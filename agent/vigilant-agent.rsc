@@ -22,6 +22,15 @@
 :global vigilantUrl
 :global vigilantToken
 
+# Tick counter — lets us run heavy/large collections on a slower cadence than the
+# 10s fast tick. The MAC/ARP host tables can be large on a busy LAN, so we only
+# gather them every ~30 ticks (~5 min). Survives between runs as a global.
+:global vigilantTick
+:if ([:typeof $vigilantTick] = "nothing") do={ :set vigilantTick 0 }
+:set vigilantTick ($vigilantTick + 1)
+:local doSlow false
+:if (($vigilantTick % 30) = 0) do={ :set doSlow true }
+
 # ── identity / system ───────────────────────────────────────────────
 :local serial    "unknown"; :do { :set serial    [/system routerboard get serial-number] } on-error={}
 :local identity  "unknown"; :do { :set identity  [/system identity get name] } on-error={}
@@ -165,6 +174,45 @@
     } on-error={}
 }
 :set nbrs ($nbrs . "]")
+
+# ── L2 host fallback (slow cadence) ──────────────────────────────────
+# Endpoints that don't advertise LLDP/CDP still show up here: the bridge host table
+# maps a MAC to the physical port it was learned on; ARP adds the IP. The ingest joins
+# them by MAC and does the OUI→vendor lookup. `null` on fast ticks = "keep previous".
+:local macHosts "null"
+:local arpList  "null"
+:if ($doSlow) do={
+    :set macHosts "["
+    :local mf true
+    :do {
+        :foreach h in=[/interface bridge host find local=no] do={
+            :do {
+                :local hm [/interface bridge host get $h mac-address]
+                :local hi [/interface bridge host get $h interface]
+                :if (!$mf) do={ :set macHosts ($macHosts . ",") }
+                :set mf false
+                :set macHosts ($macHosts . "{\"mac\":\"" . $hm . "\",\"interface\":\"" . $hi . "\"}")
+            } on-error={}
+        }
+    } on-error={}
+    :set macHosts ($macHosts . "]")
+    :set arpList "["
+    :local af true
+    :do {
+        :foreach a in=[/ip arp find] do={
+            :do {
+                :local am [/ip arp get $a mac-address]
+                :local aa [/ip arp get $a address]
+                :if (([:len $am] > 0) && ([:len $aa] > 0)) do={
+                    :if (!$af) do={ :set arpList ($arpList . ",") }
+                    :set af false
+                    :set arpList ($arpList . "{\"mac\":\"" . $am . "\",\"ip\":\"" . $aa . "\"}")
+                }
+            } on-error={}
+        }
+    } on-error={}
+    :set arpList ($arpList . "]")
+}
 :set ifaces ($ifaces . "]")
 
 # ── assemble payload ─────────────────────────────────────────────────
@@ -176,7 +224,8 @@
 \"write_sect_total\":$writeSect,\"firmware_current\":\"$fwCur\",\"firmware_upgrade\":\"$fwUpg\",\
 \"ntp_synced\":$ntpSynced,\"public_ip\":\"$publicIp\",\"pppoe_running\":$pppoeUp,\
 \"ppp_sessions\":$pppSessions,\"dhcp_leases\":$dhcpLeases,\
-\"lte\":$lteJson,\"interfaces\":$ifaces,\"neighbors\":$nbrs}"
+\"lte\":$lteJson,\"interfaces\":$ifaces,\"neighbors\":$nbrs,\
+\"mac_hosts\":$macHosts,\"arp\":$arpList}"
 
 # ── push, and read back control + pending job ────────────────────────
 :local resp ""

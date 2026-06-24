@@ -127,6 +127,22 @@ CREATE TABLE IF NOT EXISTS neighbors (
 );
 CREATE INDEX IF NOT EXISTS neighbors_device_idx ON neighbors (device_id);
 
+-- ─────────────────────────── mac_hosts (L2 fallback) ──────────────────────
+-- For endpoints that don't advertise LLDP/CDP (PCs, printers, phones). Built from the
+-- bridge host MAC table (mac → physical port) joined with ARP (mac → ip) by the ingest.
+-- Collected on a SLOW cadence (these tables can be large on a busy LAN). The collector
+-- prunes rows not seen for a while. `vendor` is an optional OUI lookup the ingest fills.
+CREATE TABLE IF NOT EXISTS mac_hosts (
+    device_id    uuid        NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    interface    text        NOT NULL,            -- physical port the MAC was learned on
+    mac          macaddr     NOT NULL,
+    ip           inet,                            -- from ARP, where known
+    vendor       text,                            -- OUI lookup (ingest-side), optional
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (device_id, interface, mac)
+);
+CREATE INDEX IF NOT EXISTS mac_hosts_device_idx ON mac_hosts (device_id);
+
 -- ─────────────────────────── lte_state (SIM + cell + signal) ──────────────
 -- One row per (device, lte interface), UPSERTed. Identifiers (iccid/imsi/imei/
 -- msisdn) are static — the agent sends them on bootstrap/on-change only, not every

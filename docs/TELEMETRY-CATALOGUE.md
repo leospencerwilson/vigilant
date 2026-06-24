@@ -72,8 +72,11 @@ or `unused` (link down, not a member of anything).
 - `/ip/neighbor print` (LLDP/CDP/MNDP) → per local interface: neighbour `identity`,
   `mac-address`, `address`, `platform`, `board`, `version`. So you see "ether3 → a Yealink
   T54W" or "ether5 → MikroTik CRS328". Stored in the `neighbors` table.
-- For endpoints that don't advertise (a PC, a printer), fall back to
-  `/interface/bridge/host print` (MAC learned per port) and `/ip/arp print` (MAC↔IP).
+- For endpoints that don't advertise (a PC, a printer), Vigilant falls back to
+  `/interface/bridge/host print` (MAC learned per physical port) joined with `/ip/arp
+  print` (MAC↔IP) — the ingest joins them by MAC and does an OUI→vendor lookup. Stored
+  in the `mac_hosts` table. Collected on a **slow** cadence (~5 min via the agent's tick
+  counter) because these tables can be large on a busy LAN.
 - `/interface/ethernet/poe/monitor <if> once` → which ports are powering a device
   (`poe-out-status`, `poe-out-power`) — useful for PoE phones.
 
