@@ -284,12 +284,16 @@
 # "<token>,Content-Type: …" and returns 401 (seen live as "telemetry POST failed"). The
 # ingest parses the JSON body regardless of Content-Type, so the header is unnecessary.
 :local resp ""
-:do {
+:onerror telErr in={
     :set resp [/tool fetch http-method=post mode=https check-certificate=$vigilantCC \
         url=("$vigilantUrl/telemetry") \
         http-header-field=("Authorization: Bearer " . $vigilantToken) \
         http-data=$body output=user as-value]
-} on-error={ :log warning "vigilant-agent: telemetry POST failed" }
+} do={
+    # Surface the REAL fetch error + the body size, so a failure is diagnosable instead
+    # of a generic "POST failed" (e.g. HTTP status, "too large", timeout, TLS).
+    :log warning ("vigilant-agent: telemetry POST failed: " . $telErr . " | body-bytes=" . [:len $body])
+}
 
 # ─────────────────────────────────────────────────────────────────────
 # CONFIG-JOB APPLY PATH  —  DRAFT / REVIEW-BEFORE-LIVE
