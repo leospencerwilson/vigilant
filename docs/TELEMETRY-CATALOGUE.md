@@ -39,6 +39,47 @@ strings). The big wins are **per-port byte/error counters**, **LTE/SIM + signal*
 **Why counters not rates:** send cumulative `rx-byte`/`tx-byte`; the ingest computes
 `bps = Δbytes·8 / Δt`. Robust across missed samples and reboots (reset guard).
 
+## 2b. Port map & role classification ← "which ports are plugged in, which is WAN"
+
+Vigilant builds a per-port map so the panel can render the router's front panel: which
+sockets have a cable + link, at what speed/duplex, what role each plays, and what's on
+the other end.
+
+**Plugged in?** For ethernet, `/interface/ethernet/monitor <if> once` → `status` is
+`link-ok` (cable in, link up) or `no-link`. (`running=yes` on the interface is the same
+signal.) Also surface `last-link-up-time`, `last-link-down-time`, and **`link-downs`** —
+a high flap count points at a dodgy cable/port.
+
+**Speed / duplex:** same call → `rate` (e.g. `1Gbps`), `full-duplex`, `auto-negotiation`.
+A LAN port that negotiated `100Mbps-half` is usually a cabling fault worth flagging.
+
+**Which is WAN?** Derived from three signals (the agent reports the facts, the ingest sets
+`role`/`is_wan`):
+1. The physical interface a **pppoe-client** dials over — `/interface/pppoe-client get
+   <name> interface` (e.g. `pppoe-out1` → `ether1`).
+2. The egress interface of the **active default route** — `/ip/route find
+   dst-address=0.0.0.0/0 active=yes` → parse `immediate-gw` (`ip%iface`).
+3. A **dhcp-client** interface with `add-default-route=yes`.
+
+**Role** each port gets classified as: `wan`, `lan`, `bridge-member` (+ which bridge),
+`trunk` (bridge port carrying tagged VLANs), `vpn` (pppoe/l2tp/sstp/wg logical), `disabled`,
+or `unused` (link down, not a member of anything).
+
+**Bridge membership / VLANs:** `/interface/bridge/port print` → `interface`, `bridge`,
+`pvid` tells you which L2 segment each port belongs to (LAN / HSCN / etc.) and access-vs-trunk.
+
+**What's on the other end:**
+- `/ip/neighbor print` (LLDP/CDP/MNDP) → per local interface: neighbour `identity`,
+  `mac-address`, `address`, `platform`, `board`, `version`. So you see "ether3 → a Yealink
+  T54W" or "ether5 → MikroTik CRS328". Stored in the `neighbors` table.
+- For endpoints that don't advertise (a PC, a printer), fall back to
+  `/interface/bridge/host print` (MAC learned per port) and `/ip/arp print` (MAC↔IP).
+- `/interface/ethernet/poe/monitor <if> once` → which ports are powering a device
+  (`poe-out-status`, `poe-out-power`) — useful for PoE phones.
+
+The agent already emits per-port `plugged`, `running`, `disabled`, `speed`,
+`full_duplex`, `bridge`, `is_wan` plus a `neighbors` array; see `agent/vigilant-agent.rsc`.
+
 ## 3. LTE / SIM  ← your specific ask
 
 **Yes — SIM identifiers and live cell/signal are all pullable.**

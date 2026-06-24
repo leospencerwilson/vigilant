@@ -76,10 +76,23 @@ CREATE INDEX IF NOT EXISTS device_state_lastseen_idx ON device_state (last_seen_
 CREATE TABLE IF NOT EXISTS interface_state (
     device_id    uuid        NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     name         text        NOT NULL,
-    type         text,
+    type         text,                           -- ether / bridge / vlan / pppoe-out / lte / ...
     comment      text,
+    -- physical / link
+    plugged      boolean,                        -- cable in + link up (ethernet status=link-ok)
     running      boolean,
-    speed        text,                           -- e.g. "1Gbps"
+    disabled     boolean,
+    speed        text,                           -- negotiated rate, e.g. "1Gbps"
+    full_duplex  boolean,
+    last_link_up_at   timestamptz,
+    last_link_down_at timestamptz,
+    link_downs   int,                            -- flap counter — high = dodgy cable/port
+    -- role / topology
+    role         text,                           -- 'wan' | 'lan' | 'bridge-member' | 'trunk' | 'vpn' | 'unused' | 'disabled'
+    is_wan       boolean     NOT NULL DEFAULT false,
+    bridge       text,                           -- bridge this port belongs to, if any
+    poe_out_status text,                         -- powered device status, where PoE
+    poe_out_power  numeric,
     mac          macaddr,
     rx_bps       bigint,                         -- derived
     tx_bps       bigint,                         -- derived
@@ -95,6 +108,24 @@ CREATE TABLE IF NOT EXISTS interface_state (
     PRIMARY KEY (device_id, name)
 );
 CREATE INDEX IF NOT EXISTS interface_state_device_idx ON interface_state (device_id);
+
+-- ─────────────────────────── neighbors (what's on the other end) ──────────
+-- LLDP/CDP/MNDP discovery — tells you the device plugged into each port (where it
+-- advertises). For dumb endpoints that don't, fall back to the bridge host MAC table.
+-- UPSERTed per (device, interface, neighbor mac); collector prunes rows not seen recently.
+CREATE TABLE IF NOT EXISTS neighbors (
+    device_id   uuid        NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    interface   text        NOT NULL,            -- local port the neighbor was seen on
+    mac         macaddr     NOT NULL,
+    identity    text,                            -- neighbor's /system identity
+    address     inet,
+    platform    text,                            -- e.g. "MikroTik", "Yealink", a switch vendor
+    board       text,
+    version     text,
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (device_id, interface, mac)
+);
+CREATE INDEX IF NOT EXISTS neighbors_device_idx ON neighbors (device_id);
 
 -- ─────────────────────────── lte_state (SIM + cell + signal) ──────────────
 -- One row per (device, lte interface), UPSERTed. Identifiers (iccid/imsi/imei/
@@ -293,6 +324,7 @@ BEGIN
     EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.device_state';
     EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.interface_state';
     EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.lte_state';
+    EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.neighbors';
     EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.config_jobs';
     EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.alerts';
   END IF;

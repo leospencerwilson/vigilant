@@ -75,33 +75,96 @@
 
 # WAN / routing (public IP only — NEVER the password)
 :local publicIp "null"
-:local pe [/ip address find interface="pppoe-out1"]
-:if ([:len $pe] > 0) do={ :set publicIp [/ip address get [:pick $pe 0] address] }
+:do { :local ic [/ip cloud get public-address]; :if ([:len $ic] > 0) do={ :set publicIp $ic } } on-error={}
+:if ($publicIp = "null") do={
+    :local pe [/ip address find interface="pppoe-out1"]
+    :if ([:len $pe] > 0) do={ :set publicIp [/ip address get [:pick $pe 0] address] }
+}
 :local pppoeUp "false"
 :if ([:len [/interface find name="pppoe-out1"]] > 0) do={ :set pppoeUp [/interface get [find name="pppoe-out1"] running] }
 :local pppSessions [:len [/ppp active find]]
 :local dhcpLeases  [:len [/ip dhcp-server lease find]]
 
-# ── per-interface counters (the throughput win) ──────────────────────
-# Build a JSON array of every interface with cumulative counters. The ingest
-# diffs rx-byte/tx-byte against the previous sample to derive bps.
+# ── WAN detection ────────────────────────────────────────────────────
+# A port is WAN if: it's the physical interface a pppoe-client dials over, OR it
+# carries the active default route, OR it's a dhcp-client iface that adds a default
+# route. Names are space-wrapped so the membership test can't false-match (ether1/ether10).
+:local wanList " "
+:foreach p in=[/interface pppoe-client find] do={
+    :do { :set wanList ($wanList . [/interface pppoe-client get $p interface] . " " . [/interface pppoe-client get $p name] . " ") } on-error={}
+}
+:foreach r in=[/ip route find dst-address="0.0.0.0/0" active=yes] do={
+    :do {
+        :local gi [/ip route get $r immediate-gw]
+        :if ([:typeof [:find $gi "%"]] != "nothing") do={ :set wanList ($wanList . [:pick $gi ([:find $gi "%"]+1) [:len $gi]] . " ") }
+    } on-error={}
+}
+:foreach d in=[/ip dhcp-client find] do={
+    :do { :if ([/ip dhcp-client get $d add-default-route] = "yes") do={ :set wanList ($wanList . [/ip dhcp-client get $d interface] . " ") } } on-error={}
+}
+
+# ── per-interface: counters + link + role + bridge membership ─────────
+# Cumulative counters (ingest derives bps); plugged/speed/duplex from ethernet/monitor;
+# bridge membership; is_wan from the list above. The ingest classifies `role`.
 :local ifaces "["
 :local first true
 :foreach i in=[/interface find] do={
     :local nm  [/interface get $i name]
     :local tp  [/interface get $i type]
-    :local run [/interface get $i running]
+    :local run "false"; :do { :set run [/interface get $i running] } on-error={}
+    :local dis "false"; :do { :set dis [/interface get $i disabled] } on-error={}
     :local rb 0; :local tb 0; :local rp 0; :local tp2 0
     :do { :set rb [/interface get $i rx-byte] }   on-error={}
     :do { :set tb [/interface get $i tx-byte] }   on-error={}
     :do { :set rp [/interface get $i rx-packet] } on-error={}
     :do { :set tp2 [/interface get $i tx-packet] } on-error={}
+    # bridge membership
+    :local br ""
+    :do { :local bp [/interface bridge port find interface=$nm]; :if ([:len $bp] > 0) do={ :set br [/interface bridge port get [:pick $bp 0] bridge] } } on-error={}
+    # physical link details (ethernet only)
+    :local plugged $run
+    :local rate ""
+    :local fd "null"
+    :if ($tp = "ether") do={
+        :do {
+            :local em [/interface ethernet monitor $nm once as-value]
+            :set plugged (($em->"status") = "link-ok")
+            :set rate ($em->"rate")
+            :if ([:typeof ($em->"full-duplex")] != "nothing") do={ :set fd ($em->"full-duplex") }
+        } on-error={}
+    }
+    # WAN?
+    :local isWan false
+    :if ([:typeof [:find $wanList (" " . $nm . " ")]] != "nothing") do={ :set isWan true }
     :if (!$first) do={ :set ifaces ($ifaces . ",") }
     :set first false
     :set ifaces ($ifaces . "{\"name\":\"" . $nm . "\",\"type\":\"" . $tp . \
-        "\",\"running\":" . $run . ",\"rx_byte\":" . $rb . ",\"tx_byte\":" . $tb . \
+        "\",\"running\":" . $run . ",\"disabled\":" . $dis . ",\"plugged\":" . $plugged . \
+        ",\"speed\":\"" . $rate . "\",\"full_duplex\":" . $fd . ",\"bridge\":\"" . $br . "\"" . \
+        ",\"is_wan\":" . $isWan . ",\"rx_byte\":" . $rb . ",\"tx_byte\":" . $tb . \
         ",\"rx_packet\":" . $rp . ",\"tx_packet\":" . $tp2 . "}")
 }
+
+# ── neighbours (what's plugged into each port, where it advertises) ──
+# LLDP/CDP/MNDP. For endpoints that don't advertise, the ingest can fall back to the
+# bridge host MAC table. NOTE: identity/platform are vendor-supplied free text — the
+# INGEST must JSON-escape these defensively (a stray quote here would break the doc).
+:local nbrs "["
+:local nf true
+:foreach n in=[/ip neighbor find] do={
+    :do {
+        :local nif [/ip neighbor get $n interface]
+        :local nid [/ip neighbor get $n identity]
+        :local nmac [/ip neighbor get $n mac-address]
+        :local nip [/ip neighbor get $n address]
+        :local npl [/ip neighbor get $n platform]
+        :if (!$nf) do={ :set nbrs ($nbrs . ",") }
+        :set nf false
+        :set nbrs ($nbrs . "{\"interface\":\"" . $nif . "\",\"identity\":\"" . $nid . \
+            "\",\"mac\":\"" . $nmac . "\",\"address\":\"" . $nip . "\",\"platform\":\"" . $npl . "\"}")
+    } on-error={}
+}
+:set nbrs ($nbrs . "]")
 :set ifaces ($ifaces . "]")
 
 # ── assemble payload ─────────────────────────────────────────────────
@@ -113,7 +176,7 @@
 \"write_sect_total\":$writeSect,\"firmware_current\":\"$fwCur\",\"firmware_upgrade\":\"$fwUpg\",\
 \"ntp_synced\":$ntpSynced,\"public_ip\":\"$publicIp\",\"pppoe_running\":$pppoeUp,\
 \"ppp_sessions\":$pppSessions,\"dhcp_leases\":$dhcpLeases,\
-\"lte\":$lteJson,\"interfaces\":$ifaces}"
+\"lte\":$lteJson,\"interfaces\":$ifaces,\"neighbors\":$nbrs}"
 
 # ── push, and read back control + pending job ────────────────────────
 :local resp ""
