@@ -334,18 +334,21 @@ CREATE OR REPLACE VIEW v_fleet AS
 -- existing Watchman frontend / console get pushed changes without polling.
 -- (Run once; ignore "already member" errors on re-apply.)
 DO $$
+DECLARE t text;
 BEGIN
-  PERFORM 1 FROM pg_publication WHERE pubname = 'supabase_realtime';
-  IF FOUND THEN
-    EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.device_state';
-    EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.interface_state';
-    EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.lte_state';
-    EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.neighbors';
-    EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.config_jobs';
-    EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.alerts';
+  IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
+    FOREACH t IN ARRAY ARRAY['device_state','interface_state','lte_state','neighbors','config_jobs','alerts'] LOOP
+      -- Per-table sub-block so one failure (already a member, or no privilege to alter
+      -- the publication) never aborts the others or the outer transaction.
+      BEGIN
+        EXECUTE format('ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.%I', t);
+      EXCEPTION
+        WHEN duplicate_object THEN NULL;                 -- already published
+        WHEN insufficient_privilege THEN
+          RAISE NOTICE 'vigilant: no privilege to add vigilant.% to supabase_realtime — add it via the Supabase dashboard', t;
+      END;
+    END LOOP;
   END IF;
-EXCEPTION WHEN duplicate_object THEN
-  NULL;
 END $$;
 
 COMMIT;
