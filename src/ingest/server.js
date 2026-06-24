@@ -201,7 +201,9 @@ function createServer({ store, config: cfg }) {
       // be colon/hyphen/dot-separated or bare hex; the regex accepts hex digits + those
       // separators only (a malformed segment 404s here, a syntactically-ok-but-too-short mac
       // is the handler's 400). Admin-auth gated, same token as /fleet.
-      const mOui = /^\/oui\/([0-9a-fA-F:.\-]{1,64})$/.exec(pathname);
+      // Allow '%' so percent-encoded separators (e.g. a client that sends "CC%3A2D%3AE0")
+      // still match; ctx.params decodeURIComponent's it and the handler normalises.
+      const mOui = /^\/oui\/([0-9a-fA-F:.%\-]{1,64})$/.exec(pathname);
       if (method === 'GET' && mOui) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { mac: decodeURIComponent(mOui[1]) };

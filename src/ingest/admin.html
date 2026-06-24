@@ -328,7 +328,10 @@ function lookupVendor(mac){
   if (!tok()) return Promise.resolve(null);
   const p = (async () => {
     try{
-      const r = await fetch('/oui/'+encodeURIComponent(key), { headers: authHeaders() });
+      // Send the prefix as BARE HEX (no colons): encodeURIComponent turns ':' into '%3A',
+      // which the server's /oui route regex rejects (no '%') -> 404 -> '—'. Bare hex needs
+      // no encoding and the endpoint normalises any format.
+      const r = await fetch('/oui/'+key.replace(/[^0-9a-fA-F]/g,''), { headers: authHeaders() });
       if (r.ok) {
         const j = await r.json().catch(()=>null);
         if (j && j.vendor) return j.vendor;       // success — keep cached
