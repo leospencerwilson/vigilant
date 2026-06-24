@@ -266,16 +266,21 @@
 :set ifaces ($ifaces . "]")
 
 # ── assemble payload ─────────────────────────────────────────────────
-:local body "{\
-\"serial\":\"$serial\",\"identity\":\"$identity\",\"uptime\":\"$uptime\",\
-\"cpu_load\":$cpuLoad,\"free_memory\":$freeMem,\"total_memory\":$totMem,\"free_hdd\":$freeHdd,\
-\"ros_version\":\"$rosVer\",\"temperature\":$temp,\"cpu_temperature\":$cpuTemp,\
-\"board_temperature\":$brdTemp,\"voltage\":$volt,\"fan1_speed\":$fan1,\
-\"write_sect_total\":$writeSect,\"firmware_current\":\"$fwCur\",\"firmware_upgrade\":\"$fwUpg\",\
-\"ntp_synced\":$ntpSynced,\"public_ip\":\"$publicIp\",\"pppoe_running\":$pppoeUp,\
-\"ppp_sessions\":$pppSessions,\"dhcp_leases\":$dhcpLeases,\
-\"lte\":$lteJson,\"interfaces\":$ifaces,\"neighbors\":$nbrs,\
-\"mac_hosts\":$macHosts,\"arp\":$arpList}"
+# Build via explicit concatenation, NOT a multi-line "\"-continued double-quoted literal.
+# RouterOS REFORMATS a script's source when it is fetched -> /system script add -> run
+# (it rejoins lines with ";  \n" separators), which BREAKS backslash line-continuations
+# inside a string literal — the body then truncates to its first fragment (~32 bytes,
+# which is exactly the "body-bytes=32" we saw) or malforms. Each :set below is one
+# self-contained statement that survives that round-trip, like the $ifaces/$nbrs loops.
+:local body "{"
+:set body ($body . "\"serial\":\"" . $serial . "\",\"identity\":\"" . $identity . "\",\"uptime\":\"" . $uptime . "\",")
+:set body ($body . "\"cpu_load\":" . $cpuLoad . ",\"free_memory\":" . $freeMem . ",\"total_memory\":" . $totMem . ",\"free_hdd\":" . $freeHdd . ",")
+:set body ($body . "\"ros_version\":\"" . $rosVer . "\",\"temperature\":" . $temp . ",\"cpu_temperature\":" . $cpuTemp . ",\"board_temperature\":" . $brdTemp . ",")
+:set body ($body . "\"voltage\":" . $volt . ",\"fan1_speed\":" . $fan1 . ",\"write_sect_total\":" . $writeSect . ",")
+:set body ($body . "\"firmware_current\":\"" . $fwCur . "\",\"firmware_upgrade\":\"" . $fwUpg . "\",\"ntp_synced\":" . $ntpSynced . ",")
+:set body ($body . "\"public_ip\":\"" . $publicIp . "\",\"pppoe_running\":" . $pppoeUp . ",\"ppp_sessions\":" . $pppSessions . ",\"dhcp_leases\":" . $dhcpLeases . ",")
+:set body ($body . "\"lte\":" . $lteJson . ",\"interfaces\":" . $ifaces . ",\"neighbors\":" . $nbrs . ",")
+:set body ($body . "\"mac_hosts\":" . $macHosts . ",\"arp\":" . $arpList . "}")
 
 # ── push, and read back control + pending job ────────────────────────
 # NOTE: send ONLY the Authorization header. RouterOS /tool fetch does not reliably split a
