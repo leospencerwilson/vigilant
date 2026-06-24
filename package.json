@@ -1,0 +1,23 @@
+{
+  "name": "vigilant",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vigilant — realtime MikroTik telemetry + review-gated config-push for the WCN Cloud IaaS.",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/ingest/server.js",
+    "start:worker": "node src/worker/worker.js",
+    "migrate": "node src/bin/migrate.js",
+    "enroll": "node src/bin/enroll.js",
+    "simulate": "node src/bin/simulate.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "dotenv": "^16",
+    "pg": "^8",
+    "zod": "^3"
+  }
+}

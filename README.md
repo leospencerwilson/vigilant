@@ -25,17 +25,77 @@ reach them inbound. So the router always initiates: it **pushes** telemetry out 
 ## Layout
 
 ```
-docs/ARCHITECTURE.md     full design — collection model, schema, config push, security
-db/schema.sql            Supabase schema (own `vigilant` schema; Realtime-enabled)
+package.json             one manifest for the whole service (scripts: start, start:worker,
+                         migrate, enroll, simulate, test); deps: pg, zod, dotenv
+.env.example             every env var Vigilant reads — copy to .env
+Dockerfile               container image; docker-compose.yml for ingest + worker
+src/
+  shared/                config, log, the Store interface + pg/mem backends, db pool,
+                         telemetry zod schema/normalize, pure transforms, OUI lookup
+  ingest/                createServer() HTTP API + per-route handlers (telemetry, agent
+                         script, config pending/fetch/result, enroll, fleet, device detail)
+  worker/                runWorker()/runOnce() — stale/offline marking, alert evaluation,
+                         history downsample/prune, neighbor/mac-host TTL
+  bin/                   migrate.js, enroll.js, simulate.js CLIs
+test/                    node:test suite (transform, telemetry, oui, config, ingest e2e)
+db/schema.sql            Supabase schema (own `vigilant` schema; Realtime-enabled);
+                         migrate() applies it verbatim/idempotently
 agent/bootstrap.rsc      DRAFT: daily self-update scheduler for the router
-agent/vigilant-agent.rsc DRAFT: the collector + config-apply agent
+agent/vigilant-agent.rsc DRAFT: the collector + config-apply agent (device payload source of truth)
+docs/                    contract, architecture, deployment, frontend integration, runbook
 ```
 
-`ingest/` (telemetry API) and `worker/` (alerts + history rollup) get added when we build
-them — see ARCHITECTURE §3 and the build order in §9.
+## Docs
+
+- **[docs/CONTRACT.md](docs/CONTRACT.md)** — authoritative build contract: file layout,
+  Store interface, routes, telemetry payload/response, env vars, test gate. Start here.
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — full design: collection model,
+  schema, config push, security.
+- **[docs/TELEMETRY-CATALOGUE.md](docs/TELEMETRY-CATALOGUE.md)** — what RouterOS 7 fields
+  the agent collects and how they map to the payload.
+- **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** — deploy on the IaaS via Coolify behind the
+  Cloudflare Tunnel: apply schema, set env, run ingest + worker.
+- **[docs/FRONTEND-INTEGRATION.md](docs/FRONTEND-INTEGRATION.md)** — how Watchman and the
+  WCN console consume Vigilant (Supabase Realtime + the small action API).
+- **[docs/RUNBOOK-config-push.md](docs/RUNBOOK-config-push.md)** — review-gated config-push
+  lifecycle: Safe Mode apply with dead-man rollback.
 
 ## Status
 
-Design + scaffold. Nothing deployed. Next step: apply `db/schema.sql` to the IaaS
-Supabase, stand up the ingest API behind the Cloudflare Tunnel, and pilot the rewritten
-agent on **one** non-critical router.
+**Built (green).** The ingest API, worker, the three CLIs (`migrate`, `enroll`,
+`simulate`), and the `node:test` suite are implemented per `docs/CONTRACT.md` and load
+cleanly. `npm test` (`node --test`) passes with no external Postgres (tests run against the
+in-memory store). The `agent/` `.rsc` files remain **DRAFTS** pending review.
+
+**Not yet deployed.** Next step: apply `db/schema.sql` to the IaaS Supabase, stand the
+ingest API up behind the Cloudflare Tunnel (see `docs/DEPLOYMENT.md`), and pilot the
+rewritten agent on **one** non-critical router.
+
+## Run it
+
+Requires Node 20+. For a real run set `STORE_KIND=pg` and point `VIGILANT_DB_URL` at the
+self-hosted Supabase Postgres; for a no-database smoke test set `STORE_KIND=mem`.
+
+```sh
+npm install                       # pg, zod, dotenv (no dev deps)
+
+cp .env.example .env              # then edit: VIGILANT_DB_URL, ENROLL_TOKEN, PUBLIC_BASE_URL …
+
+npm run migrate                   # apply db/schema.sql into the `vigilant` schema (pg store)
+
+npm start                         # ingest HTTP API on $PORT (default 9100)
+npm run start:worker              # alerts + history rollup loop (separate process)
+
+# Enrol a device — prints the per-device bearer + RouterOS bootstrap snippet ONCE:
+npm run enroll -- --serial HGT0A023T6C --site "Allied Huddersfield" \
+  --customer Allied --wan-type pppoe --tags allied,pharmacy
+
+# Drive synthetic telemetry at the ingest so you can watch data flow without a router:
+npm run simulate -- --url http://localhost:9100 --token <bearer-from-enroll>
+
+npm test                          # node --test — runs against the in-memory store
+```
+
+> The `--` after the npm script name forwards the flags to the underlying CLI.
+> `enroll` and `simulate` accept `--flag value` or `--flag=value`. `simulate` also takes
+> optional `--ticks N` (0 = forever), `--interval <ms>`, and `--serial <S>`.

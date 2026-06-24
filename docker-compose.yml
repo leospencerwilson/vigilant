@@ -1,0 +1,50 @@
+# Vigilant — ingest API + collector worker.
+#
+# Two services, ONE image (built from ./Dockerfile). They differ only in their start
+# command: `ingest` runs the HTTP API (node src/ingest/server.js), `worker` runs the
+# background collector (node src/worker/worker.js).
+#
+# NOTE ON POSTGRES: there is deliberately NO database service here. Vigilant writes to
+# the EXTERNAL self-hosted Supabase Postgres already running on the WCN Cloud IaaS
+# (10.10.30.10 / the Coolify Supabase stack), reached via VIGILANT_DB_URL in .env. Do
+# not add a `postgres:` service — that would create a second, wrong database.
+#
+# NOTE ON EXPOSURE: only `ingest` is reachable from the internet, and only via the
+# existing Cloudflare Tunnel on the IaaS (cloudflared points at this container's PORT).
+# There is no host port mapping and no dst-NAT on the WCN MikroTik (see
+# server project/dc-deployment/02-public-exposure.md). The worker is internal-only.
+
+services:
+  ingest:
+    build: .
+    image: vigilant:latest
+    restart: unless-stopped
+    env_file: .env
+    # PORT comes from .env (default 9100). We expose the port to other containers /
+    # the Cloudflare Tunnel sidecar on the same Docker network, NOT to the host.
+    # Coolify (or a cloudflared service) targets ingest:${PORT}.
+    expose:
+      - "${PORT:-9100}"
+    command: ["node", "src/ingest/server.js"]
+    healthcheck:
+      # Hits the open /healthz route. node:alpine has no curl/wget by default, so use node.
+      test:
+        - "CMD"
+        - "node"
+        - "-e"
+        - "require('http').get('http://127.0.0.1:'+(process.env.PORT||9100)+'/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  worker:
+    build: .
+    image: vigilant:latest
+    restart: unless-stopped
+    env_file: .env
+    # Same image, same env, different entrypoint. The worker only talks to Postgres
+    # (VIGILANT_DB_URL); it has no inbound listener and no published/exposed port.
+    command: ["node", "src/worker/worker.js"]
+    depends_on:
+      - ingest
