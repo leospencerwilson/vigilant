@@ -604,6 +604,30 @@ async function deviceHistory(ctx) {
   });
 }
 
+// ── GET /oui/:mac (admin) ────────────────────────────────────────────
+// Resolve a MAC's OUI to a vendor for the dashboard's neighbours / mac_hosts enrichment.
+// Tiered: seed -> in-process cache -> external API (prefix only). Never 500s — a clearly
+// invalid mac is 400, everything else (incl. an unreachable API) returns the contract shape
+// with vendor:null source:'none'. The :mac may be colon/hyphen/dot-separated or bare hex.
+async function ouiLookup(ctx) {
+  const { res, params } = ctx;
+  const raw = params && params.mac;
+
+  // A clearly-invalid MAC has no resolvable 3-octet OUI prefix -> 400 (not a server fault).
+  if (oui.ouiKey(raw) === null) {
+    return json(res, 400, { ok: false, error: 'invalid mac' });
+  }
+
+  // resolveVendor never throws; it returns the full contract shape directly.
+  const result = await oui.resolveVendor(raw);
+  return json(res, 200, {
+    mac: result.mac,
+    oui: result.oui,
+    vendor: result.vendor,
+    source: result.source,
+  });
+}
+
 module.exports = {
   healthz,
   adminUi,
@@ -616,4 +640,5 @@ module.exports = {
   fleet,
   deviceDetail,
   deviceHistory,
+  ouiLookup,
 };

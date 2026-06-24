@@ -61,6 +61,7 @@
   .between{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
   .between h2{margin:0}
   .empty{color:var(--mut);padding:18px;text-align:center}
+  .muted{color:var(--mut);font-style:italic;opacity:.8}
 
   /* ── view switching ───────────────────────────────────── */
   .hidden{display:none !important}
@@ -215,12 +216,27 @@
 
     <div class="grid2">
       <div class="card">
-        <h2>Neighbours</h2>
-        <div id="d-nbrs" class="nbr-list"><div class="empty">None.</div></div>
+        <h2>Neighbours <span class="hint">(LLDP / CDP)</span></h2>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Neighbour</th><th>Interface</th><th>MAC</th><th>Manufacturer</th><th>Type</th></tr></thead>
+            <tbody id="d-nbrs"><tr><td colspan="5" class="empty">No neighbours seen.</td></tr></tbody>
+          </table>
+        </div>
       </div>
       <div class="card hidden" id="d-ltebox">
         <h2>LTE / cellular</h2>
         <div class="ltegrid" id="d-lte"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:18px">
+      <div class="between"><h2>Hosts <span class="hint">(learned MACs)</span></h2><span class="hint" id="d-hostcount"></span></div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>MAC</th><th>Interface</th><th>IP</th><th>Manufacturer</th></tr></thead>
+          <tbody id="d-hosts"><tr><td colspan="4" class="empty">No hosts learned.</td></tr></tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -283,6 +299,63 @@ function ago(ts){ if(!ts) return '—'; const d=(Date.now()-new Date(ts).getTime
 function pill(s){ s=(s||'unknown'); return '<span class="pill '+s+'">'+s+'</span>'; }
 function esc(s){ if(s==null) return ''; return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function dash(v, suffix){ return (v==null||v==='') ? '—' : (esc(v)+(suffix||'')); }
+
+// ════════════════════ OUI -> vendor (manufacturer) lookup ════════════════════
+// Resolve a MAC's manufacturer via the admin-gated GET /oui/<mac> endpoint (seed -> cache ->
+// external API server-side). We DEDUPE + CACHE client-side by 3-octet OUI prefix in a JS Map:
+// the same prefix is fetched at most once per page load and in-flight requests are shared, so
+// a dashboard full of phones from one vendor makes a single request, not one-per-row. Every
+// failure mode (401 / !ok / network / vendor:null) resolves to null so the cell falls back to
+// '—'; the helper never throws and never rejects.
+const _ouiCache = new Map(); // oui-prefix -> Promise<string|null>  (resolved cache stays as a settled promise)
+
+// 3-octet OUI prefix, upper-case colon form ("AC:CF:23"), or null if <6 hex digits.
+function ouiPrefix(mac){
+  if (typeof mac !== 'string') return null;
+  const hex = mac.replace(/[^0-9a-fA-F]/g, '');
+  if (hex.length < 6) return null;
+  const up = hex.slice(0,6).toUpperCase();
+  return up.slice(0,2)+':'+up.slice(2,4)+':'+up.slice(4,6);
+}
+
+// lookupVendor(mac) -> Promise<string|null>. Deduped + cached by OUI prefix. Never throws.
+function lookupVendor(mac){
+  const key = ouiPrefix(mac);
+  if (key === null) return Promise.resolve(null);
+  if (_ouiCache.has(key)) return _ouiCache.get(key);
+  // Don't fetch (or cache) without a token — otherwise a pre-token render would permanently
+  // poison the cache with a null for this prefix. Resolve transiently; the next render retries.
+  if (!tok()) return Promise.resolve(null);
+  const p = (async () => {
+    try{
+      const r = await fetch('/oui/'+encodeURIComponent(key), { headers: authHeaders() });
+      if (r.ok) {
+        const j = await r.json().catch(()=>null);
+        if (j && j.vendor) return j.vendor;       // success — keep cached
+      }
+    }catch(e){ /* offline / network error */ }
+    // Don't cache a transient failure / null (401, server-down, vendor:null): drop the key
+    // so a later render retries instead of showing '—' for this OUI until a full reload.
+    _ouiCache.delete(key);
+    return null;
+  })();
+  _ouiCache.set(key, p);
+  return p;
+}
+
+// Fill a table cell (or any element) with the resolved manufacturer for `mac`, lazily.
+// Shows a subtle 'resolving…' placeholder, then the vendor (escaped) or '—'. Guards against
+// the row being re-rendered underneath us by stamping the element with the mac it's resolving.
+function fillVendorCell(el, mac){
+  if (!el) return;
+  if (ouiPrefix(mac) === null){ el.textContent = '—'; return; }
+  el.dataset.ouiMac = mac;
+  el.innerHTML = '<span class="muted">resolving…</span>';
+  lookupVendor(mac).then(vendor => {
+    if (el.dataset.ouiMac !== mac) return;   // row changed while we were awaiting — leave it
+    el.textContent = vendor || '—';
+  });
+}
 
 // ════════════════════ inline SVG line chart ════════════════════
 // drawLineChart(svgEl, series, opts)
@@ -462,6 +535,7 @@ function renderDevice(d){
   const st = d.state || {};
   const ifaces = d.interfaces || [];
   const nbrs = d.neighbors || [];
+  const hosts = d.mac_hosts || [];
   const lteArr = Array.isArray(d.lte) ? d.lte : (d.lte ? [d.lte] : []);
 
   // ── header ──
@@ -510,11 +584,41 @@ function renderDevice(d){
       + '</tr>';
   }).join('') : '<tr><td colspan="6" class="empty">No interfaces.</td></tr>';
 
-  // ── neighbours ──
-  $('#d-nbrs').innerHTML = nbrs.length ? nbrs.map(n=>
-    '<div class="nbr"><div class="nh"><span>'+dash(n.identity||n.mac)+'</span><span>'+dash(n.interface)+'</span></div>'
-    + '<div class="ns">'+esc(n.mac||'')+(n.address?' · '+esc(n.address):'')+(n.platform?' · '+esc(n.platform):'')+'</div></div>'
-  ).join('') : '<div class="empty">No neighbours seen.</div>';
+  // ── neighbours (LLDP/CDP): MAC + platform-as-Type + resolved Manufacturer ──
+  // Each row carries a data-oui-mac vendor cell filled lazily after render (deduped/cached).
+  $('#d-nbrs').innerHTML = nbrs.length ? nbrs.map((n,idx)=>
+    '<tr>'
+    + '<td>'+dash(n.identity||n.address||n.mac)+'</td>'
+    + '<td>'+dash(n.interface)+'</td>'
+    + '<td>'+dash(n.mac)+'</td>'
+    + '<td class="nbr-vendor" data-idx="'+idx+'">—</td>'
+    + '<td>'+dash(n.platform)+'</td>'
+    + '</tr>'
+  ).join('') : '<tr><td colspan="5" class="empty">No neighbours seen.</td></tr>';
+  // Lazily resolve the manufacturer for the rows currently shown (deduped by OUI in lookupVendor).
+  if (nbrs.length){
+    $$('#d-nbrs .nbr-vendor').forEach(cell=>{
+      const n = nbrs[+cell.dataset.idx];
+      if (n && n.mac) fillVendorCell(cell, n.mac); else cell.textContent = '—';
+    });
+  }
+
+  // ── hosts (learned MACs): mac + interface + ip + resolved Manufacturer (no platform/type) ──
+  $('#d-hostcount').textContent = hosts.length ? (hosts.length + ' hosts') : '';
+  $('#d-hosts').innerHTML = hosts.length ? hosts.map((h,idx)=>
+    '<tr>'
+    + '<td>'+dash(h.mac)+'</td>'
+    + '<td>'+dash(h.interface)+'</td>'
+    + '<td>'+dash(h.ip)+'</td>'
+    + '<td class="host-vendor" data-idx="'+idx+'">—</td>'
+    + '</tr>'
+  ).join('') : '<tr><td colspan="4" class="empty">No hosts learned.</td></tr>';
+  if (hosts.length){
+    $$('#d-hosts .host-vendor').forEach(cell=>{
+      const h = hosts[+cell.dataset.idx];
+      if (h && h.mac) fillVendorCell(cell, h.mac); else cell.textContent = '—';
+    });
+  }
 
   // ── LTE (only when present) ──
   if (lteArr.length && lteArr[0] && lteArr[0].interface){
