@@ -14,14 +14,15 @@
 #   3. vigilant-agent     — the collector script itself (fetched by the bootstrap).
 #   4. vigilant-agent scheduler — runs the collector every 10s (the telemetry tick).
 #
-# TLS: vigilantTlsCheck controls /tool fetch check-certificate. RouterOS 7.12+ ships a
-# builtin trust store containing the public roots, so a validating fetch to the
-# Cloudflare-fronted host works with NO CA import on a healthy box (correct clock + trust
-# store on). Two things break it on a fresh board: a wrong clock (1970 RTC -> "cert not yet
-# valid") and a disabled trust store — fix both before install (see ONBOARDING-A-SITE.md §2).
-#   "yes-without-crl"  -> validate the chain via the builtin trust store (default; secure)
+# TLS: vigilantTlsCheck controls /tool fetch check-certificate. NOTE: real estate boxes
+# (e.g. a 7.18 unit) returned "SSL: no trusted CA certificate found" on a validating fetch —
+# RouterOS's builtin trust store is often empty/disabled, so validation FAILS out of the box.
+# So the default is "no" (skip verification; still TLS-encrypted) for reliable onboarding.
+# To harden a site: import the Cloudflare-edge CA (/certificate import) or populate+enable
+# the builtin trust store, then set vigilantTlsCheck to a validating mode.
+#   "no"               -> skip verification (DEFAULT; still TLS-encrypted but unverified)
+#   "yes-without-crl"  -> validate the chain (needs a CA imported / trust store populated)
 #   "yes"              -> validate incl. CRL
-#   "no"               -> skip verification (fallback only; still TLS-encrypted but unverified)
 #
 # Config-apply: vigilantApplyEnabled=false keeps the device telemetry-only. It will NOT
 # change anything on the router until you deliberately flip this to true later.
@@ -31,11 +32,14 @@
 /system script add name=vigilant-env dont-require-permissions=no source={
     :global vigilantUrl "<VIGILANT_URL>"
     :global vigilantToken "<VIGILANT_TOKEN>"
-    # "yes-without-crl" = validate the TLS chain (RouterOS 7.12+ ships a builtin trust
-    # store that contains the public root behind the Cloudflare edge, so no CA import is
-    # needed on a healthy box with a correct clock). Set to "no" ONLY as a fallback if a
-    # validating fetch fails after fixing the clock + trust store (see ONBOARDING-A-SITE.md).
-    :global vigilantTlsCheck "yes-without-crl"
+    # TLS verification for /tool fetch. Default "no" (skip verification — still TLS-
+    # encrypted) because real estate boxes were observed with an empty/disabled trust store
+    # ("SSL: no trusted CA certificate found"), which makes a validating fetch fail. To
+    # HARDEN a site, import the Cloudflare-edge CA (/certificate import) or enable a
+    # populated builtin trust store, then set this to "yes-without-crl". Note: with "no",
+    # the per-device bearer is sent over unverified TLS — fine for a pilot; for estate-wide
+    # rollout, harden so the token can't be captured by a path MITM.
+    :global vigilantTlsCheck "no"
     :global vigilantApplyEnabled false
 }
 /system scheduler remove [find name="vigilant-env"]

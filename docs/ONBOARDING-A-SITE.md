@@ -133,6 +133,16 @@ matters only if someone has *disabled* core packages.)
 
 ### 2.2 The TLS decision for `/tool fetch` over HTTPS — DECIDE THIS BEFORE ENROLMENT
 
+> **Reality check (observed on a real 7.18 estate box):** a validating fetch returned
+> **`SSL: no trusted CA certificate found`** — RouterOS's builtin trust store was
+> empty/disabled, so `yes-without-crl` failed. Because of this, the install block now
+> **defaults `vigilantTlsCheck` to `"no"`** (skip verification; still TLS-encrypted) for
+> reliable onboarding. The validation guidance below is the **hardening** path: enable a
+> populated builtin trust store *or* import the Cloudflare-edge CA, prove the `/healthz`
+> fetch validates, then set `vigilantTlsCheck "yes-without-crl"`. Until you do, the
+> per-device bearer rides unverified TLS — acceptable for a pilot, but **harden before
+> estate-wide rollout** so a path MITM can't capture the token.
+
 Vigilant ingest is HTTPS at `https://vigilant.internal.western-communication.com`. By
 default `/tool fetch mode=https` **validates the server cert against the router's trust
 store**. The host is **Cloudflare-fronted** (public exposure is via Cloudflare Tunnel — see
