@@ -111,6 +111,13 @@ function createServer({ store, config: cfg }) {
         return handlers.healthz(ctx);
       }
 
+      // GET / — open root health/status. Some platforms (and Coolify's default
+      // health check) probe '/' and only mark an app "running"/route it once that
+      // returns 2xx; without this the app 404s on '/' and can stay un-routed.
+      if (method === 'GET' && pathname === '/') {
+        return json(res, 200, { service: 'vigilant', ok: true });
+      }
+
       // ── device routes ────────────────────────────────────────────
       // POST /telemetry
       if (method === 'POST' && pathname === '/telemetry') {
