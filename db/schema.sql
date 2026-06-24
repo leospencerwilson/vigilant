@@ -54,7 +54,16 @@ CREATE TABLE IF NOT EXISTS device_state (
     ppp_sessions     int,                       -- active PPP/SSTP/L2TP sessions (concentrators)
     dhcp_leases      int,
     conn_count       int,                       -- firewall connection-tracking entries
-    lte_signal       int,                       -- RSRP/dBm where SIM present
+    lte_signal       int,                       -- RSRP/dBm where SIM present (also in lte_state)
+    cpu_temperature  numeric,
+    board_temperature numeric,
+    fan1_speed       int,
+    fan2_speed       int,
+    write_sect_total bigint,                     -- flash-wear trend
+    firmware_current text,
+    firmware_upgrade text,                       -- if != current → firmware-behind
+    ntp_synced       boolean,
+    netwatch_down    int,                        -- count of monitored hosts currently down
     last_seen_at     timestamptz NOT NULL DEFAULT now(),
     raw              jsonb                       -- full last payload, for fields not yet promoted to columns
 );
@@ -86,6 +95,51 @@ CREATE TABLE IF NOT EXISTS interface_state (
     PRIMARY KEY (device_id, name)
 );
 CREATE INDEX IF NOT EXISTS interface_state_device_idx ON interface_state (device_id);
+
+-- ─────────────────────────── lte_state (SIM + cell + signal) ──────────────
+-- One row per (device, lte interface), UPSERTed. Identifiers (iccid/imsi/imei/
+-- msisdn) are static — the agent sends them on bootstrap/on-change only, not every
+-- tick (querying them via AT can disrupt the data session). Signal fields update fast.
+CREATE TABLE IF NOT EXISTS lte_state (
+    device_id     uuid        NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    interface     text        NOT NULL,
+    -- static identifiers
+    iccid         text,                          -- /interface/lte/info -> uicc (the SIM number)
+    imsi          text,
+    imei          text,                          -- modem IMEI
+    msisdn        text,                          -- phone number (subscriber-number), often blank
+    operator      text,                          -- current-operator (MCC+MNC) / name
+    apn           text,
+    -- live state
+    registration  text,                          -- registered / searching / denied
+    access_tech   text,                          -- lte / lte-a / 5g-nsa
+    band          text,
+    earfcn        text,
+    cell_id       text,                          -- current-cellid (eNB+cell)
+    phy_cellid    text,
+    rssi          numeric,
+    rsrp          numeric,
+    rsrq          numeric,
+    sinr          numeric,
+    cqi           int,
+    session_uptime_s bigint,
+    sampled_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (device_id, interface)
+);
+CREATE INDEX IF NOT EXISTS lte_state_iccid_idx ON lte_state (iccid);
+
+CREATE TABLE IF NOT EXISTS lte_history (
+    device_id   uuid        NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    interface   text        NOT NULL,
+    ts          timestamptz NOT NULL,
+    rsrp        numeric,
+    rsrq        numeric,
+    sinr        numeric,
+    rssi        numeric,
+    cell_id     text,
+    PRIMARY KEY (device_id, interface, ts)
+);
+CREATE INDEX IF NOT EXISTS lte_history_ts_idx ON lte_history (ts);
 
 -- ─────────────────────────── history (time-series, downsampled) ───────────
 -- Append-only. The collector worker rolls these up (raw 24h → 1-min 7d → 5-min 90d)
@@ -238,6 +292,7 @@ BEGIN
   IF FOUND THEN
     EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.device_state';
     EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.interface_state';
+    EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.lte_state';
     EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.config_jobs';
     EXECUTE 'ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.alerts';
   END IF;

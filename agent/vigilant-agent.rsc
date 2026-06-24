@@ -32,9 +32,46 @@
 :local freeHdd   "0";       :do { :set freeHdd   [/system resource get free-hdd-space] } on-error={}
 :local rosVer    "0";       :do { :set rosVer    [/system resource get version] } on-error={}
 
-# Health (temperature/voltage) — not all boards support it; guard each.
-:local temp "null"; :do { :set temp [/system health get [find name="temperature"] value] } on-error={}
-:local volt "null"; :do { :set volt [/system health get [find name="voltage"] value] } on-error={}
+# Health — board-dependent; guard each. (Iterating /system/health rows also works.)
+:local temp     "null"; :do { :set temp     [/system health get [find name="temperature"] value] } on-error={}
+:local cpuTemp  "null"; :do { :set cpuTemp  [/system health get [find name="cpu-temperature"] value] } on-error={}
+:local brdTemp  "null"; :do { :set brdTemp  [/system health get [find name="board-temperature"] value] } on-error={}
+:local volt     "null"; :do { :set volt     [/system health get [find name="voltage"] value] } on-error={}
+:local fan1     "null"; :do { :set fan1     [/system health get [find name="fan1-speed"] value] } on-error={}
+:local writeSect "0";   :do { :set writeSect [/system resource get write-sect-total] } on-error={}
+
+# Firmware-behind + NTP sync (cheap operational signals)
+:local fwCur "null"; :do { :set fwCur [/system routerboard get current-firmware] } on-error={}
+:local fwUpg "null"; :do { :set fwUpg [/system routerboard get upgrade-firmware] } on-error={}
+:local ntpSynced "false"; :do { :if ([/system ntp client get status] = "synchronized") do={ :set ntpSynced "true" } } on-error={}
+
+# ── LTE / SIM (only if an LTE interface exists) ──────────────────────
+# Signal fields update every tick. Identifiers (ICCID/IMSI/IMEI/MSISDN) are STATIC —
+# we read them via lte/info here, but if missing fall back to at-chat sparingly (see
+# docs/TELEMETRY-CATALOGUE.md §3 — at-chat every tick can disrupt the data session).
+:local lteJson "null"
+:if ([:len [/interface/lte find]] > 0) do={
+    :do {
+        :local lif [/interface/lte find]
+        :local ln  [/interface/lte get [:pick $lif 0] name]
+        :local li  [/interface/lte/info $ln once as-value]
+        :local g do={ :local v ($1->$2); :if ([:typeof $v] = "nothing") do={ :return "" }; :return $v }
+        :set lteJson ("{\"interface\":\"" . $ln . "\"" . \
+            ",\"iccid\":\"" .  [$g $li "uicc"] . "\"" . \
+            ",\"imsi\":\"" .   [$g $li "imsi"] . "\"" . \
+            ",\"imei\":\"" .   [$g $li "imei"] . "\"" . \
+            ",\"msisdn\":\"" . [$g $li "subscriber-number"] . "\"" . \
+            ",\"operator\":\"" . [$g $li "current-operator"] . "\"" . \
+            ",\"registration\":\"" . [$g $li "registration-status"] . "\"" . \
+            ",\"access_tech\":\"" . [$g $li "access-technology"] . "\"" . \
+            ",\"band\":\"" .  [$g $li "band"] . "\"" . \
+            ",\"cell_id\":\"" . [$g $li "current-cellid"] . "\"" . \
+            ",\"rssi\":\"" .  [$g $li "rssi"] . "\"" . \
+            ",\"rsrp\":\"" .  [$g $li "rsrp"] . "\"" . \
+            ",\"rsrq\":\"" .  [$g $li "rsrq"] . "\"" . \
+            ",\"sinr\":\"" .  [$g $li "sinr"] . "\"}")
+    } on-error={ :log warning "vigilant-agent: lte/info read failed" }
+}
 
 # WAN / routing (public IP only — NEVER the password)
 :local publicIp "null"
@@ -71,9 +108,12 @@
 :local body "{\
 \"serial\":\"$serial\",\"identity\":\"$identity\",\"uptime\":\"$uptime\",\
 \"cpu_load\":$cpuLoad,\"free_memory\":$freeMem,\"total_memory\":$totMem,\"free_hdd\":$freeHdd,\
-\"ros_version\":\"$rosVer\",\"temperature\":$temp,\"voltage\":$volt,\
-\"public_ip\":\"$publicIp\",\"pppoe_running\":$pppoeUp,\"ppp_sessions\":$pppSessions,\
-\"dhcp_leases\":$dhcpLeases,\"interfaces\":$ifaces}"
+\"ros_version\":\"$rosVer\",\"temperature\":$temp,\"cpu_temperature\":$cpuTemp,\
+\"board_temperature\":$brdTemp,\"voltage\":$volt,\"fan1_speed\":$fan1,\
+\"write_sect_total\":$writeSect,\"firmware_current\":\"$fwCur\",\"firmware_upgrade\":\"$fwUpg\",\
+\"ntp_synced\":$ntpSynced,\"public_ip\":\"$publicIp\",\"pppoe_running\":$pppoeUp,\
+\"ppp_sessions\":$pppSessions,\"dhcp_leases\":$dhcpLeases,\
+\"lte\":$lteJson,\"interfaces\":$ifaces}"
 
 # ── push, and read back control + pending job ────────────────────────
 :local resp ""
