@@ -285,13 +285,16 @@
 # ingest parses the JSON body regardless of Content-Type, so the header is unnecessary.
 :local resp ""
 :onerror telErr in={
-    :set resp [/tool fetch http-method=post mode=https check-certificate=$vigilantCC \
+    # output=none — do NOT capture the response. /tool fetch with output=user/as-value
+    # buffers the result back through the scripting message bus, which trips
+    # "maximum message size exceeded" on a real device. Telemetry doesn't need the
+    # response (config-apply is gated off and reads via GET /config/pending instead),
+    # so we fire-and-forget. $resp stays "" and the config block below cleanly no-ops.
+    /tool fetch http-method=post mode=https check-certificate=$vigilantCC \
         url=("$vigilantUrl/telemetry") \
         http-header-field=("Authorization: Bearer " . $vigilantToken) \
-        http-data=$body output=user as-value]
+        http-data=$body output=none
 } do={
-    # Surface the REAL fetch error + the body size, so a failure is diagnosable instead
-    # of a generic "POST failed" (e.g. HTTP status, "too large", timeout, TLS).
     :log warning ("vigilant-agent: telemetry POST failed: " . $telErr . " | body-bytes=" . [:len $body])
 }
 
