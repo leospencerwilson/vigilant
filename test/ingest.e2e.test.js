@@ -204,3 +204,18 @@ test("POST /telemetry without a valid bearer -> 401", async () => {
     await close(server);
   }
 });
+
+test("GET / serves the admin onboarding UI (handler exported + wired)", async () => {
+  const config = makeConfig();
+  const store = makeMemStore();
+  const server = createServer({ store, config });
+  const port = await listen(server);
+  try {
+    const r = await request(port, { method: "GET", path: "/" });
+    assert.equal(r.status, 200, "root returns 200 (not a 500 from a missing export)");
+    assert.equal(typeof r.body, "string", "root serves HTML, not JSON");
+    assert.ok(/Vigilant|onboarding/i.test(r.body), "root is the admin UI page");
+  } finally {
+    await close(server);
+  }
+});

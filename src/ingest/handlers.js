@@ -504,6 +504,7 @@ async function deviceDetail(ctx) {
 
 module.exports = {
   healthz,
+  adminUi,
   telemetry: telemetryIngest,
   agentScript,
   configPending,
