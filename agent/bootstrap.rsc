@@ -14,10 +14,14 @@
 #   3. vigilant-agent     — the collector script itself (fetched by the bootstrap).
 #   4. vigilant-agent scheduler — runs the collector every 10s (the telemetry tick).
 #
-# TLS: RouterOS 7 does NOT trust public CAs by default, so a plain mode=https fetch to a
-# Cloudflare-fronted host FAILS. vigilantTlsCheck controls /tool fetch check-certificate:
-#   "no"               -> skip verification (pragmatic pilot default; still TLS-encrypted)
-#   "yes-without-crl"  -> verify the chain (do this once you've imported the CA — secure)
+# TLS: vigilantTlsCheck controls /tool fetch check-certificate. RouterOS 7.12+ ships a
+# builtin trust store containing the public roots, so a validating fetch to the
+# Cloudflare-fronted host works with NO CA import on a healthy box (correct clock + trust
+# store on). Two things break it on a fresh board: a wrong clock (1970 RTC -> "cert not yet
+# valid") and a disabled trust store — fix both before install (see ONBOARDING-A-SITE.md §2).
+#   "yes-without-crl"  -> validate the chain via the builtin trust store (default; secure)
+#   "yes"              -> validate incl. CRL
+#   "no"               -> skip verification (fallback only; still TLS-encrypted but unverified)
 #
 # Config-apply: vigilantApplyEnabled=false keeps the device telemetry-only. It will NOT
 # change anything on the router until you deliberately flip this to true later.
@@ -27,7 +31,11 @@
 /system script add name=vigilant-env dont-require-permissions=no source={
     :global vigilantUrl "<VIGILANT_URL>"
     :global vigilantToken "<VIGILANT_TOKEN>"
-    :global vigilantTlsCheck "no"
+    # "yes-without-crl" = validate the TLS chain (RouterOS 7.12+ ships a builtin trust
+    # store that contains the public root behind the Cloudflare edge, so no CA import is
+    # needed on a healthy box with a correct clock). Set to "no" ONLY as a fallback if a
+    # validating fetch fails after fixing the clock + trust store (see ONBOARDING-A-SITE.md).
+    :global vigilantTlsCheck "yes-without-crl"
     :global vigilantApplyEnabled false
 }
 /system scheduler remove [find name="vigilant-env"]

@@ -56,51 +56,41 @@ day it `GET`s `/agent/script?serial=…`, writes it to `vigilant-agent.rsc`, rem
 collection once (server-side, `agent_scripts.is_current=true`) and the estate self-updates
 — no per-router edits.
 
-### Three blocking facts the shipped scripts get wrong (you fix these here)
+### Easiest path: the admin UI
 
-These are the reasons "paste both files as-is" does **not** work. Each is handled in the
-steps below; do not skip them.
+Open **`https://vigilant.internal.western-communication.com/`** in a browser, paste the
+admin `ENROLL_TOKEN` into the token bar, fill the **Enrol a device** form (serial + a few
+fields), and click **Generate key & install block**. It mints the per-device token and
+shows the **complete copy-paste install block** (the same one `/enroll` returns), plus a
+live fleet table. You still do the router-side work under **Safe Mode** per §3, and the
+prereqs in §2 still apply. The curl/API flow (§4) is the scripted equivalent.
 
-1. **TLS must validate before any data flows.** Every `/tool fetch` uses `mode=https` with
-   full validation (no `check-certificate=` override). The host is **Cloudflare-fronted**,
-   so its edge cert chains to a **public root that RouterOS 7's `builtin-trust-store`
-   already contains** — on a healthy 7.19.4 box validation just works, with **no CA
-   import**. The two things that break it on a fresh box are a **disabled trust store** and
-   a **wrong clock** (cert-not-yet-valid on a 1970 RTC looks exactly like a missing CA). The
-   agent **swallows the error** (`on-error={ :log warning … }`), so the router looks healthy
-   locally while sending **zero** telemetry, and the daily bootstrap self-update never runs.
-   → Fix the clock + trust store and prove a validating `/healthz` fetch **before** enrolment
-   (§2.2). **Never** hand-add `check-certificate=no` to the scripts (it is overwritten by the
-   daily self-update) and **never** fetch a CA from the ingest (no such route exists).
-2. **`:global` variables are wiped on every reboot.** `vigilantUrl` and `vigilantToken`
-   vanish on a power cut; the agent then fetches an empty base URL with an empty bearer
-   (401 / malformed) and the bootstrap fetch has no host. Neither script ships a startup
-   scheduler. → You add a `start-time=startup` scheduler that re-declares the per-device
-   globals (§5).
-3. **Neither file creates the collector scheduler.** `bootstrap.rsc` only adds the daily
-   `vigilant-bootstrap` scheduler; the agent script has no timer of its own. Pasted as-is,
-   `vigilant-agent` never runs on a schedule, so no telemetry is sent. → You add the 10s
-   `vigilant-agent` scheduler by hand (§5), **with a `Vigilant` comment** so the back-out
-   in §8 can find it.
+### What the installer sets up for you (one paste, reboot-safe)
 
-### A trap to avoid: the wrong hostname
+The install block returned by `/enroll` / the UI is the **full** installer — it is no
+longer "paste two files and hand-fix three things." In one paste it creates, all named so
+the §8 back-out finds them:
 
-Both `.rsc` draft files hardcode the **OLD** host
-`https://vigilant.western-communication.com` in their comments. The **LIVE** ingest is at
-`https://vigilant.internal.western-communication.com` (the `.internal` subdomain). An
-operator transcribing from the script comment points the router at the wrong (likely
-non-resolving) host. **Always paste the `vigilantUrl` that `/enroll` returns** in its
-`bootstrap` field — it is built from `config.publicBaseUrl` (`handlers.js` `enroll()`),
-which is `PUBLIC_BASE_URL` in Coolify, and is also used to build the `config/<id>.rsc` job
-URL. Treat the URLs in the `.rsc` drafts as stale placeholders; update them before they
-ship estate-wide.
+1. **`vigilant-env`** — a script that (re)declares the per-device globals, plus a
+   `start-time=startup` scheduler that re-runs it on every boot. RouterOS `:global` vars are
+   wiped on reboot, so this is how `vigilantUrl`/`vigilantToken`/`vigilantTlsCheck`/
+   `vigilantApplyEnabled` survive a power cut.
+2. **`vigilant-bootstrap`** + a `1d` scheduler — the daily self-updater that re-fetches the
+   collector from `GET /agent/script`.
+3. **`vigilant-agent`** — the collector script (fetched by the bootstrap on first run).
+4. **`vigilant-agent` scheduler** — the 10s telemetry tick.
 
-> **But the `/enroll` `bootstrap` is only authoritative if `PUBLIC_BASE_URL` is set.**
-> `config.publicBaseUrl` **defaults to the OLD `.internal`-less host** when `PUBLIC_BASE_URL`
-> is unset (`src/shared/config.js` line 47), so a misconfigured Coolify env makes `/enroll`
-> hand you the **wrong** host in both the `bootstrap` globals and the config-job URL. §4.0
-> makes you confirm `PUBLIC_BASE_URL` before enrolling, and §4.2 makes you assert the
-> returned host is the `.internal` one and **abort** if not.
+It sets `vigilantApplyEnabled false` (config-apply OFF) and `vigilantTlsCheck`
+`yes-without-crl` (validate the TLS chain via the builtin trust store — see §2.2). All four
+`/tool fetch` calls (bootstrap + the agent's telemetry/config) honour `vigilantTlsCheck`.
+
+> **The host comes from `PUBLIC_BASE_URL`.** `enroll()` substitutes `config.publicBaseUrl`
+> into the install block (and the `config/<id>.rsc` job URL). It **defaults to the OLD
+> `.internal`-less host** if `PUBLIC_BASE_URL` is unset (`src/shared/config.js`), so §4.0
+> makes you confirm `PUBLIC_BASE_URL=https://vigilant.internal.western-communication.com` in
+> Coolify before enrolling, and §4.2 makes you assert the returned block contains the
+> `.internal` host. (The literal URLs in the `agent/*.rsc` *comments* are placeholders;
+> the server substitutes the real one — always use what `/enroll`/the UI hands you.)
 
 ---
 
@@ -359,12 +349,14 @@ Body fields (handled in `handlers.js` `enroll`):
 | `wan_type` | No | Defaults to `"unknown"`. DB CHECK accepts `pppoe`/`sim`/`dhcp`/`static`/`unknown`. The raw HTTP handler stores the string **as-is** — it does **NOT** apply the CLI's `lte`/`4g`/`5g` → `sim` aliasing. **For LTE/SIM sites over HTTP send `"wan_type":"sim"`** (use `bin/enroll.js` if you want the friendly aliasing). |
 | `tags` | No | Must be an array, else coerced to `[]`. |
 
-### 4.2 The response — `200 {token, bootstrap}`
+### 4.2 The response — `200 {token, serial, install, bootstrap}`
 
 ```json
 {
   "token": "<64 hex chars — crypto.randomBytes(32).toString('hex')>",
-  "bootstrap": ":global vigilantUrl \"https://vigilant.internal.western-communication.com\"\n:global vigilantToken \"<token>\""
+  "serial": "<SERIAL>",
+  "install": "# Vigilant install/bootstrap …\n/system script remove [find name=\"vigilant-env\"]\n… full RouterOS install block …",
+  "bootstrap": "<alias of install, for backward compatibility>"
 }
 ```
 
@@ -372,9 +364,12 @@ Body fields (handled in `handlers.js` `enroll`):
   `sha256(token)`** (`store.setDeviceToken`); the plaintext is **returned once in this
   response and never again**. **Capture it now — it is not recoverable. If lost, re-enrol**
   the device to mint a new one.
-- The `bootstrap` field is **exactly two `:global` lines** (newline-separated), built
-  verbatim from `config.publicBaseUrl` and the token. **This is the correct `vigilantUrl`**
-  — paste from here, not from the `.rsc` comments.
+- **`install`** (and its alias `bootstrap`) is the **complete, reboot-safe RouterOS install
+  block** — the `agent/bootstrap.rsc` template with the real `vigilantUrl`
+  (`config.publicBaseUrl`) and this device's `token` substituted. It creates the `vigilant-env`
+  globals + startup scheduler, the daily `vigilant-bootstrap`, fetches the collector, and adds
+  the 10s `vigilant-agent` scheduler — config-apply OFF. **Paste this one block** (§5); you no
+  longer hand-assemble the pieces.
 - **HARD CHECK — assert the returned host before doing anything else.** Because the
   `bootstrap` is built verbatim from `config.publicBaseUrl`, a misconfigured `PUBLIC_BASE_URL`
   silently returns the WRONG host (see §4.0). **Confirm the `bootstrap` string contains
@@ -390,10 +385,10 @@ Body fields (handled in `handlers.js` `enroll`):
     && echo "$resp" \
     || { echo "ABORT: /enroll returned wrong host — check PUBLIC_BASE_URL in Coolify"; }
   ```
-- **The HTTP `bootstrap` field is ONLY the two bare globals — it does NOT include
-  reboot-persistence.** After a reboot the globals are lost and the scheduler can't
-  authenticate. You add persistence yourself in §5 (or run `bin/enroll.js`, whose CLI prints
-  a richer snippet with a `vigilant-env` persisted script + startup scheduler).
+- **`install` already includes reboot-persistence** (the `vigilant-env` script + a
+  `start-time=startup` scheduler) and the 10s collector scheduler — so a reboot re-declares
+  the globals and telemetry resumes on its own. You do **not** hand-add persistence any more;
+  just paste the block.
 
 > **Claude:** if running the enrol on Leo's behalf, return the `token` and `bootstrap`
 > to Leo immediately and do not retain the admin token.
@@ -402,11 +397,22 @@ Body fields (handled in `handlers.js` `enroll`):
 
 ## 5. Install on the router (telemetry only; config-apply DISABLED)
 
-> **Safe Mode on (§3.3). Review each block before paste.** Prefer the `.rsc` + `/import`
-> route for multi-line scripts (see §5.5). Paste the **exact** url+token from the §4
-> `bootstrap`/`token` — `vigilantUrl` must be
-> `https://vigilant.internal.western-communication.com` and the token must be **this**
-> device's.
+> **You paste ONE thing: the `install` block from §4 / the UI.** It is the complete,
+> reboot-safe installer — it creates the persisted globals + startup scheduler, the daily
+> self-updater, fetches the collector, and adds the 10s tick, with config-apply OFF and TLS
+> validation on. **§5.1–5.4 below describe what that one block does** (and the few things to
+> verify); you do **not** run them as separate manual steps any more.
+>
+> **Safe Mode on (§3.3). Review the block before paste.** Prefer saving it as an `.rsc` and
+> `/import` for a clean atomic paste (see §5.5). Confirm the block's `vigilantUrl` is
+> `https://vigilant.internal.western-communication.com` and the token is **this** device's
+> (it is, if you used this device's `/enroll` response).
+>
+> ```routeros
+> # Save the install block to a file and import it (recommended), in Safe Mode:
+> /import file-name=vigilant-install.rsc
+> # …or paste the whole block into a fresh Winbox "New Terminal" window in one go.
+> ```
 
 ### 5.1 Persist the per-device globals across reboot (fixes blocking-fact #2)
 
@@ -425,7 +431,7 @@ CLI-declared `:global` vars are session-scoped and wiped on reboot. The fix is a
 
 # (b) Run it ONCE per boot. start-time=startup + interval=0s = one-shot at boot.
 #     Do NOT give it a repeating interval (would churn the globals).
-/system scheduler add name=vigilant-env-startup start-time=startup interval=0s \
+/system scheduler add name=vigilant-env start-time=startup interval=0s \
     on-event="/system script run vigilant-env" \
     comment="Vigilant: re-declare globals on boot"
 
@@ -721,9 +727,10 @@ its prior state. Run **in Safe Mode (`Ctrl-X`)**. Each step is idempotent.
 #    Remove by NAME and by COMMENT — the 10s agent tick is found by its "Vigilant" comment.
 /system scheduler remove [find name="vigilant-rollback"]    ;# dead-man, only if a config apply was in flight
 /system scheduler remove [find name="vigilant-bootstrap"]   ;# daily self-update
-/system scheduler remove [find name="vigilant-env-startup"] ;# startup global loader
-/system scheduler remove [find comment~"Vigilant"]          ;# catch the 10s agent-tick scheduler + any stragglers
-/system scheduler print where on-event~"vigilant"           ;# verify the tick scheduler is gone
+/system scheduler remove [find name="vigilant-env"]         ;# startup global loader (start-time=startup)
+/system scheduler remove [find name="vigilant-agent"]       ;# 10s telemetry tick
+/system scheduler remove [find comment~"Vigilant"]          ;# catch any stragglers by comment
+/system scheduler print where comment~"Vigilant"            ;# verify no Vigilant schedulers remain
 
 # 2) Scripts.
 /system script remove [find name="vigilant-agent"]
