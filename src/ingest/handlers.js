@@ -239,25 +239,33 @@ async function telemetryIngest(ctx) {
 
   if (hasCore) {
     // 8. one logical transaction: upsert state + neighbors + lte + (mac_hosts) + history.
+    //
+    // NUMERIC COERCION (defence in depth): telemetry.normalize() already coerces every health
+    // numeric via transform.parseNum, but the agent emits some of these as QUOTED strings
+    // ('41.5') and absent values as the literal string 'null', while device_state's columns are
+    // numeric (int/bigint/numeric). Re-coerce here through transform.parseNum so the stored
+    // device_state is ALWAYS number|null regardless of which layer fed `payload` ('null' -> null,
+    // '41.5' -> 41.5), and a stray string can never slip into a numeric column.
+    const num = transform.parseNum;
     const deviceState = {
       status: 'online',
       uptime_s: parseRosUptime(payload.uptime),
-      cpu_load: payload.cpu_load,
-      free_memory: payload.free_memory,
-      total_memory: payload.total_memory,
-      free_hdd: payload.free_hdd,
-      temperature: payload.temperature,
-      voltage: payload.voltage,
+      cpu_load: num(payload.cpu_load),
+      free_memory: num(payload.free_memory),
+      total_memory: num(payload.total_memory),
+      free_hdd: num(payload.free_hdd),
+      temperature: num(payload.temperature),
+      voltage: num(payload.voltage),
       public_ip: payload.public_ip,
       ros_version: payload.ros_version,
       firmware: payload.firmware_current,
       pppoe_running: payload.pppoe_running,
-      ppp_sessions: payload.ppp_sessions,
-      dhcp_leases: payload.dhcp_leases,
-      cpu_temperature: payload.cpu_temperature,
-      board_temperature: payload.board_temperature,
-      fan1_speed: payload.fan1_speed,
-      write_sect_total: payload.write_sect_total,
+      ppp_sessions: num(payload.ppp_sessions),
+      dhcp_leases: num(payload.dhcp_leases),
+      cpu_temperature: num(payload.cpu_temperature),
+      board_temperature: num(payload.board_temperature),
+      fan1_speed: num(payload.fan1_speed),
+      write_sect_total: num(payload.write_sect_total),
       firmware_current: payload.firmware_current,
       firmware_upgrade: payload.firmware_upgrade,
       ntp_synced: payload.ntp_synced,
@@ -533,6 +541,69 @@ async function deviceDetail(ctx) {
   return json(res, 200, detail);
 }
 
+// ── GET /devices/:serial/history?window=1h (admin) ───────────────────
+// Time-series for the dashboard throughput/health charts. Returns device-level metric
+// points (cpu/memory/temperature/ppp) and per-interface rx/tx bps series, both
+// time-ascending, for the requested window. 404 when the serial is unknown so the UI can
+// distinguish a typo'd/deleted device from a device with no history yet.
+const HISTORY_WINDOWS = {
+  '1h': 3600,
+  '6h': 6 * 3600,
+  '24h': 24 * 3600,
+  '7d': 7 * 24 * 3600,
+};
+
+async function deviceHistory(ctx) {
+  const { res, store, query, params } = ctx;
+
+  // Validate the window; default to 1h on anything unrecognised (fail soft — a bad query
+  // param should still return a useful chart, not an error).
+  const requested = query && query.get('window');
+  const windowKey = Object.prototype.hasOwnProperty.call(HISTORY_WINDOWS, requested)
+    ? requested
+    : '1h';
+  const windowSeconds = HISTORY_WINDOWS[windowKey];
+
+  // Prefer the single combined store reader getDeviceHistory(serial, windowSeconds) (the
+  // HISTORY API contract method): it returns null for an unknown serial, does its own
+  // ts >= now()-window filtering, and (pg) caps the row count. Fall back to getDeviceDetail
+  // for existence + the split getMetricsHistory/getInterfaceHistory readers only when a store
+  // predates getDeviceHistory, so the route never 500s on an older store.
+  if (typeof store.getDeviceHistory === 'function') {
+    const hist = await store.getDeviceHistory(params.serial, windowSeconds);
+    if (!hist) return json(res, 404, { ok: false, error: 'not found' });
+    return json(res, 200, {
+      serial: hist.serial != null ? hist.serial : params.serial,
+      window: windowKey,
+      metrics: hist.metrics || [],
+      interfaces: hist.interfaces || [],
+    });
+  }
+
+  // ── fallback path (store predating getDeviceHistory) ──
+  const sinceMs = Date.now() - windowSeconds * 1000;
+  // 404 if the serial is unknown (mirrors deviceDetail). getDeviceDetail is the cheapest
+  // existence check that both stores already implement.
+  const detail = await store.getDeviceDetail(params.serial);
+  if (!detail) return json(res, 404, { ok: false, error: 'not found' });
+
+  const metrics =
+    typeof store.getMetricsHistory === 'function'
+      ? await store.getMetricsHistory(params.serial, sinceMs)
+      : [];
+  const interfaces =
+    typeof store.getInterfaceHistory === 'function'
+      ? await store.getInterfaceHistory(params.serial, sinceMs)
+      : [];
+
+  return json(res, 200, {
+    serial: params.serial,
+    window: windowKey,
+    metrics: metrics || [],
+    interfaces: interfaces || [],
+  });
+}
+
 module.exports = {
   healthz,
   adminUi,
@@ -544,4 +615,5 @@ module.exports = {
   enroll,
   fleet,
   deviceDetail,
+  deviceHistory,
 };

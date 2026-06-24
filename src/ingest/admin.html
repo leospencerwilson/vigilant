@@ -4,31 +4,33 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="robots" content="noindex" />
-<title>Vigilant — device onboarding</title>
+<title>Vigilant — fleet dashboard</title>
 <style>
   :root{
     --bg:#0b0f14; --panel:#121821; --panel2:#0e141d; --line:#1f2a37;
     --fg:#e6edf3; --mut:#8b9aa9; --acc:#3b82f6; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444;
+    --vpn:#a855f7; --lan:#38bdf8; --wan:#22c55e; --bridge:#eab308; --unused:#64748b; --disabled:#475569;
+    --rx:#3b82f6; --tx:#f59e0b;
     --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
     --sans:Inter,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.5}
-  header{display:flex;align-items:center;gap:12px;padding:16px 22px;border-bottom:1px solid var(--line);background:var(--panel2);position:sticky;top:0;z-index:5}
+  header{display:flex;align-items:center;gap:12px;padding:14px 22px;border-bottom:1px solid var(--line);background:var(--panel2);position:sticky;top:0;z-index:5}
   header .dot{width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok)}
   header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.2px}
   header .sub{color:var(--mut);font-size:12px}
   header .spacer{flex:1}
   .tokbar{display:flex;gap:8px;align-items:center}
-  .tokbar input{width:280px}
-  main{display:grid;grid-template-columns:minmax(420px,1fr) minmax(420px,1.3fr);gap:18px;padding:22px;max-width:1400px;margin:0 auto}
-  @media(max-width:900px){main{grid-template-columns:1fr}}
+  .tokbar input{width:260px}
+  main{max-width:1500px;margin:0 auto;padding:20px 22px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px}
   .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:0 0 14px}
   label{display:block;font-size:12px;color:var(--mut);margin:12px 0 5px}
   input,select,textarea{width:100%;padding:9px 11px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--fg);font-family:var(--sans);font-size:13px}
   textarea{font-family:var(--mono);font-size:12px;resize:vertical}
   input:focus,select:focus,textarea:focus{outline:none;border-color:var(--acc)}
+  select{width:auto}
   .step{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em;display:flex;justify-content:space-between;align-items:center;margin:14px 0 6px}
   pre.snippet{margin:0;white-space:pre-wrap;word-break:break-word;border-color:var(--acc)}
   .ok-parse{color:#86efac}
@@ -37,6 +39,8 @@
   button.primary{background:var(--acc);color:#fff;margin-top:16px;width:100%}
   button.primary:disabled{opacity:.5;cursor:not-allowed}
   button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg);padding:6px 10px;font-size:12px}
+  button.ghost:hover{border-color:var(--acc)}
+  button.ghost.on{border-color:var(--acc);color:#fff;background:rgba(59,130,246,.15)}
   .msg{margin-top:12px;padding:10px 12px;border-radius:8px;font-size:13px;display:none}
   .msg.err{display:block;background:rgba(239,68,68,.12);border:1px solid var(--bad);color:#fecaca}
   .msg.ok{display:block;background:rgba(34,197,94,.10);border:1px solid var(--ok);color:#bbf7d0}
@@ -57,12 +61,71 @@
   .between{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
   .between h2{margin:0}
   .empty{color:var(--mut);padding:18px;text-align:center}
+
+  /* ── view switching ───────────────────────────────────── */
+  .hidden{display:none !important}
+
+  /* fleet grid */
+  #fleetView{display:grid;grid-template-columns:minmax(380px,420px) 1fr;gap:18px}
+  @media(max-width:1000px){#fleetView{grid-template-columns:1fr}}
+  .fleetgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+  .devcard{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:13px;cursor:pointer;transition:border-color .12s,transform .08s}
+  .devcard:hover{border-color:var(--acc);transform:translateY(-1px)}
+  .devcard .nm{font-weight:600;font-size:13px;margin-bottom:2px}
+  .devcard .sn{font-family:var(--mono);font-size:11px;color:var(--mut);margin-bottom:8px}
+  .devcard .meta{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--mut);margin-top:8px}
+  .devcard .cust{font-size:11px;color:var(--mut);margin-bottom:6px}
+
+  /* ── device dashboard ─────────────────────────────────── */
+  #devView .dash-head{display:flex;align-items:flex-start;gap:14px;margin-bottom:18px}
+  #devView .dash-head .idblock{flex:1}
+  #devView .dash-head h2{font-size:20px;margin:0 0 4px;text-transform:none;letter-spacing:0;color:var(--fg)}
+  #devView .dash-head .ids{font-family:var(--mono);font-size:12px;color:var(--mut)}
+  #devView .dash-head .ids b{color:var(--fg);font-weight:600}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:18px}
+  .tile{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px}
+  .tile .lab{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
+  .tile .val{font-size:22px;font-weight:700;margin-top:5px;font-family:var(--mono)}
+  .tile .sub{font-size:11px;color:var(--mut);margin-top:2px}
+  .tile.flag{border-color:var(--warn)}
+  .tile.flag .val{color:var(--warn)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}
+  @media(max-width:900px){.grid2{grid-template-columns:1fr}}
+  .chartbox{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .chartbox h3{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:0 0 4px;display:flex;justify-content:space-between;align-items:center}
+  .chartbox .legend{font-size:11px;font-family:var(--sans);font-weight:400;text-transform:none;letter-spacing:0;color:var(--mut)}
+  .chartbox .legend .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 4px 0 10px;vertical-align:middle}
+  svg.chart{width:100%;height:130px;display:block}
+  svg.chart .axis{stroke:var(--line);stroke-width:1}
+  svg.chart .grid{stroke:var(--line);stroke-width:1;stroke-dasharray:2 3;opacity:.5}
+  svg.chart text{fill:var(--mut);font-family:var(--mono);font-size:9px}
+  .roledot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .linkdot{display:inline-block;width:8px;height:8px;border-radius:50%}
+  .role-wan{color:var(--wan)} .role-lan{color:var(--lan)} .role-vpn{color:var(--vpn)}
+  .role-bridge-member{color:var(--bridge)} .role-unused{color:var(--unused)} .role-disabled{color:var(--disabled)}
+  .rtag{display:inline-block;padding:1px 7px;border-radius:5px;font-size:10px;font-weight:600;font-family:var(--sans);text-transform:uppercase;letter-spacing:.04em}
+  .rtag.wan{background:rgba(34,197,94,.15);color:#86efac}
+  .rtag.lan{background:rgba(56,189,248,.15);color:#7dd3fc}
+  .rtag.vpn{background:rgba(168,85,247,.15);color:#d8b4fe}
+  .rtag.bridge-member{background:rgba(234,179,8,.15);color:#fde047}
+  .rtag.unused{background:rgba(100,116,139,.18);color:#cbd5e1}
+  .rtag.disabled{background:rgba(71,85,105,.25);color:#94a3b8}
+  .up{background:var(--ok);box-shadow:0 0 6px var(--ok)} .down{background:#374151}
+  .scroll{max-height:420px;overflow:auto}
+  .nbr-list{display:grid;grid-template-columns:1fr;gap:8px}
+  .nbr{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px 11px;font-size:12px}
+  .nbr .nh{display:flex;justify-content:space-between;font-family:var(--mono)}
+  .nbr .ns{color:var(--mut);font-size:11px;margin-top:3px}
+  .ltegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px}
+  .lte-cell{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px}
+  .lte-cell .lab{font-size:10px;text-transform:uppercase;color:var(--mut);letter-spacing:.05em}
+  .lte-cell .v{font-family:var(--mono);font-size:14px;margin-top:3px}
 </style>
 </head>
 <body>
 <header>
-  <span class="dot" id="health"></span>
-  <div><h1>Vigilant</h1><div class="sub">MikroTik device onboarding · vigilant.internal</div></div>
+  <span class="dot" id="health" title="ingest health"></span>
+  <div><h1>Vigilant</h1><div class="sub">MikroTik fleet telemetry · vigilant.internal</div></div>
   <div class="spacer"></div>
   <div class="tokbar">
     <input id="admintok" type="password" placeholder="Admin token (ENROLL_TOKEN)" autocomplete="off" />
@@ -71,47 +134,103 @@
 </header>
 
 <main>
-  <section class="card">
-    <h2>Enrol a device</h2>
-    <p class="hint">Two steps — no typing. Paste the snippet into the router's terminal, then paste what it prints back here. The site name is taken from the router's identity.</p>
+  <!-- ══════════════════ FLEET VIEW ══════════════════ -->
+  <div id="fleetView">
+    <section class="card">
+      <h2>Enrol a device</h2>
+      <p class="hint">Two steps — no typing. Paste the snippet into the router's terminal, then paste what it prints back here. The site name is taken from the router's identity.</p>
 
-    <div class="step"><span>1 · Paste this into the router (New Terminal / SSH)</span><button class="ghost" data-copy="probe">Copy</button></div>
-    <pre class="snippet" id="probe">:put ("VIGILANT serial=" . [/system routerboard get serial-number]); :put ("VIGILANT identity=" . [/system identity get name])</pre>
+      <div class="step"><span>1 · Paste this into the router (New Terminal / SSH)</span><button class="ghost" data-copy="probe">Copy</button></div>
+      <pre class="snippet" id="probe">:put ("VIGILANT serial=" . [/system routerboard get serial-number]); :put ("VIGILANT identity=" . [/system identity get name])</pre>
 
-    <label>2 · Paste the router's output here</label>
-    <textarea id="probeout" rows="4" placeholder="VIGILANT serial=HGT0A023T6C&#10;VIGILANT identity=Allied Huddersfield" autocomplete="off"></textarea>
-    <div class="hint" id="parsed">Waiting for router output…</div>
+      <label>2 · Paste the router's output here</label>
+      <textarea id="probeout" rows="4" placeholder="VIGILANT serial=HGT0A023T6C&#10;VIGILANT identity=Allied Huddersfield" autocomplete="off"></textarea>
+      <div class="hint" id="parsed">Waiting for router output…</div>
 
-    <button class="primary" id="enrol">Generate key &amp; install block</button>
-    <div class="msg" id="msg"></div>
+      <button class="primary" id="enrol">Generate key &amp; install block</button>
+      <div class="msg" id="msg"></div>
 
-    <div class="result" id="result">
-      <div class="field">
-        <div class="k">Per-device token <button class="ghost" data-copy="tokval">Copy</button></div>
-        <code class="tok" id="tokval"></code>
-        <div class="hint">⚠️ Shown once. It's stored only as a hash server-side — copy it now.</div>
+      <div class="result" id="result">
+        <div class="field">
+          <div class="k">Per-device token <button class="ghost" data-copy="tokval">Copy</button></div>
+          <code class="tok" id="tokval"></code>
+          <div class="hint">⚠️ Shown once. It's stored only as a hash server-side — copy it now.</div>
+        </div>
+        <div class="field">
+          <div class="k">RouterOS install block — paste under Safe Mode (Ctrl-X) <button class="ghost" data-copy="installval">Copy</button></div>
+          <pre id="installval"></pre>
+          <div class="hint">Telemetry-only (config-apply disabled). TLS verification off by default — see the runbook to harden.</div>
+        </div>
       </div>
-      <div class="field">
-        <div class="k">RouterOS install block — paste under Safe Mode (Ctrl-X) <button class="ghost" data-copy="installval">Copy</button></div>
-        <pre id="installval"></pre>
-        <div class="hint">Telemetry-only (config-apply disabled). TLS verification off by default — see the runbook to harden.</div>
+    </section>
+
+    <section class="card">
+      <div class="between"><h2>Fleet</h2><button class="ghost" id="refresh">Refresh</button></div>
+      <div id="fleet"><div class="empty">Enter the admin token to load the fleet.</div></div>
+    </section>
+  </div>
+
+  <!-- ══════════════════ DEVICE DASHBOARD ══════════════════ -->
+  <div id="devView" class="hidden">
+    <div style="margin-bottom:16px"><button class="ghost" id="back">← Back to fleet</button></div>
+
+    <div class="dash-head">
+      <div class="idblock">
+        <h2 id="d-name">—</h2>
+        <div class="ids">
+          <b id="d-serial">—</b> · <span id="d-model">—</span> · ROS <span id="d-ros">—</span>
+          · up <span id="d-uptime">—</span> · <span id="d-ip">—</span>
+        </div>
+      </div>
+      <div id="d-status"></div>
+    </div>
+
+    <div class="tiles" id="d-tiles"></div>
+
+    <div class="card" style="margin-bottom:18px">
+      <div class="between"><h2>Port map</h2><span class="hint" id="d-portcount"></span></div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Port</th><th>Role</th><th>Link</th><th>Speed</th><th>RX</th><th>TX</th></tr></thead>
+          <tbody id="d-ports"><tr><td colspan="6" class="empty">No interfaces.</td></tr></tbody>
+        </table>
       </div>
     </div>
-  </section>
 
-  <section class="card">
-    <div class="between"><h2>Fleet</h2><button class="ghost" id="refresh">Refresh</button></div>
-    <table>
-      <thead><tr><th>Serial</th><th>Site</th><th>Status</th><th>CPU</th><th>Last seen</th></tr></thead>
-      <tbody id="fleet"><tr><td colspan="5" class="empty">Enter the admin token to load the fleet.</td></tr></tbody>
-    </table>
-  </section>
+    <div class="card" style="margin-bottom:18px">
+      <div class="between">
+        <h2>Throughput &amp; health</h2>
+        <div>
+          <button class="ghost win on" data-win="1h">1h</button>
+          <button class="ghost win" data-win="6h">6h</button>
+          <button class="ghost win" data-win="24h">24h</button>
+        </div>
+      </div>
+      <div class="grid2">
+        <div class="chartbox"><h3>CPU load <span class="legend"><span class="sw" style="background:var(--acc)"></span>%</span></h3><svg class="chart" id="c-cpu"></svg></div>
+        <div class="chartbox"><h3>Free memory <span class="legend"><span class="sw" style="background:var(--ok)"></span>bytes</span></h3><svg class="chart" id="c-mem"></svg></div>
+      </div>
+      <div class="grid2" id="d-ifcharts"></div>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <h2>Neighbours</h2>
+        <div id="d-nbrs" class="nbr-list"><div class="empty">None.</div></div>
+      </div>
+      <div class="card hidden" id="d-ltebox">
+        <h2>LTE / cellular</h2>
+        <div class="ltegrid" id="d-lte"></div>
+      </div>
+    </div>
+  </div>
 </main>
 
 <script>
 const $ = s => document.querySelector(s);
-// Token source: whatever is in the field right now, else the cached value. So just
-// TYPING the token is enough — no need to click "Use token" first.
+const $$ = s => Array.from(document.querySelectorAll(s));
+
+// ── token: typed value wins, else cached. Typing is enough — no need to click. ──
 const tok = () => {
   const el = document.getElementById('admintok');
   const typed = el && el.value ? el.value.trim() : '';
@@ -121,19 +240,111 @@ function setMsg(t, cls){ const m=$('#msg'); m.textContent=t; m.className='msg '+
 function authHeaders(){ return { 'Authorization':'Bearer '+tok(), 'Content-Type':'application/json' }; }
 
 $('#admintok').value = sessionStorage.getItem('vigilant_admin') || '';
-// Persist as you type, and refresh the fleet once a token is present.
 $('#admintok').addEventListener('input', () => {
   sessionStorage.setItem('vigilant_admin', $('#admintok').value.trim());
   if (tok()) loadFleet();
 });
 $('#savetok').onclick = () => { sessionStorage.setItem('vigilant_admin', $('#admintok').value.trim()); setMsg(tok() ? 'Token set — fleet loaded.' : 'Enter a token first.', tok() ? 'ok' : 'err'); loadFleet(); };
 
-document.querySelectorAll('[data-copy]').forEach(b => b.onclick = () => {
+$$('[data-copy]').forEach(b => b.onclick = () => {
   const el = $('#'+b.dataset.copy); navigator.clipboard.writeText(el.textContent).then(()=>{ b.textContent='Copied'; setTimeout(()=>b.textContent='Copy',1200); });
 });
 
-// Parse the router's pasted output. Serial is to end-of-line; identity (may contain
-// spaces) is captured to end-of-line too. Tolerant of extra terminal noise.
+// ════════════════════ humanise helpers ════════════════════
+function humanBps(v){
+  if (v == null || isNaN(v)) return '—';
+  const a = Math.abs(v);
+  if (a < 1e3) return Math.round(v) + ' bps';
+  if (a < 1e6) return (v/1e3).toFixed(a<1e4?1:0) + ' kbps';
+  if (a < 1e9) return (v/1e6).toFixed(2) + ' Mbps';
+  return (v/1e9).toFixed(2) + ' Gbps';
+}
+function humanBytes(v){
+  if (v == null || isNaN(v)) return '—';
+  const a = Math.abs(v);
+  if (a < 1024) return v + ' B';
+  if (a < 1048576) return (v/1024).toFixed(1) + ' KiB';
+  if (a < 1073741824) return (v/1048576).toFixed(1) + ' MiB';
+  return (v/1073741824).toFixed(2) + ' GiB';
+}
+function humanUptime(s){
+  if (s == null || isNaN(s)) return '—';
+  s = Math.floor(s);
+  const d = Math.floor(s/86400); s -= d*86400;
+  const h = Math.floor(s/3600);  s -= h*3600;
+  const m = Math.floor(s/60);
+  const parts = [];
+  if (d) parts.push(d+'d');
+  if (h || d) parts.push(h+'h');
+  parts.push(m+'m');
+  return parts.join(' ');
+}
+function ago(ts){ if(!ts) return '—'; const d=(Date.now()-new Date(ts).getTime())/1000; if(d<0) return 'now'; if(d<60) return Math.round(d)+'s ago'; if(d<3600) return Math.round(d/60)+'m ago'; if(d<86400) return Math.round(d/3600)+'h ago'; return Math.round(d/86400)+'d ago'; }
+function pill(s){ s=(s||'unknown'); return '<span class="pill '+s+'">'+s+'</span>'; }
+function esc(s){ if(s==null) return ''; return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function dash(v, suffix){ return (v==null||v==='') ? '—' : (esc(v)+(suffix||'')); }
+
+// ════════════════════ inline SVG line chart ════════════════════
+// drawLineChart(svgEl, series, opts)
+//   series: [{ points:[{ts, value}], color:'#hex' }, ...]   (null values are skipped)
+//   opts:   { yFmt:fn(v)->str, min, max }   (min/max auto from data when absent)
+// Time on x (from earliest to latest ts across all series), value on y. Pure SVG;
+// no libraries. Renders axis min/max labels + a couple of gridlines + multiple polylines.
+const SVGNS = 'http://www.w3.org/2000/svg';
+function svgEl(tag, attrs){ const e=document.createElementNS(SVGNS, tag); for(const k in attrs) e.setAttribute(k, attrs[k]); return e; }
+function drawLineChart(el, series, opts){
+  opts = opts || {};
+  while (el.firstChild) el.removeChild(el.firstChild);
+  const W = el.clientWidth || 400, H = el.clientHeight || 130;
+  const padL = 46, padR = 8, padT = 8, padB = 16;
+  el.setAttribute('viewBox', '0 0 '+W+' '+H);
+
+  // Collect finite points.
+  const all = [];
+  for (const s of (series||[])) for (const p of (s.points||[])) if (p && p.value != null && isFinite(p.value)) all.push(p);
+  if (!all.length){
+    el.appendChild(svgEl('text', { x: W/2, y: H/2, 'text-anchor':'middle' })).textContent = 'no data';
+    return;
+  }
+  let tMin = Infinity, tMax = -Infinity, vMin = Infinity, vMax = -Infinity;
+  for (const p of all){ const t=new Date(p.ts).getTime(); if(t<tMin)tMin=t; if(t>tMax)tMax=t; if(p.value<vMin)vMin=p.value; if(p.value>vMax)vMax=p.value; }
+  if (opts.min != null) vMin = opts.min;
+  if (opts.max != null) vMax = opts.max;
+  if (vMin === vMax){ vMax = vMin + 1; vMin = Math.max(0, vMin - 1); }
+  else { const pad=(vMax-vMin)*0.08; vMax+=pad; vMin=Math.max(opts.min!=null?opts.min:vMin-pad, vMin-pad); }
+  if (tMin === tMax) tMax = tMin + 1;
+  const yFmt = opts.yFmt || (v => (Math.round(v*10)/10).toString());
+
+  const x = t => padL + (W-padL-padR) * (t - tMin) / (tMax - tMin);
+  const y = v => padT + (H-padT-padB) * (1 - (v - vMin) / (vMax - vMin));
+
+  // axes
+  el.appendChild(svgEl('line', { class:'axis', x1:padL, y1:padT, x2:padL, y2:H-padB }));
+  el.appendChild(svgEl('line', { class:'axis', x1:padL, y1:H-padB, x2:W-padR, y2:H-padB }));
+  // y gridlines + labels (min, mid, max)
+  [vMin, (vMin+vMax)/2, vMax].forEach(v => {
+    const yy = y(v);
+    el.appendChild(svgEl('line', { class:'grid', x1:padL, y1:yy, x2:W-padR, y2:yy }));
+    const tx = svgEl('text', { x:padL-4, y:yy+3, 'text-anchor':'end' }); tx.textContent = yFmt(v); el.appendChild(tx);
+  });
+  // x end labels (time)
+  const tl=svgEl('text',{x:padL,y:H-4}); tl.textContent=fmtClock(tMin); el.appendChild(tl);
+  const tr=svgEl('text',{x:W-padR,y:H-4,'text-anchor':'end'}); tr.textContent=fmtClock(tMax); el.appendChild(tr);
+
+  // polylines per series (break the line at null gaps)
+  for (const s of (series||[])){
+    let run = [];
+    const flush = () => { if (run.length>1) el.appendChild(svgEl('polyline', { fill:'none', stroke:s.color||'var(--acc)', 'stroke-width':1.6, points:run.join(' ') })); run=[]; };
+    for (const p of (s.points||[])){
+      if (p && p.value != null && isFinite(p.value)) run.push(x(new Date(p.ts).getTime())+','+y(p.value));
+      else flush();
+    }
+    flush();
+  }
+}
+function fmtClock(t){ const d=new Date(t); return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); }
+
+// ════════════════════ enrolment ════════════════════
 function parseProbe(){
   const t = $('#probeout').value || '';
   const s = (t.match(/serial\s*=\s*([^\r\n]+)/i)||[])[1];
@@ -143,10 +354,9 @@ function parseProbe(){
 $('#probeout').addEventListener('input', () => {
   const { serial, identity } = parseProbe();
   $('#parsed').innerHTML = serial
-    ? '<span class="ok-parse">✓ serial <b>'+serial+'</b>'+(identity?' · identity “'+identity+'”':' · no identity found')+'</span>'
+    ? '<span class="ok-parse">✓ serial <b>'+esc(serial)+'</b>'+(identity?' · identity “'+esc(identity)+'”':' · no identity found')+'</span>'
     : 'Waiting for router output…';
 });
-
 $('#enrol').onclick = async () => {
   if(!tok()){ setMsg('Set the admin token first.', 'err'); return; }
   const { serial, identity } = parseProbe();
@@ -160,31 +370,224 @@ $('#enrol').onclick = async () => {
     $('#tokval').textContent = j.token || '';
     $('#installval').textContent = j.install || j.bootstrap || '';
     $('#result').style.display='block';
-    setMsg('Device '+serial+' enrolled'+(identity?' as “'+identity+'”':'')+'. Copy the token + install block below, then paste the block into the router under Safe Mode.', 'ok');
+    setMsg('Device '+esc(serial)+' enrolled'+(identity?' as “'+esc(identity)+'”':'')+'. Copy the token + install block below, then paste the block into the router under Safe Mode.', 'ok');
     loadFleet();
   }catch(e){ setMsg('Network error: '+e.message, 'err'); }
   finally{ $('#enrol').disabled = false; }
 };
 
-function pill(s){ s=(s||'unknown'); return '<span class="pill '+s+'">'+s+'</span>'; }
-function ago(ts){ if(!ts) return '—'; const d=(Date.now()-new Date(ts).getTime())/1000; if(d<60) return Math.round(d)+'s ago'; if(d<3600) return Math.round(d/60)+'m ago'; return Math.round(d/3600)+'h ago'; }
-
+// ════════════════════ fleet ════════════════════
+function tokenGate(target){
+  // On 401, prompt for the admin token in the relevant container.
+  target.innerHTML = '<div class="empty">Enter the admin token (top right) to load.</div>';
+}
 async function loadFleet(){
-  if(!tok()) return;
+  if(!tok()){ tokenGate($('#fleet')); return; }
   try{
     const r = await fetch('/fleet', { headers:authHeaders() });
-    if(!r.ok){ $('#fleet').innerHTML='<tr><td colspan="5" class="empty">Fleet load failed ('+r.status+').</td></tr>'; return; }
+    if(r.status === 401){ tokenGate($('#fleet')); return; }
+    if(!r.ok){ $('#fleet').innerHTML='<div class="empty">Fleet load failed ('+r.status+').</div>'; return; }
     const j = await r.json(); const rows=(j.devices||j||[]);
-    if(!rows.length){ $('#fleet').innerHTML='<tr><td colspan="5" class="empty">No devices enrolled yet.</td></tr>'; return; }
-    $('#fleet').innerHTML = rows.map(d=>'<tr><td>'+(d.serial||'')+'</td><td>'+(d.site_name||'—')+'</td><td>'+pill(d.status)+'</td><td>'+(d.cpu_load==null?'—':d.cpu_load+'%')+'</td><td>'+ago(d.last_seen_at)+'</td></tr>').join('');
+    if(!rows.length){ $('#fleet').innerHTML='<div class="empty">No devices enrolled yet.</div>'; return; }
+    $('#fleet').innerHTML = '<div class="fleetgrid">' + rows.map(d=>{
+      const cpu = d.cpu_load==null ? '—' : d.cpu_load+'%';
+      return '<div class="devcard" data-serial="'+esc(d.serial)+'">'
+        + '<div class="nm">'+dash(d.site_name||d.identity)+'</div>'
+        + '<div class="sn">'+esc(d.serial||'')+'</div>'
+        + (d.customer?'<div class="cust">'+esc(d.customer)+'</div>':'')
+        + '<div>'+pill(d.status)+'</div>'
+        + '<div class="meta"><span>CPU '+cpu+'</span><span>'+ago(d.last_seen_at)+'</span></div>'
+        + '</div>';
+    }).join('') + '</div>';
+    $$('#fleet .devcard').forEach(c => c.onclick = () => openDevice(c.dataset.serial));
   }catch(e){ /* leave as-is */ }
 }
 $('#refresh').onclick = loadFleet;
 
-// liveness dot + periodic fleet refresh
+// ════════════════════ device dashboard ════════════════════
+let curSerial = null;
+let curWindow = '1h';
+let liveTimer = null, histTimer = null;
+
+function showFleet(){
+  curSerial = null;
+  if (liveTimer) clearInterval(liveTimer); liveTimer = null;
+  if (histTimer) clearInterval(histTimer); histTimer = null;
+  $('#devView').classList.add('hidden');
+  $('#fleetView').classList.remove('hidden');
+  loadFleet();
+}
+$('#back').onclick = showFleet;
+
+function openDevice(serial){
+  curSerial = serial;
+  $('#fleetView').classList.add('hidden');
+  $('#devView').classList.remove('hidden');
+  // reset chart selection to default window
+  // (keep whatever window was last chosen)
+  refreshDevice();
+  refreshHistory();
+  if (liveTimer) clearInterval(liveTimer);
+  if (histTimer) clearInterval(histTimer);
+  liveTimer = setInterval(refreshDevice, 5000);   // live values every 5s
+  histTimer = setInterval(refreshHistory, 30000); // charts every 30s
+}
+
+$$('.win').forEach(b => b.onclick = () => {
+  $$('.win').forEach(x => x.classList.remove('on'));
+  b.classList.add('on');
+  curWindow = b.dataset.win;
+  refreshHistory();
+});
+
+// role precedence for the port-map sort: WAN first.
+const ROLE_ORDER = { wan:0, vpn:1, 'bridge-member':2, lan:3, unused:4, disabled:5 };
+
+async function refreshDevice(){
+  if (!curSerial) return;
+  if (!tok()){ $('#d-tiles').innerHTML='<div class="empty">Enter the admin token (top right).</div>'; return; }
+  let detail;
+  try{
+    const r = await fetch('/devices/'+encodeURIComponent(curSerial), { headers:authHeaders() });
+    if (r.status === 401){ $('#d-tiles').innerHTML='<div class="empty">Enter the admin token (top right).</div>'; return; }
+    if (r.status === 404){ $('#d-name').textContent='Device not found'; return; }
+    if (!r.ok) return;
+    detail = await r.json();
+  }catch(e){ return; }
+  renderDevice(detail);
+}
+
+function renderDevice(d){
+  const dev = d.device || {};
+  const st = d.state || {};
+  const ifaces = d.interfaces || [];
+  const nbrs = d.neighbors || [];
+  const lteArr = Array.isArray(d.lte) ? d.lte : (d.lte ? [d.lte] : []);
+
+  // ── header ──
+  $('#d-name').textContent = dev.site_name || dev.identity || dev.serial || '—';
+  $('#d-serial').textContent = dev.serial || '—';
+  $('#d-model').textContent = dev.model || '—';
+  $('#d-ros').textContent = st.ros_version || dev.ros_version || '—';
+  $('#d-uptime').textContent = humanUptime(st.uptime_s);
+  $('#d-ip').textContent = st.public_ip || '—';
+  $('#d-status').innerHTML = pill(st.status);
+
+  // ── tiles ──
+  const memUsed = (st.total_memory!=null && st.free_memory!=null) ? (st.total_memory - st.free_memory) : null;
+  const fwBehind = st.firmware_upgrade && st.firmware_current && st.firmware_upgrade !== st.firmware_current;
+  const tiles = [
+    { lab:'CPU', val: st.cpu_load==null?'—':st.cpu_load+'%' },
+    { lab:'Memory', val: memUsed==null?'—':humanBytes(memUsed), sub: st.total_memory==null?'':('of '+humanBytes(st.total_memory)) },
+    { lab:'Temperature', val: st.temperature==null?'—':st.temperature+'°C' },
+    { lab:'PPP sessions', val: st.ppp_sessions==null?'—':st.ppp_sessions },
+    { lab:'DHCP leases', val: st.dhcp_leases==null?'—':st.dhcp_leases },
+    { lab:'Firmware', val: st.firmware_current||'—', sub: fwBehind?('upgrade → '+esc(st.firmware_upgrade)):'', flag: fwBehind },
+  ];
+  $('#d-tiles').innerHTML = tiles.map(t =>
+    '<div class="tile'+(t.flag?' flag':'')+'"><div class="lab">'+t.lab+'</div><div class="val">'+esc(t.val)+'</div>'
+    + (t.sub?'<div class="sub">'+t.sub+'</div>':'')+'</div>').join('');
+
+  // ── port map (WAN first, then role order, then name) ──
+  $('#d-portcount').textContent = ifaces.length + ' interfaces';
+  const sorted = ifaces.slice().sort((a,b)=>{
+    const ra = ROLE_ORDER[a.role]!=null?ROLE_ORDER[a.role]:9;
+    const rb = ROLE_ORDER[b.role]!=null?ROLE_ORDER[b.role]:9;
+    if (ra!==rb) return ra-rb;
+    return (a.name||'').localeCompare(b.name||'');
+  });
+  $('#d-ports').innerHTML = sorted.length ? sorted.map(i=>{
+    const role = i.role || 'lan';
+    const up = (i.plugged===true || i.running===true);
+    const linkTitle = i.disabled===true ? 'disabled' : (up?'link up':'link down');
+    return '<tr>'
+      + '<td>'+esc(i.name)+(i.bridge?' <span class="hint">@'+esc(i.bridge)+'</span>':'')+'</td>'
+      + '<td><span class="rtag '+role+'">'+role+'</span></td>'
+      + '<td><span class="linkdot '+(i.disabled===true?'down':(up?'up':'down'))+'" title="'+linkTitle+'"></span></td>'
+      + '<td>'+dash(i.speed)+'</td>'
+      + '<td>'+humanBps(i.rx_bps)+'</td>'
+      + '<td>'+humanBps(i.tx_bps)+'</td>'
+      + '</tr>';
+  }).join('') : '<tr><td colspan="6" class="empty">No interfaces.</td></tr>';
+
+  // ── neighbours ──
+  $('#d-nbrs').innerHTML = nbrs.length ? nbrs.map(n=>
+    '<div class="nbr"><div class="nh"><span>'+dash(n.identity||n.mac)+'</span><span>'+dash(n.interface)+'</span></div>'
+    + '<div class="ns">'+esc(n.mac||'')+(n.address?' · '+esc(n.address):'')+(n.platform?' · '+esc(n.platform):'')+'</div></div>'
+  ).join('') : '<div class="empty">No neighbours seen.</div>';
+
+  // ── LTE (only when present) ──
+  if (lteArr.length && lteArr[0] && lteArr[0].interface){
+    const l = lteArr[0];
+    $('#d-ltebox').classList.remove('hidden');
+    const cells = [
+      ['Operator', l.operator], ['Reg', l.registration], ['Tech', l.access_tech], ['Band', l.band],
+      ['RSRP', l.rsrp!=null?l.rsrp+' dBm':null], ['RSRQ', l.rsrq!=null?l.rsrq+' dB':null],
+      ['SINR', l.sinr!=null?l.sinr+' dB':null], ['RSSI', l.rssi!=null?l.rssi+' dBm':null],
+      ['Cell', l.cell_id], ['ICCID', l.iccid],
+    ];
+    $('#d-lte').innerHTML = cells.map(c=>'<div class="lte-cell"><div class="lab">'+c[0]+'</div><div class="v">'+dash(c[1])+'</div></div>').join('');
+  } else {
+    $('#d-ltebox').classList.add('hidden');
+  }
+}
+
+async function refreshHistory(){
+  if (!curSerial || !tok()) return;
+  let h;
+  try{
+    const r = await fetch('/devices/'+encodeURIComponent(curSerial)+'/history?window='+encodeURIComponent(curWindow), { headers:authHeaders() });
+    if (!r.ok) return;
+    h = await r.json();
+  }catch(e){ return; }
+  renderHistory(h);
+}
+
+function renderHistory(h){
+  const metrics = h.metrics || [];
+  const ifaces = h.interfaces || [];
+
+  // CPU + memory device-level charts.
+  drawLineChart($('#c-cpu'),
+    [{ color:'var(--acc)', points: metrics.map(m=>({ ts:m.ts, value:m.cpu_load })) }],
+    { min:0, max:100, yFmt:v=>Math.round(v)+'%' });
+  drawLineChart($('#c-mem'),
+    [{ color:'var(--ok)', points: metrics.map(m=>({ ts:m.ts, value:m.free_memory })) }],
+    { yFmt:humanBytes });
+
+  // Per-interface rx/tx charts for the top N busy interfaces (by peak rx+tx across window).
+  const ranked = ifaces.map(it=>{
+    let peak = 0;
+    for (const p of (it.points||[])){ const v=(p.rx_bps||0)+(p.tx_bps||0); if(v>peak) peak=v; }
+    return { it, peak };
+  }).filter(r=>r.peak>0).sort((a,b)=>b.peak-a.peak).slice(0,4);
+
+  const box = $('#d-ifcharts');
+  if (!ranked.length){ box.innerHTML = '<div class="chartbox" style="grid-column:1/-1"><div class="empty">No interface throughput in this window yet.</div></div>'; return; }
+
+  box.innerHTML = ranked.map((r,idx)=>
+    '<div class="chartbox"><h3>'+esc(r.it.name)+' <span class="legend">'
+    + '<span class="sw" style="background:var(--rx)"></span>rx'
+    + '<span class="sw" style="background:var(--tx)"></span>tx</span></h3>'
+    + '<svg class="chart" id="cif-'+idx+'"></svg></div>'
+  ).join('');
+  // Draw after the SVG nodes exist in the DOM (so clientWidth is real).
+  ranked.forEach((r,idx)=>{
+    drawLineChart($('#cif-'+idx),
+      [ { color:'var(--rx)', points: (r.it.points||[]).map(p=>({ ts:p.ts, value:p.rx_bps })) },
+        { color:'var(--tx)', points: (r.it.points||[]).map(p=>({ ts:p.ts, value:p.tx_bps })) } ],
+      { min:0, yFmt:humanBps });
+  });
+}
+
+// ── liveness dot + initial load ──
 fetch('/healthz').then(r=>{ $('#health').style.background = r.ok ? 'var(--ok)' : 'var(--bad)'; }).catch(()=>{ $('#health').style.background='var(--bad)'; });
-if(tok()) loadFleet();
-setInterval(loadFleet, 10000);
+if (tok()) loadFleet();
+// Refresh the fleet list periodically only while it's the visible view.
+setInterval(()=>{ if (!curSerial) loadFleet(); }, 10000);
+// Re-flow charts on resize (debounced) so the SVG viewBox tracks the container width.
+let rzT=null;
+window.addEventListener('resize', ()=>{ if(rzT)clearTimeout(rzT); rzT=setTimeout(()=>{ if(curSerial) refreshHistory(); }, 250); });
 </script>
 </body>
 </html>

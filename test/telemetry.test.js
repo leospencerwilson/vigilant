@@ -158,3 +158,41 @@ test("normalize: rejects missing serial", () => {
   delete raw.serial;
   assert.throws(() => telemetry.normalize(raw));
 });
+
+// ── NUMERIC COERCION: the agent emits health numerics both as QUOTED strings and as the
+// literal 'null'. normalize() must coerce every one to number|null (docs/CONTRACT.md). ──
+test("normalize: quoted-string health numerics coerce to numbers; 'null' -> null", () => {
+  const raw = sample();
+  // Agent emits these as QUOTED strings.
+  raw.cpu_load = "23";
+  raw.free_memory = "123456789";
+  raw.total_memory = "268435456";
+  raw.free_hdd = "100000000";
+  raw.temperature = "41.5";
+  raw.voltage = "24.1";
+  raw.write_sect_total = "987654";
+  raw.ppp_sessions = "7";
+  raw.dhcp_leases = "30";
+  // Agent emits these absent values as the literal string 'null'.
+  raw.cpu_temperature = "null";
+  raw.board_temperature = "null";
+  raw.fan1_speed = "null";
+
+  const out = telemetry.normalize(raw);
+
+  assert.equal(out.cpu_load, 23);
+  assert.equal(typeof out.cpu_load, "number");
+  assert.equal(out.free_memory, 123456789);
+  assert.equal(out.total_memory, 268435456);
+  assert.equal(out.free_hdd, 100000000);
+  assert.equal(out.temperature, 41.5);
+  assert.equal(typeof out.temperature, "number");
+  assert.equal(out.voltage, 24.1);
+  assert.equal(out.write_sect_total, 987654);
+  assert.equal(out.ppp_sessions, 7);
+  assert.equal(out.dhcp_leases, 30);
+  // 'null' string -> real null
+  assert.equal(out.cpu_temperature, null);
+  assert.equal(out.board_temperature, null);
+  assert.equal(out.fan1_speed, null);
+});

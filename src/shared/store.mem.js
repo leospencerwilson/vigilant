@@ -437,6 +437,70 @@ function makeMemStore(_config) {
     };
   }
 
+  // ── history read APIs (dashboard charts) ────────────────────────────────────
+  // Time-ascending device-level metric points since `sinceMs` (epoch ms). Mirrors
+  // store.pg.getMetricsHistory: the dashboard's CPU/memory/temperature/ppp charts read
+  // from here. Returns [] for an unknown serial (the route layer 404s on unknown serials
+  // via getDeviceDetail, so this never has to distinguish "no device" from "no points").
+  async function getMetricsHistory(serial, sinceMs) {
+    const id = serialIndex.get(serial);
+    if (!id) return [];
+    const since = typeof sinceMs === 'number' ? sinceMs : 0;
+    return metricsHistory
+      .filter((r) => r.device_id === id && new Date(r.ts).getTime() >= since)
+      .map((r) => ({
+        ts: iso(r.ts),
+        cpu_load: r.cpu_load != null ? r.cpu_load : null,
+        free_memory: r.free_memory != null ? r.free_memory : null,
+        temperature: r.temperature != null ? r.temperature : null,
+        ppp_sessions: r.ppp_sessions != null ? r.ppp_sessions : null,
+      }))
+      .sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+  }
+
+  // Time-ascending per-interface rx/tx bps points since `sinceMs`, grouped by interface
+  // name. Mirrors store.pg.getInterfaceHistory. Each interface gets its own points array.
+  async function getInterfaceHistory(serial, sinceMs) {
+    const id = serialIndex.get(serial);
+    if (!id) return [];
+    const since = typeof sinceMs === 'number' ? sinceMs : 0;
+    const byName = new Map();
+    for (const r of interfaceHistory) {
+      if (r.device_id !== id) continue;
+      if (new Date(r.ts).getTime() < since) continue;
+      if (!byName.has(r.name)) byName.set(r.name, []);
+      byName.get(r.name).push({
+        ts: iso(r.ts),
+        rx_bps: r.rx_bps != null ? r.rx_bps : null,
+        tx_bps: r.tx_bps != null ? r.tx_bps : null,
+      });
+    }
+    const out = [];
+    for (const [name, points] of byName) {
+      points.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+      out.push({ name, points });
+    }
+    out.sort((a, b) => a.name.localeCompare(b.name));
+    return out;
+  }
+
+  // Combined device history in the HISTORY API contract shape (docs §HISTORY API):
+  //   { serial, metrics:[{ts,cpu_load,free_memory,temperature,ppp_sessions}],
+  //     interfaces:[{name, points:[{ts,rx_bps,tx_bps}]}] }
+  // window is `windowSeconds` back from now; both series are time-ASCENDING. Returns null
+  // for an UNKNOWN serial so the route layer can 404 (distinct from a known device with no
+  // history, which yields empty arrays). Mirrors store.pg.getDeviceHistory so mem/pg stay
+  // interchangeable. The `window` label itself is owned by the handler.
+  async function getDeviceHistory(serial, windowSeconds) {
+    const id = serialIndex.get(serial);
+    if (!id) return null;
+    const win = typeof windowSeconds === 'number' && windowSeconds > 0 ? windowSeconds : 3600;
+    const sinceMs = Date.now() - win * 1000;
+    const metrics = await getMetricsHistory(serial, sinceMs);
+    const interfaces = await getInterfaceHistory(serial, sinceMs);
+    return { serial, metrics, interfaces };
+  }
+
   // ── worker ─────────────────────────────────────────────────────────────────
   async function markStaleDevices(staleSeconds, offlineSeconds) {
     const at = Date.now();
@@ -657,6 +721,9 @@ function makeMemStore(_config) {
     getCurrentAgentScript,
     getFleet,
     getDeviceDetail,
+    getMetricsHistory,
+    getInterfaceHistory,
+    getDeviceHistory,
     markStaleDevices,
     getActiveAlertRules,
     evaluateAndApplyAlerts,

@@ -254,6 +254,74 @@ test("chunked telemetry: core chunk writes device_state without touching interfa
   }
 });
 
+test("chunked telemetry: a CORE chunk with QUOTED-string numerics stores numeric device_state ('null' -> null)", async () => {
+  const config = makeConfig();
+  const store = makeMemStore();
+
+  const SERIAL = "HGT0A96706Z";
+  const TOKEN = "device-bearer-coerce";
+  const tokenHash = transform.sha256Hex(TOKEN);
+  await seedDevice(store, { serial: SERIAL, token: TOKEN, tokenHash });
+
+  const server = createServer({ store, config });
+  const port = await listen(server);
+
+  try {
+    // The real agent emits health numerics as QUOTED strings, and absent values as the
+    // literal string 'null'. The ingest must store them as number|null in device_state.
+    const body = {
+      serial: SERIAL,
+      ts: Date.now(),
+      identity: "OldSwan",
+      uptime: "5d3h",
+      cpu_load: "23",
+      free_memory: "123456789",
+      total_memory: "268435456",
+      free_hdd: "100000000",
+      temperature: "41.5",
+      voltage: "24.1",
+      write_sect_total: "987654",
+      ppp_sessions: "7",
+      dhcp_leases: "30",
+      // absent sensors arrive as the literal string 'null'
+      cpu_temperature: "null",
+      board_temperature: "null",
+      fan1_speed: "null",
+      ros_version: "7.18",
+      pppoe_running: true,
+      ntp_synced: true,
+      public_ip: "84.247.33.71",
+    };
+
+    const r = await request(port, { method: "POST", path: "/telemetry", token: TOKEN, body });
+    assert.equal(r.status, 200, "core chunk with quoted numerics accepted");
+
+    const detail = await store.getDeviceDetail(SERIAL);
+    const s = detail.state;
+    assert.ok(s, "device_state written");
+
+    // Quoted strings stored as real numbers.
+    assert.equal(s.cpu_load, 23);
+    assert.equal(typeof s.cpu_load, "number", "cpu_load is a number, not the string '23'");
+    assert.equal(s.free_memory, 123456789);
+    assert.equal(s.total_memory, 268435456);
+    assert.equal(s.free_hdd, 100000000);
+    assert.equal(s.temperature, 41.5);
+    assert.equal(typeof s.temperature, "number");
+    assert.equal(s.voltage, 24.1);
+    assert.equal(s.write_sect_total, 987654);
+    assert.equal(s.ppp_sessions, 7);
+    assert.equal(s.dhcp_leases, 30);
+
+    // 'null' string coerced to a real null (never the string 'null').
+    assert.equal(s.cpu_temperature, null);
+    assert.equal(s.board_temperature, null);
+    assert.equal(s.fan1_speed, null);
+  } finally {
+    await close(server);
+  }
+});
+
 test("chunked telemetry: a detail chunk that arrives BEFORE any core chunk still marks the device online", async () => {
   const config = makeConfig();
   const store = makeMemStore();

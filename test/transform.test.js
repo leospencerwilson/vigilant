@@ -109,11 +109,55 @@ test("classifyRole: ether + plugged + no bridge -> 'lan'", () => {
   );
 });
 
-test("classifyRole: non-ether, no bridge, not wan/vpn -> 'lan'", () => {
+test("classifyRole: non-ether, no bridge, not wan/vpn (e.g. vlan) -> 'lan'", () => {
   assert.equal(
-    transform.classifyRole({ disabled: false, is_wan: false, bridge: "", type: "bridge", plugged: true }),
+    transform.classifyRole({ disabled: false, is_wan: false, bridge: "", type: "vlan", plugged: true }),
     "lan",
   );
+});
+
+// ── type-aware classification: a TYPE/name never mislabelled 'wan' (precedence) ─────────
+test("classifyRole: a bridge with is_wan=true -> 'bridge-member' (type beats the wan flag)", () => {
+  // Even though the agent flagged is_wan:true, a bridge interface must be a bridge-member,
+  // never a 'wan' — the bridge type takes precedence over the hint.
+  assert.equal(
+    transform.classifyRole({ disabled: false, is_wan: true, bridge: "", type: "bridge", plugged: true }),
+    "bridge-member",
+  );
+  // also by name (type came through blank but it is named "bridge-lan").
+  assert.equal(
+    transform.classifyRole({ disabled: false, is_wan: true, bridge: "", type: "", name: "bridge-lan", plugged: true }),
+    "bridge-member",
+  );
+});
+
+test("classifyRole: an l2tp-out with is_wan=true -> 'vpn' (tunnel type beats the wan flag)", () => {
+  assert.equal(
+    transform.classifyRole({ disabled: false, is_wan: true, bridge: "", type: "l2tp-out", plugged: true }),
+    "vpn",
+  );
+  // also by tell-tale name when the type is generic/blank.
+  assert.equal(
+    transform.classifyRole({ disabled: false, is_wan: true, bridge: "", type: "", name: "sstp-allied", plugged: true }),
+    "vpn",
+  );
+});
+
+test("classifyRole: a plugged ether with is_wan=true -> 'wan'", () => {
+  assert.equal(
+    transform.classifyRole({ disabled: false, is_wan: true, bridge: "", type: "ether", plugged: true }),
+    "wan",
+  );
+});
+
+test("classifyRole: extra VPN types (ipip, vpls, sstp-in, ovpn-out) -> 'vpn'", () => {
+  for (const type of ["ipip", "vpls", "sstp-in", "ovpn-out"]) {
+    assert.equal(
+      transform.classifyRole({ disabled: false, is_wan: false, bridge: "", type }),
+      "vpn",
+      `type ${type} should classify as vpn`,
+    );
+  }
 });
 
 // ── parseNum(v) -> number|null ──────────────────────────────────────────────

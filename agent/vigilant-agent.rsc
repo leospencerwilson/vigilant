@@ -143,22 +143,75 @@
 :local pppSessions [:len [/ppp active find]]
 :local dhcpLeases  [:len [/ip dhcp-server lease find]]
 
-# ── WAN detection ────────────────────────────────────────────────────
-# A port is WAN if: it's the physical interface a pppoe-client dials over, OR it
-# carries the active default route, OR it's a dhcp-client iface that adds a default
-# route. Names are space-wrapped so the membership test can't false-match (ether1/ether10).
+# ── WAN detection (CONSERVATIVE) ──────────────────────────────────────
+# is_wan must be TRUE ONLY for a genuine internet uplink. On a VPN-concentrator router
+# (this box has bridge_HSCN, bridge_L2TP, l2tp-out1, ether2-5, …) the naive "egress of any
+# default route is WAN" rule wrongly flags ~24/25 interfaces, because every tunnel/bridge
+# that carries a default route looked like WAN. We therefore only ever add:
+#   (a) the PHYSICAL interface a pppoe-client dials over, PLUS the pppoe-out interface
+#       itself (the dialled session) — these are unambiguously the internet uplink; and
+#   (b) the egress interface of the ACTIVE default route, but ONLY IF that egress is a
+#       physical 'ether' or a 'pppoe-out'. A bridge / l2tp / sstp / gre / ipsec / vlan
+#       egress is an overlay or LAN-side path, NOT an internet uplink, so it is EXCLUDED.
+# We deliberately DROP the old "dhcp-client add-default-route => WAN" rule: only a route
+# whose egress passes the ether/pppoe-out type check qualifies, and a DHCP-WAN port's
+# default route is already covered by (b) when its egress is an ether.
+# Names are space-wrapped (" name ") so the membership test can't false-match (ether1 vs
+# ether10). A helper de-dupes so the same port is never added twice.
 :local wanList " "
-:foreach p in=[/interface pppoe-client find] do={
-    :do { :set wanList ($wanList . [/interface pppoe-client get $p interface] . " " . [/interface pppoe-client get $p name] . " ") } on-error={}
+# Add " $nm " to $wanList only if it is not already present (dedupe on the space-wrapped name).
+:local wanAdd do={
+    :local lst [:tostr $1]
+    :local nm  [:tostr $2]
+    :if ([:len $nm] = 0) do={ :return $lst }
+    :if ([:typeof [:find $lst (" " . $nm . " ")]] != "nothing") do={ :return $lst }
+    :return ($lst . $nm . " ")
 }
-:foreach r in=[/ip route find dst-address="0.0.0.0/0" active=yes] do={
+# (a) pppoe-client: the physical interface it dials over + the pppoe-out session itself.
+:foreach p in=[/interface pppoe-client find] do={
     :do {
-        :local gi [/ip route get $r immediate-gw]
-        :if ([:typeof [:find $gi "%"]] != "nothing") do={ :set wanList ($wanList . [:pick $gi ([:find $gi "%"]+1) [:len $gi]] . " ") }
+        :set wanList [$wanAdd $wanList [/interface pppoe-client get $p interface]]
+        :set wanList [$wanAdd $wanList [/interface pppoe-client get $p name]]
     } on-error={}
 }
-:foreach d in=[/ip dhcp-client find] do={
-    :do { :if ([/ip dhcp-client get $d add-default-route] = "yes") do={ :set wanList ($wanList . [/ip dhcp-client get $d interface] . " ") } } on-error={}
+# (b) active default route egress — ONLY when the egress interface is a physical 'ether'
+#     or a 'pppoe-out'. Read the route's egress interface name, then check its type before
+#     adding. NOT a bridge, NOT an l2tp/sstp/gre/ipsec/eoip/vlan tunnel.
+:foreach r in=[/ip route find dst-address="0.0.0.0/0" active=yes] do={
+    :do {
+        # immediate-gw is "<gw-ip>%<iface>" (or "%<iface>"). On an ECMP / dual-WAN default
+        # route it is a COMMA-separated LIST of those segments, e.g.
+        #   "1.2.3.4%ether1,5.6.7.8%pppoe-out1"
+        # so we MUST split on comma and process each segment independently. Taking everything
+        # after the FIRST '%' would yield a mangled "ether1,5.6.7.8%pppoe-out1" that matches no
+        # interface, silently flagging NEITHER real WAN egress on a load-balanced site.
+        # Walk $gi one comma-delimited segment at a time; per segment, pull the iface name
+        # after that segment's '%' and apply the unchanged ether/pppoe-out type gate.
+        :local gi [/ip route get $r immediate-gw]
+        :local glen [:len $gi]
+        :local segStart 0
+        :while ($segStart <= $glen) do={
+            # Find the next comma at/after segStart; the segment is [segStart, comma).
+            :local rel [:find [:pick $gi $segStart $glen] ","]
+            :local segEnd $glen
+            :if ([:typeof $rel] != "nothing") do={ :set segEnd ($segStart + $rel) }
+            :local seg [:pick $gi $segStart $segEnd]
+            # Within this ONE segment, split on '%' to get the egress interface name.
+            :local pos [:find $seg "%"]
+            :if ([:typeof $pos] != "nothing") do={
+                :local egN [:pick $seg ($pos + 1) [:len $seg]]
+                :if ([:len $egN] > 0) do={
+                    # Look up the egress interface's TYPE; only ether / pppoe-out qualify as WAN.
+                    :local egT ""
+                    :do { :set egT [/interface get [find name=$egN] type] } on-error={}
+                    :if (($egT = "ether") || ($egT = "pppoe-out")) do={ :set wanList [$wanAdd $wanList $egN] }
+                }
+            }
+            # Advance past this segment and its trailing comma. If there was no comma we are
+            # done (jump past glen so the :while exits); otherwise resume after the comma.
+            :if ([:typeof $rel] = "nothing") do={ :set segStart ($glen + 1) } else={ :set segStart ($segEnd + 1) }
+        }
+    } on-error={}
 }
 
 # ── per-interface: counters + link + role + bridge membership ─────────
@@ -332,11 +385,28 @@
 # This is the ONLY chunk carrying the system block, so it is the one that writes
 # device_state and flips the device 'online'. No arrays → size is independent of how
 # many interfaces/neighbours/hosts the router has.
+#
+# NUMERIC SAFETY — health metrics are emitted as QUOTED STRINGS, not bare JSON numbers.
+# /system health values are board-dependent free-form fields: a sensor can report a
+# non-numeric token (e.g. "24.5C", "no-sensor", or a stray space) and the defaults here
+# are the literal token "null". Interpolated UNQUOTED that would produce invalid JSON
+# (e.g. {"temperature":24.5C} or {"temperature":null,...} with a missing value) and 400
+# the ENTIRE core POST — taking the device offline for that tick. Quoting them
+# ("temperature":"41.5" / "temperature":"null" / "cpu_load":"3") keeps the body valid
+# JSON unconditionally; the server's telemetry.normalize parseNum-coerces each string to
+# number|null (so "24.5C"→null, "41.5"→41.5, "null"→null). Fields kept as QUOTED STRINGS:
+#   cpu_load, free_memory, total_memory, free_hdd, temperature, cpu_temperature,
+#   board_temperature, voltage, fan1_speed, write_sect_total (the health/resource numerics),
+#   plus ros_version / uptime / identity / public_ip / firmware_current / firmware_upgrade.
+# Kept as UNQUOTED booleans: ntp_synced, pppoe_running. Kept as UNQUOTED integers:
+#   ppp_sessions, dhcp_leases (both from [:len …] — reliably whole numbers).
+# (Interface counters rx_byte/tx_byte/rx_packet/tx_packet stay UNQUOTED integers in the
+#  DETAIL chunk: they come straight from /interface get and are reliably numeric.)
 :local core "{"
 :set core ($core . "\"serial\":\"" . $serial . "\",\"identity\":\"" . $identity . "\",\"uptime\":\"" . $uptime . "\",")
-:set core ($core . "\"cpu_load\":" . $cpuLoad . ",\"free_memory\":" . $freeMem . ",\"total_memory\":" . $totMem . ",\"free_hdd\":" . $freeHdd . ",")
-:set core ($core . "\"ros_version\":\"" . $rosVer . "\",\"temperature\":" . $temp . ",\"cpu_temperature\":" . $cpuTemp . ",\"board_temperature\":" . $brdTemp . ",")
-:set core ($core . "\"voltage\":" . $volt . ",\"fan1_speed\":" . $fan1 . ",\"write_sect_total\":" . $writeSect . ",")
+:set core ($core . "\"cpu_load\":\"" . $cpuLoad . "\",\"free_memory\":\"" . $freeMem . "\",\"total_memory\":\"" . $totMem . "\",\"free_hdd\":\"" . $freeHdd . "\",")
+:set core ($core . "\"ros_version\":\"" . $rosVer . "\",\"temperature\":\"" . $temp . "\",\"cpu_temperature\":\"" . $cpuTemp . "\",\"board_temperature\":\"" . $brdTemp . "\",")
+:set core ($core . "\"voltage\":\"" . $volt . "\",\"fan1_speed\":\"" . $fan1 . "\",\"write_sect_total\":\"" . $writeSect . "\",")
 :set core ($core . "\"firmware_current\":\"" . $fwCur . "\",\"firmware_upgrade\":\"" . $fwUpg . "\",\"ntp_synced\":" . $ntpSynced . ",")
 :set core ($core . "\"public_ip\":\"" . $publicIp . "\",\"pppoe_running\":" . $pppoeUp . ",\"ppp_sessions\":" . $pppSessions . ",\"dhcp_leases\":" . $dhcpLeases . ",")
 :set core ($core . "\"lte\":" . $lteJson . "}")

@@ -20,6 +20,7 @@
 //   POST /enroll                  admin   create device + token -> {token, bootstrap}
 //   GET  /fleet                   admin   fleet read API
 //   GET  /devices/:serial         admin   device detail
+//   GET  /devices/:serial/history admin   dashboard time-series (window=1h|6h|24h|7d)
 
 const http = require('node:http');
 const crypto = require('node:crypto');
@@ -175,6 +176,17 @@ function createServer({ store, config: cfg }) {
       if (method === 'GET' && pathname === '/fleet') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         return handlers.fleet(ctx);
+      }
+
+      // GET /devices/:serial/history?window=1h (admin) — dashboard chart series.
+      // Matched BEFORE /devices/:serial so the trailing /history segment is routed here
+      // and not swallowed (the bare-serial regex anchors on a no-slash segment, but keep
+      // this first for clarity + defence in depth).
+      const mHist = /^\/devices\/([^/]+)\/history$/.exec(pathname);
+      if (method === 'GET' && mHist) {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { serial: decodeURIComponent(mHist[1]) };
+        return handlers.deviceHistory(ctx);
       }
 
       // GET /devices/:serial

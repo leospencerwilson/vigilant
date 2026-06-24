@@ -79,14 +79,26 @@ function deltaBps(prevBytes, prevAtMs, curBytes, curAtMs) {
 // Interface types that are tunnels / overlays → role 'vpn'.
 // NOTE: 'vlan' deliberately stays 'lan' (it is not a tunnel). Matches use either
 // an exact type or a known prefix family (l2tp-*, sstp-*, ovpn-*).
+// `pppoe-client` is retained (older RouterOS / agent spelling) alongside `pppoe-out`.
 const VPN_TYPES = new Set([
   'pppoe-out',
   'pppoe-client',
+  'l2tp-out',
+  'l2tp-in',
+  'sstp-out',
+  'sstp-in',
+  'ovpn-out',
+  'ovpn-in',
   'wireguard',
   'gre',
   'eoip',
+  'ipip',
+  'vpls',
 ]);
 const VPN_PREFIXES = ['l2tp-', 'sstp-', 'ovpn-'];
+// Name substrings that mark a tunnel even when the agent reports a generic/empty type
+// (e.g. a dynamic interface whose `type` came through blank but is named "l2tp-allied").
+const VPN_NAME_SUBSTRINGS = ['l2tp', 'sstp', 'ovpn', 'gre', 'ipsec'];
 
 function isVpnType(type) {
   if (typeof type !== 'string' || type === '') return false;
@@ -98,24 +110,53 @@ function isVpnType(type) {
   return false;
 }
 
+function isVpnName(name) {
+  if (typeof name !== 'string' || name === '') return false;
+  const n = name.toLowerCase();
+  for (const s of VPN_NAME_SUBSTRINGS) {
+    if (n.includes(s)) return true;
+  }
+  return false;
+}
+
 /**
  * classifyRole(iface) -> 'disabled'|'wan'|'vpn'|'bridge-member'|'lan'|'unused'
- * Precedence (first match wins):
- *   1. disabled            -> 'disabled'
- *   2. is_wan              -> 'wan'
- *   3. tunnel/overlay type -> 'vpn'   (vlan stays lan)
- *   4. bridge set          -> 'bridge-member'
- *   5. ether & !plugged & no bridge -> 'unused'
- *   6. else                -> 'lan'
+ *
+ * TYPE-AWARE precedence (first match wins). The ordering deliberately classifies by the
+ * interface's actual TYPE before honouring the agent's `is_wan` hint, so a bridge or a
+ * tunnel can never be mislabelled 'wan' just because the agent flagged it (a bridge that
+ * happens to ride the WAN path, a backup VPN over a WAN, etc.):
+ *   1. disabled                                              -> 'disabled'
+ *   2. type 'bridge' OR name starts 'bridge'                 -> 'bridge-member'
+ *   3. tunnel/overlay type OR name contains l2tp/sstp/ovpn/  -> 'vpn'   (vlan stays lan)
+ *      gre/ipsec
+ *   4. is_wan && type 'ether' (or 'pppoe-out')               -> 'wan'
+ *   5. type 'ether' & !plugged & no bridge                   -> 'unused'
+ *   6. else                                                  -> 'lan'
  */
 function classifyRole(iface) {
   const i = iface || {};
   if (i.disabled === true) return 'disabled';
-  if (i.is_wan === true) return 'wan';
-  if (isVpnType(i.type)) return 'vpn';
+
+  const type = typeof i.type === 'string' ? i.type.toLowerCase() : i.type;
+  const name = typeof i.name === 'string' ? i.name : '';
   const bridge = typeof i.bridge === 'string' ? i.bridge.trim() : i.bridge;
+
+  // 2. A bridge itself is a bridge-member of the L2 topology (NOT a wan, even if flagged).
+  if (type === 'bridge' || name.toLowerCase().startsWith('bridge')) return 'bridge-member';
+
+  // 3. Tunnels / overlays — by type OR by a tell-tale name substring.
+  if (isVpnType(type) || isVpnName(name)) return 'vpn';
+
+  // 4. WAN only when the agent flags it AND it is an actual uplink type (ether or pppoe-out).
+  if (i.is_wan === true && (type === 'ether' || type === 'pppoe-out')) return 'wan';
+
+  // 5. An unplugged ethernet port with no bridge membership is unused.
+  if (type === 'ether' && i.plugged !== true && !bridge) return 'unused';
+
+  // A non-bridge port that is a member of a bridge is still a bridge-member.
   if (bridge) return 'bridge-member';
-  if (i.type === 'ether' && i.plugged !== true && !bridge) return 'unused';
+
   return 'lan';
 }
 

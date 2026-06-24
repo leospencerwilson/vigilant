@@ -19,6 +19,10 @@ const transform = require('./transform');
 // Path to the canonical schema file applied by migrate().
 const SCHEMA_PATH = path.join(__dirname, '..', '..', 'db', 'schema.sql');
 
+// Upper bound on rows returned by a single getDeviceHistory window query, so a wide window
+// (7d) on a busy multi-interface router can't return an unbounded result set to the UI.
+const HISTORY_ROW_CAP = 2000;
+
 /**
  * @param {import('pg').Pool|string|{databaseUrl?:string,connectionString?:string}} poolOrConfig
  *        An existing pg Pool, a database URL string, or a config object with
@@ -658,6 +662,117 @@ function makePgStore(poolOrConfig) {
     return { device, state, interfaces, lte, neighbors, mac_hosts: macHosts };
   }
 
+  // ── history read APIs (dashboard charts) ─────────────────────────────────────
+  // Device-level metric series since `sinceMs` (epoch ms), time-ascending. Backs the
+  // dashboard CPU/memory/temperature/ppp charts (GET /devices/:serial/history). Returns []
+  // for an unknown serial. ts is returned as an ISO string for the JSON contract.
+  async function getMetricsHistory(serial, sinceMs) {
+    const device = await getDeviceBySerial(serial);
+    if (!device) return [];
+    const since = new Date(typeof sinceMs === 'number' ? sinceMs : 0).toISOString();
+    const r = await rows(
+      `SELECT ts, cpu_load, free_memory, temperature, ppp_sessions
+         FROM metrics_history
+        WHERE device_id = $1 AND ts >= $2
+        ORDER BY ts ASC`,
+      [device.id, since]
+    );
+    return r.map((row) => ({
+      ts: row.ts instanceof Date ? row.ts.toISOString() : String(row.ts),
+      cpu_load: row.cpu_load != null ? Number(row.cpu_load) : null,
+      free_memory: row.free_memory != null ? Number(row.free_memory) : null,
+      temperature: row.temperature != null ? Number(row.temperature) : null,
+      ppp_sessions: row.ppp_sessions != null ? Number(row.ppp_sessions) : null,
+    }));
+  }
+
+  // Per-interface rx/tx bps series since `sinceMs`, grouped by interface name and
+  // time-ascending within each. Backs the per-interface throughput charts.
+  async function getInterfaceHistory(serial, sinceMs) {
+    const device = await getDeviceBySerial(serial);
+    if (!device) return [];
+    const since = new Date(typeof sinceMs === 'number' ? sinceMs : 0).toISOString();
+    const r = await rows(
+      `SELECT name, ts, rx_bps, tx_bps
+         FROM interface_history
+        WHERE device_id = $1 AND ts >= $2
+        ORDER BY name ASC, ts ASC`,
+      [device.id, since]
+    );
+    const byName = new Map();
+    for (const row of r) {
+      if (!byName.has(row.name)) byName.set(row.name, []);
+      byName.get(row.name).push({
+        ts: row.ts instanceof Date ? row.ts.toISOString() : String(row.ts),
+        rx_bps: row.rx_bps != null ? Number(row.rx_bps) : null,
+        tx_bps: row.tx_bps != null ? Number(row.tx_bps) : null,
+      });
+    }
+    const out = [];
+    for (const [name, points] of byName) out.push({ name, points });
+    return out;
+  }
+
+  // Combined device history in the HISTORY API contract shape (docs §HISTORY API):
+  //   { serial, metrics:[{ts,cpu_load,free_memory,temperature,ppp_sessions}],
+  //     interfaces:[{name, points:[{ts,rx_bps,tx_bps}]}] }
+  // Both series cover the last `windowSeconds` (ts >= now() - window) and are time-ASCENDING.
+  // Returns null for an UNKNOWN serial (route 404s) — distinct from a known device with no
+  // history (empty arrays). A sane row cap (HISTORY_ROW_CAP) bounds each query so a wide
+  // window on a busy multi-interface router can't return an unbounded result set; we take the
+  // MOST RECENT rows (ORDER BY ts DESC LIMIT cap) then re-sort ascending for the chart. The
+  // `window` label is owned by the handler.
+  async function getDeviceHistory(serial, windowSeconds) {
+    const device = await getDeviceBySerial(serial);
+    if (!device) return null;
+    const win = typeof windowSeconds === 'number' && windowSeconds > 0 ? windowSeconds : 3600;
+
+    const mRows = await rows(
+      `SELECT ts, cpu_load, free_memory, temperature, ppp_sessions
+         FROM metrics_history
+        WHERE device_id = $1
+          AND ts >= now() - ($2 || ' seconds')::interval
+        ORDER BY ts DESC
+        LIMIT ${HISTORY_ROW_CAP}`,
+      [device.id, String(win)]
+    );
+    const metrics = mRows
+      .map((row) => ({
+        ts: row.ts instanceof Date ? row.ts.toISOString() : String(row.ts),
+        cpu_load: row.cpu_load != null ? Number(row.cpu_load) : null,
+        free_memory: row.free_memory != null ? Number(row.free_memory) : null,
+        temperature: row.temperature != null ? Number(row.temperature) : null,
+        ppp_sessions: row.ppp_sessions != null ? Number(row.ppp_sessions) : null,
+      }))
+      .reverse(); // DESC fetch -> ASC for the contract
+
+    const iRows = await rows(
+      `SELECT name, ts, rx_bps, tx_bps
+         FROM interface_history
+        WHERE device_id = $1
+          AND ts >= now() - ($2 || ' seconds')::interval
+        ORDER BY ts DESC
+        LIMIT ${HISTORY_ROW_CAP}`,
+      [device.id, String(win)]
+    );
+    const byName = new Map();
+    // iRows are DESC; build ascending per-interface point arrays by unshifting.
+    for (const row of iRows) {
+      if (!byName.has(row.name)) byName.set(row.name, []);
+      byName.get(row.name).unshift({
+        ts: row.ts instanceof Date ? row.ts.toISOString() : String(row.ts),
+        rx_bps: row.rx_bps != null ? Number(row.rx_bps) : null,
+        tx_bps: row.tx_bps != null ? Number(row.tx_bps) : null,
+      });
+    }
+    const interfaces = [];
+    for (const name of Array.from(byName.keys()).sort()) {
+      interfaces.push({ name, points: byName.get(name) });
+    }
+
+    return { serial, metrics, interfaces };
+  }
+
   // ── worker: staleness / alerts / retention ──────────────────────────────────
   // Bump device_state.status by last_seen_at age. online -> stale -> offline.
   async function markStaleDevices(staleSeconds, offlineSeconds) {
@@ -879,6 +994,9 @@ function makePgStore(poolOrConfig) {
     getCurrentAgentScript,
     getFleet,
     getDeviceDetail,
+    getMetricsHistory,
+    getInterfaceHistory,
+    getDeviceHistory,
     markStaleDevices,
     getActiveAlertRules,
     evaluateAndApplyAlerts,
