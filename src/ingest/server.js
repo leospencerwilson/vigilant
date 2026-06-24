@@ -111,11 +111,11 @@ function createServer({ store, config: cfg }) {
         return handlers.healthz(ctx);
       }
 
-      // GET / — open root health/status. Some platforms (and Coolify's default
-      // health check) probe '/' and only mark an app "running"/route it once that
-      // returns 2xx; without this the app 404s on '/' and can stay un-routed.
+      // GET / — admin onboarding UI (static HTML shell; enrol/fleet actions inside it
+      // call the admin-token-gated JSON endpoints). Also serves as the 2xx root that
+      // platform health checks probe.
       if (method === 'GET' && pathname === '/') {
-        return json(res, 200, { service: 'vigilant', ok: true });
+        return handlers.adminUi(ctx);
       }
 
       // ── device routes ────────────────────────────────────────────

@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en-GB" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex" />
+<title>Vigilant — device onboarding</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#121821; --panel2:#0e141d; --line:#1f2a37;
+    --fg:#e6edf3; --mut:#8b9aa9; --acc:#3b82f6; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444;
+    --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:Inter,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.5}
+  header{display:flex;align-items:center;gap:12px;padding:16px 22px;border-bottom:1px solid var(--line);background:var(--panel2);position:sticky;top:0;z-index:5}
+  header .dot{width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok)}
+  header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.2px}
+  header .sub{color:var(--mut);font-size:12px}
+  header .spacer{flex:1}
+  .tokbar{display:flex;gap:8px;align-items:center}
+  .tokbar input{width:280px}
+  main{display:grid;grid-template-columns:minmax(420px,1fr) minmax(420px,1.3fr);gap:18px;padding:22px;max-width:1400px;margin:0 auto}
+  @media(max-width:900px){main{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px}
+  .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:0 0 14px}
+  label{display:block;font-size:12px;color:var(--mut);margin:12px 0 5px}
+  input,select{width:100%;padding:9px 11px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--fg);font-family:var(--sans);font-size:13px}
+  input:focus,select:focus{outline:none;border-color:var(--acc)}
+  .row{display:flex;gap:10px}.row>*{flex:1}
+  button{cursor:pointer;border:none;border-radius:8px;padding:10px 14px;font-weight:600;font-size:13px;font-family:var(--sans)}
+  button.primary{background:var(--acc);color:#fff;margin-top:16px;width:100%}
+  button.primary:disabled{opacity:.5;cursor:not-allowed}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg);padding:6px 10px;font-size:12px}
+  .msg{margin-top:12px;padding:10px 12px;border-radius:8px;font-size:13px;display:none}
+  .msg.err{display:block;background:rgba(239,68,68,.12);border:1px solid var(--bad);color:#fecaca}
+  .msg.ok{display:block;background:rgba(34,197,94,.10);border:1px solid var(--ok);color:#bbf7d0}
+  .result{display:none;margin-top:16px}
+  .field{margin-top:12px}
+  .field .k{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em;display:flex;justify-content:space-between;align-items:center}
+  pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;max-height:340px;font-family:var(--mono);font-size:12px;color:#cbd5e1;white-space:pre;margin:6px 0 0}
+  code.tok{display:block;background:var(--panel2);border:1px solid var(--warn);border-radius:8px;padding:10px;font-family:var(--mono);font-size:12px;color:#fde68a;word-break:break-all;margin-top:6px}
+  .hint{color:var(--mut);font-size:12px;margin-top:6px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;color:var(--mut);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.05em;padding:8px 8px;border-bottom:1px solid var(--line)}
+  td{padding:9px 8px;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:12px}
+  .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;font-family:var(--sans)}
+  .pill.online{background:rgba(34,197,94,.15);color:#86efac}
+  .pill.stale{background:rgba(245,158,11,.15);color:#fcd34d}
+  .pill.offline{background:rgba(239,68,68,.15);color:#fca5a5}
+  .pill.unknown{background:rgba(139,154,169,.15);color:#cbd5e1}
+  .between{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+  .between h2{margin:0}
+  .empty{color:var(--mut);padding:18px;text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="health"></span>
+  <div><h1>Vigilant</h1><div class="sub">MikroTik device onboarding · vigilant.internal</div></div>
+  <div class="spacer"></div>
+  <div class="tokbar">
+    <input id="admintok" type="password" placeholder="Admin token (ENROLL_TOKEN)" autocomplete="off" />
+    <button class="ghost" id="savetok">Use token</button>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Enrol a device</h2>
+    <label>Serial number <span class="hint">(must match <code>/system routerboard get serial-number</code>)</span></label>
+    <input id="serial" placeholder="e.g. HGT0A023T6C" autocomplete="off" />
+    <div class="row">
+      <div><label>Site name</label><input id="site" placeholder="e.g. Allied Huddersfield" /></div>
+      <div><label>Customer</label><input id="customer" placeholder="e.g. Allied" /></div>
+    </div>
+    <div class="row">
+      <div><label>WAN type</label>
+        <select id="wan"><option>pppoe</option><option>sim</option><option>dhcp</option><option>static</option><option value="unknown">unknown</option></select>
+      </div>
+      <div><label>Tags <span class="hint">(comma-sep)</span></label><input id="tags" placeholder="test, allied" /></div>
+    </div>
+    <button class="primary" id="enrol">Generate key &amp; install block</button>
+    <div class="msg" id="msg"></div>
+
+    <div class="result" id="result">
+      <div class="field">
+        <div class="k">Per-device token <button class="ghost" data-copy="tokval">Copy</button></div>
+        <code class="tok" id="tokval"></code>
+        <div class="hint">⚠️ Shown once. It's stored only as a hash server-side — copy it now.</div>
+      </div>
+      <div class="field">
+        <div class="k">RouterOS install block — paste under Safe Mode (Ctrl-X) <button class="ghost" data-copy="installval">Copy</button></div>
+        <pre id="installval"></pre>
+        <div class="hint">Telemetry-only (config-apply disabled). TLS verification off by default — see the runbook to harden.</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="between"><h2>Fleet</h2><button class="ghost" id="refresh">Refresh</button></div>
+    <table>
+      <thead><tr><th>Serial</th><th>Site</th><th>Status</th><th>CPU</th><th>Last seen</th></tr></thead>
+      <tbody id="fleet"><tr><td colspan="5" class="empty">Enter the admin token to load the fleet.</td></tr></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const tok = () => sessionStorage.getItem('vigilant_admin') || '';
+function setMsg(t, cls){ const m=$('#msg'); m.textContent=t; m.className='msg '+(cls||''); }
+function authHeaders(){ return { 'Authorization':'Bearer '+tok(), 'Content-Type':'application/json' }; }
+
+$('#admintok').value = tok();
+$('#savetok').onclick = () => { sessionStorage.setItem('vigilant_admin', $('#admintok').value.trim()); setMsg('Token set.', 'ok'); loadFleet(); };
+
+document.querySelectorAll('[data-copy]').forEach(b => b.onclick = () => {
+  const el = $('#'+b.dataset.copy); navigator.clipboard.writeText(el.textContent).then(()=>{ b.textContent='Copied'; setTimeout(()=>b.textContent='Copy',1200); });
+});
+
+$('#enrol').onclick = async () => {
+  if(!tok()){ setMsg('Set the admin token first.', 'err'); return; }
+  const serial = $('#serial').value.trim();
+  if(!serial){ setMsg('Serial is required.', 'err'); return; }
+  const body = {
+    serial,
+    site_name: $('#site').value.trim() || null,
+    customer: $('#customer').value.trim() || null,
+    wan_type: $('#wan').value,
+    tags: $('#tags').value.split(',').map(s=>s.trim()).filter(Boolean),
+  };
+  $('#enrol').disabled = true; setMsg('Enrolling…','');
+  try{
+    const r = await fetch('/enroll', { method:'POST', headers:authHeaders(), body:JSON.stringify(body) });
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok){ setMsg('Enrol failed ('+r.status+'): '+(j.error||'unknown'), 'err'); return; }
+    $('#tokval').textContent = j.token || '';
+    $('#installval').textContent = j.install || j.bootstrap || '';
+    $('#result').style.display='block';
+    setMsg('Device '+serial+' enrolled. Copy the token and install block below.', 'ok');
+    loadFleet();
+  }catch(e){ setMsg('Network error: '+e.message, 'err'); }
+  finally{ $('#enrol').disabled = false; }
+};
+
+function pill(s){ s=(s||'unknown'); return '<span class="pill '+s+'">'+s+'</span>'; }
+function ago(ts){ if(!ts) return '—'; const d=(Date.now()-new Date(ts).getTime())/1000; if(d<60) return Math.round(d)+'s ago'; if(d<3600) return Math.round(d/60)+'m ago'; return Math.round(d/3600)+'h ago'; }
+
+async function loadFleet(){
+  if(!tok()) return;
+  try{
+    const r = await fetch('/fleet', { headers:authHeaders() });
+    if(!r.ok){ $('#fleet').innerHTML='<tr><td colspan="5" class="empty">Fleet load failed ('+r.status+').</td></tr>'; return; }
+    const j = await r.json(); const rows=(j.devices||j||[]);
+    if(!rows.length){ $('#fleet').innerHTML='<tr><td colspan="5" class="empty">No devices enrolled yet.</td></tr>'; return; }
+    $('#fleet').innerHTML = rows.map(d=>'<tr><td>'+(d.serial||'')+'</td><td>'+(d.site_name||'—')+'</td><td>'+pill(d.status)+'</td><td>'+(d.cpu_load==null?'—':d.cpu_load+'%')+'</td><td>'+ago(d.last_seen_at)+'</td></tr>').join('');
+  }catch(e){ /* leave as-is */ }
+}
+$('#refresh').onclick = loadFleet;
+
+// liveness dot + periodic fleet refresh
+fetch('/healthz').then(r=>{ $('#health').style.background = r.ok ? 'var(--ok)' : 'var(--bad)'; }).catch(()=>{ $('#health').style.background='var(--bad)'; });
+if(tok()) loadFleet();
+setInterval(loadFleet, 10000);
+</script>
+</body>
+</html>

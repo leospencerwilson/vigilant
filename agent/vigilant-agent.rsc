@@ -22,6 +22,15 @@
 :global vigilantUrl
 :global vigilantToken
 
+# TLS verification mode for every /tool fetch below. Set by vigilant-env (see
+# bootstrap.rsc). RouterOS 7 trusts no public CA by default, so default to "no" (skip
+# verification — still TLS-encrypted) unless the operator has imported the CA and set
+# vigilantTlsCheck to a verifying mode. Declared once; visible to the fetches below.
+:global vigilantTlsCheck
+:local vigilantCC "no"
+:if ($vigilantTlsCheck = "yes-without-crl") do={ :set vigilantCC "yes-without-crl" }
+:if ($vigilantTlsCheck = "yes") do={ :set vigilantCC "yes" }
+
 # ── JSON free-text sanitiser ─────────────────────────────────────────
 # Vendor-supplied free text (identity, neighbour identity/platform, LTE operator,
 # interface comments) can contain characters that would BREAK the JSON document we
@@ -271,7 +280,7 @@
 # ── push, and read back control + pending job ────────────────────────
 :local resp ""
 :do {
-    :set resp [/tool fetch http-method=post mode=https \
+    :set resp [/tool fetch http-method=post mode=https check-certificate=$vigilantCC \
         url=("$vigilantUrl/telemetry") \
         http-header-field=("Authorization: Bearer " . $vigilantToken . ",Content-Type: application/json") \
         http-data=$body output=user as-value]
@@ -372,7 +381,7 @@
         :do {
             :local rb ("{\"job_id\":\"" . $vigilantPendingJob . "\",\"status\":\"applied\"," . \
                 "\"result_log\":\"rollback cancelled on server confirm\"}")
-            /tool fetch http-method=post mode=https url=("$vigilantUrl/config/result") \
+            /tool fetch http-method=post mode=https check-certificate=$vigilantCC url=("$vigilantUrl/config/result") \
                 http-header-field=("Authorization: Bearer " . $vigilantToken . ",Content-Type: application/json") \
                 http-data=$rb output=none
         } on-error={ :log warning "vigilant-agent: applied-result POST failed" }
@@ -420,7 +429,7 @@
         #    the sha256 of the fetched bytes matches BOTH the sha256 the server put in the
         #    telemetry job object AND (where present) the X-Vigilant-Sha256 response header.
         :do { /file remove [find name=$jobFn] } on-error={}
-        :local fr [/tool fetch http-method=get mode=https url=$jobUrl \
+        :local fr [/tool fetch http-method=get mode=https check-certificate=$vigilantCC url=$jobUrl \
             http-header-field=("Authorization: Bearer " . $vigilantToken) \
             dst-path=$jobFn as-value]
         :delay 1s
@@ -484,7 +493,7 @@
         :local ex  [$vigilantClean $exp]
         :local rb ("{\"job_id\":\"" . $jobId . "\",\"status\":\"" . $resultStatus . "\"," . \
             "\"result_log\":\"" . $rl . "\",\"export\":\"" . $ex . "\"}")
-        /tool fetch http-method=post mode=https url=("$vigilantUrl/config/result") \
+        /tool fetch http-method=post mode=https check-certificate=$vigilantCC url=("$vigilantUrl/config/result") \
             http-header-field=("Authorization: Bearer " . $vigilantToken . ",Content-Type: application/json") \
             http-data=$rb output=none
     } on-error={ :log warning "vigilant-agent: config result POST failed" }

@@ -88,6 +88,24 @@ async function healthz(ctx) {
   text(ctx.res, 200, 'ok');
 }
 
+// ── GET / — admin onboarding UI (static HTML; actions inside require the admin token) ──
+let _adminHtml = null;
+function adminUi(ctx) {
+  const { res } = ctx;
+  if (_adminHtml == null) {
+    try {
+      _adminHtml = require('node:fs').readFileSync(
+        require('node:path').join(__dirname, 'admin.html'), 'utf8');
+    } catch (e) {
+      _adminHtml = '<!doctype html><meta charset="utf-8"><title>Vigilant</title>' +
+        '<body style="font-family:sans-serif;background:#0b0f14;color:#e6edf3;padding:40px">' +
+        '<h1>Vigilant</h1><p>Admin UI asset missing; API is up. Use POST /enroll directly.</p>';
+    }
+  }
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+  res.end(_adminHtml);
+}
+
 // ── POST /telemetry ──────────────────────────────────────────────────
 // Implements the 11-step algorithm from the contract verbatim.
 async function telemetryIngest(ctx) {
@@ -445,12 +463,28 @@ async function enroll(ctx) {
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
   await store.setDeviceToken(device.id, tokenHash);
 
-  const bootstrap =
-    `:global vigilantUrl "${config.publicBaseUrl}"\n` +
-    `:global vigilantToken "${token}"`;
+  // Build the FULL, reboot-safe install block from the bootstrap.rsc template (single
+  // source of truth — same file the agent docs ship), substituting the real URL + token.
+  // Falls back to the minimal two-liner if the template can't be read.
+  let install;
+  try {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const dir = path.dirname(config.agentScriptPath || './agent/vigilant-agent.rsc');
+    const tmpl = fs.readFileSync(path.join(dir, 'bootstrap.rsc'), 'utf8');
+    install = tmpl
+      .split('<VIGILANT_URL>').join(config.publicBaseUrl)
+      .split('<VIGILANT_TOKEN>').join(token);
+  } catch (e) {
+    install =
+      `:global vigilantUrl "${config.publicBaseUrl}"\n` +
+      `:global vigilantToken "${token}"`;
+    log.warn('enroll: bootstrap template unreadable, returned minimal snippet', { msg: e && e.message });
+  }
 
   log.info('enroll: device created', { serial });
-  return json(res, 200, { token, bootstrap });
+  // `bootstrap` kept as an alias of `install` for backward compatibility.
+  return json(res, 200, { token, serial, install, bootstrap: install });
 }
 
 // ── GET /fleet (admin) ───────────────────────────────────────────────
