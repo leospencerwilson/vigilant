@@ -110,12 +110,23 @@
 
 <script>
 const $ = s => document.querySelector(s);
-const tok = () => sessionStorage.getItem('vigilant_admin') || '';
+// Token source: whatever is in the field right now, else the cached value. So just
+// TYPING the token is enough — no need to click "Use token" first.
+const tok = () => {
+  const el = document.getElementById('admintok');
+  const typed = el && el.value ? el.value.trim() : '';
+  return typed || sessionStorage.getItem('vigilant_admin') || '';
+};
 function setMsg(t, cls){ const m=$('#msg'); m.textContent=t; m.className='msg '+(cls||''); }
 function authHeaders(){ return { 'Authorization':'Bearer '+tok(), 'Content-Type':'application/json' }; }
 
-$('#admintok').value = tok();
-$('#savetok').onclick = () => { sessionStorage.setItem('vigilant_admin', $('#admintok').value.trim()); setMsg('Token set.', 'ok'); loadFleet(); };
+$('#admintok').value = sessionStorage.getItem('vigilant_admin') || '';
+// Persist as you type, and refresh the fleet once a token is present.
+$('#admintok').addEventListener('input', () => {
+  sessionStorage.setItem('vigilant_admin', $('#admintok').value.trim());
+  if (tok()) loadFleet();
+});
+$('#savetok').onclick = () => { sessionStorage.setItem('vigilant_admin', $('#admintok').value.trim()); setMsg(tok() ? 'Token set — fleet loaded.' : 'Enter a token first.', tok() ? 'ok' : 'err'); loadFleet(); };
 
 document.querySelectorAll('[data-copy]').forEach(b => b.onclick = () => {
   const el = $('#'+b.dataset.copy); navigator.clipboard.writeText(el.textContent).then(()=>{ b.textContent='Copied'; setTimeout(()=>b.textContent='Copy',1200); });
