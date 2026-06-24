@@ -354,7 +354,7 @@
 :local ifN [:len $ifaceArr]
 :local ifI 0
 :while ($ifI < $ifN) do={
-    :local body "{\"serial\":\"" . $serial . "\",\"partial\":true,\"interfaces\":["
+    :local body ("{\"serial\":\"" . $serial . "\",\"partial\":true,\"interfaces\":[")
     :local j 0
     :local sep ""
     :while (($j < $ifBatch) && (($ifI + $j) < $ifN)) do={
@@ -372,7 +372,7 @@
 :local nbN [:len $nbrArr]
 :local nbI 0
 :while ($nbI < $nbN) do={
-    :local body "{\"serial\":\"" . $serial . "\",\"partial\":true,\"neighbors\":["
+    :local body ("{\"serial\":\"" . $serial . "\",\"partial\":true,\"neighbors\":[")
     :local j 0
     :local sep ""
     :while (($j < $nbBatch) && (($nbI + $j) < $nbN)) do={
@@ -418,7 +418,7 @@
             }
             :set j ($j + 1)
         }
-        :local body "{\"serial\":\"" . $serial . "\",\"partial\":true,\"mac_hosts\":[" . $hosts . "],\"arp\":[" . $arps . "]}"
+        :local body ("{\"serial\":\"" . $serial . "\",\"partial\":true,\"mac_hosts\":[" . $hosts . "],\"arp\":[" . $arps . "]}")
         [$vigilantPost $body "telemetry-hosts" $vigilantCC]
         :set hI ($hI + $hBatch)
     }
