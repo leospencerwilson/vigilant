@@ -217,49 +217,80 @@ async function telemetryIngest(ctx) {
     }));
   }
 
-  // 8. one logical transaction: upsert state + neighbors + lte + (mac_hosts) + history.
-  const deviceState = {
-    status: 'online',
-    uptime_s: parseRosUptime(payload.uptime),
-    cpu_load: payload.cpu_load,
-    free_memory: payload.free_memory,
-    total_memory: payload.total_memory,
-    free_hdd: payload.free_hdd,
-    temperature: payload.temperature,
-    voltage: payload.voltage,
-    public_ip: payload.public_ip,
-    ros_version: payload.ros_version,
-    firmware: payload.firmware_current,
-    pppoe_running: payload.pppoe_running,
-    ppp_sessions: payload.ppp_sessions,
-    dhcp_leases: payload.dhcp_leases,
-    cpu_temperature: payload.cpu_temperature,
-    board_temperature: payload.board_temperature,
-    fan1_speed: payload.fan1_speed,
-    write_sect_total: payload.write_sect_total,
-    firmware_current: payload.firmware_current,
-    firmware_upgrade: payload.firmware_upgrade,
-    ntp_synced: payload.ntp_synced,
-    // Single-number signal for the bounded overview grid (schema device_state.lte_signal,
-    // RSRP/dBm). Mirrors the richer lte_state row; null when no SIM or no RSRP this tick.
-    lte_signal: lteRow && lteRow.rsrp != null ? Math.round(lteRow.rsrp) : null,
-    last_seen_at: ts,
-    raw,
-  };
+  // ── CHUNKED-TELEMETRY contract (see docs/CONTRACT.md §chunked telemetry) ──────────────
+  // RouterOS /tool fetch caps the size of the http-data argument the script can hand the
+  // fetch subsystem, so a multi-interface router cannot POST its whole rich body in one
+  // request. The agent therefore splits a tick across several SMALLER POSTs, and EVERY POST
+  // to /telemetry is treated as an IDEMPOTENT PARTIAL UPSERT of whatever it carries:
+  //   * device_state (the system block + status:'online' + metrics-history row) is written
+  //     ONLY for a CORE chunk — one whose raw body carried at least one system field
+  //     (payload.has_core). A DETAIL chunk (interfaces/neighbors/lte/mac_hosts only, or
+  //     partial:true) must NOT overwrite device_state with nulls; it only bumps last_seen_at
+  //     via store.touchDeviceState so the device still shows 'online' between core ticks.
+  //   * interface_state is upserted per (device, name) for whatever interfaces are present;
+  //     a chunk carrying a SUBSET leaves the others untouched (the store upserts, never
+  //     replaces). bps is per-interface and matched by name against the prior sample, so it
+  //     is computed correctly across chunked calls regardless of which chunk a port rode in.
+  //   * lte / neighbors / mac_hosts are independently upserted only when present (mac_hosts
+  //     null still means "keep previous"), so a chunk omitting any of them loses no data.
+  // A single full payload (no partial flag, system block present) keeps the EXACT prior
+  // behaviour — has_core is true, so this is byte-for-byte the original code path.
+  const hasCore = payload.has_core !== false; // default true unless normalize flagged a detail chunk
 
-  await store.upsertDeviceState(device.id, deviceState);
+  if (hasCore) {
+    // 8. one logical transaction: upsert state + neighbors + lte + (mac_hosts) + history.
+    const deviceState = {
+      status: 'online',
+      uptime_s: parseRosUptime(payload.uptime),
+      cpu_load: payload.cpu_load,
+      free_memory: payload.free_memory,
+      total_memory: payload.total_memory,
+      free_hdd: payload.free_hdd,
+      temperature: payload.temperature,
+      voltage: payload.voltage,
+      public_ip: payload.public_ip,
+      ros_version: payload.ros_version,
+      firmware: payload.firmware_current,
+      pppoe_running: payload.pppoe_running,
+      ppp_sessions: payload.ppp_sessions,
+      dhcp_leases: payload.dhcp_leases,
+      cpu_temperature: payload.cpu_temperature,
+      board_temperature: payload.board_temperature,
+      fan1_speed: payload.fan1_speed,
+      write_sect_total: payload.write_sect_total,
+      firmware_current: payload.firmware_current,
+      firmware_upgrade: payload.firmware_upgrade,
+      ntp_synced: payload.ntp_synced,
+      // Single-number signal for the bounded overview grid (schema device_state.lte_signal,
+      // RSRP/dBm). Mirrors the richer lte_state row; null when no SIM or no RSRP this tick.
+      lte_signal: lteRow && lteRow.rsrp != null ? Math.round(lteRow.rsrp) : null,
+      last_seen_at: ts,
+      raw,
+    };
+    await store.upsertDeviceState(device.id, deviceState);
+  } else if (typeof store.touchDeviceState === 'function') {
+    // DETAIL chunk: don't clobber the system columns; just keep the device 'online'. Guarded
+    // so a store predating touchDeviceState still loads (it simply won't bump last_seen here).
+    await store.touchDeviceState(device.id, ts);
+  }
+
   await store.upsertInterfaceStates(device.id, ifaceRows);
   if (lteRow) await store.upsertLteState(device.id, lteRow);
   await store.upsertNeighbors(device.id, payload.neighbors || []);
   if (macHostRows !== null) await store.upsertMacHosts(device.id, macHostRows);
 
-  await store.appendMetricsHistory(device.id, ts, {
-    cpu_load: payload.cpu_load,
-    free_memory: payload.free_memory,
-    temperature: payload.temperature,
-    ppp_sessions: payload.ppp_sessions,
-    conn_count: null,
-  });
+  // Metrics history is a snapshot of the system block — only meaningful for a CORE chunk.
+  // Skip it for a detail chunk so we never append an all-null metrics row that would dilute
+  // the history series and the downsample/rollup averages.
+  if (hasCore) {
+    await store.appendMetricsHistory(device.id, ts, {
+      cpu_load: payload.cpu_load,
+      free_memory: payload.free_memory,
+      temperature: payload.temperature,
+      ppp_sessions: payload.ppp_sessions,
+      conn_count: null,
+    });
+  }
   await store.appendInterfaceHistory(device.id, ts, ifaceHistRows);
   if (lteRow) {
     await store.appendLteHistory(device.id, ts, {

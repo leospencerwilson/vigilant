@@ -164,8 +164,13 @@
 # ── per-interface: counters + link + role + bridge membership ─────────
 # Cumulative counters (ingest derives bps); plugged/speed/duplex from ethernet/monitor;
 # bridge membership; is_wan from the list above. The ingest classifies `role`.
-:local ifaces "["
-:local first true
+#
+# CHUNKING: we collect each interface as its OWN small JSON object string into an ARRAY
+# ($ifaceArr) rather than concatenating one giant "[...]" string. The send section below
+# then POSTs these objects in SMALL BATCHES so no single /tool fetch http-data argument
+# exceeds RouterOS's message-bus cap (see the header comment in the send section). Each
+# element is a self-contained {...} object; the batch loop wraps a slice in [ ... ].
+:local ifaceArr [:toarray ""]
 :foreach i in=[/interface find] do={
     :local nm  [/interface get $i name]
     :local tp  [/interface get $i type]
@@ -194,13 +199,15 @@
     # WAN?
     :local isWan false
     :if ([:typeof [:find $wanList (" " . $nm . " ")]] != "nothing") do={ :set isWan true }
-    :if (!$first) do={ :set ifaces ($ifaces . ",") }
-    :set first false
-    :set ifaces ($ifaces . "{\"name\":\"" . $nm . "\",\"type\":\"" . $tp . \
-        "\",\"running\":" . $run . ",\"disabled\":" . $dis . ",\"plugged\":" . $plugged . \
-        ",\"speed\":\"" . $rate . "\",\"full_duplex\":" . $fd . ",\"bridge\":\"" . $br . "\"" . \
-        ",\"is_wan\":" . $isWan . ",\"rx_byte\":" . $rb . ",\"tx_byte\":" . $tb . \
-        ",\"rx_packet\":" . $rp . ",\"tx_packet\":" . $tp2 . "}")
+    # One self-contained interface object (explicit "." concatenation per line — survives
+    # the fetch->script-add->run reformat that breaks backslash-continued literals).
+    :local ifObj "{"
+    :set ifObj ($ifObj . "\"name\":\"" . $nm . "\",\"type\":\"" . $tp . "\",")
+    :set ifObj ($ifObj . "\"running\":" . $run . ",\"disabled\":" . $dis . ",\"plugged\":" . $plugged . ",")
+    :set ifObj ($ifObj . "\"speed\":\"" . $rate . "\",\"full_duplex\":" . $fd . ",\"bridge\":\"" . $br . "\",")
+    :set ifObj ($ifObj . "\"is_wan\":" . $isWan . ",\"rx_byte\":" . $rb . ",\"tx_byte\":" . $tb . ",")
+    :set ifObj ($ifObj . "\"rx_packet\":" . $rp . ",\"tx_packet\":" . $tp2 . "}")
+    :set ifaceArr ($ifaceArr , $ifObj)
 }
 
 # ── neighbours (what's plugged into each port, where it advertises) ──
@@ -208,8 +215,10 @@
 # bridge host MAC table. NOTE: identity/platform are vendor-supplied free text — we run
 # them through $vigilantClean before interpolating so a stray quote/backslash/control
 # char can't break the JSON doc. (The ingest also fails safe on a bad parse — belt+braces.)
-:local nbrs "["
-:local nf true
+#
+# CHUNKING: collect each neighbour as its own small object into $nbrArr; the send section
+# POSTs them in small batches the same way as interfaces.
+:local nbrArr [:toarray ""]
 :foreach n in=[/ip neighbor find] do={
     :do {
         :local nif [/ip neighbor get $n interface]
@@ -217,91 +226,212 @@
         :local nmac [/ip neighbor get $n mac-address]
         :local nip [/ip neighbor get $n address]
         :local npl [$vigilantClean [/ip neighbor get $n platform]]
-        :if (!$nf) do={ :set nbrs ($nbrs . ",") }
-        :set nf false
-        :set nbrs ($nbrs . "{\"interface\":\"" . $nif . "\",\"identity\":\"" . $nid . \
-            "\",\"mac\":\"" . $nmac . "\",\"address\":\"" . $nip . "\",\"platform\":\"" . $npl . "\"}")
+        :local nObj "{"
+        :set nObj ($nObj . "\"interface\":\"" . $nif . "\",\"identity\":\"" . $nid . "\",")
+        :set nObj ($nObj . "\"mac\":\"" . $nmac . "\",\"address\":\"" . $nip . "\",\"platform\":\"" . $npl . "\"}")
+        :set nbrArr ($nbrArr , $nObj)
     } on-error={}
 }
-:set nbrs ($nbrs . "]")
 
 # ── L2 host fallback (slow cadence) ──────────────────────────────────
 # Endpoints that don't advertise LLDP/CDP still show up here: the bridge host table
 # maps a MAC to the physical port it was learned on; ARP adds the IP. The ingest joins
-# them by MAC and does the OUI→vendor lookup. `null` on fast ticks = "keep previous".
-:local macHosts "null"
-:local arpList  "null"
+# them by MAC and does the OUI→vendor lookup. We only collect this on the SLOW tick;
+# on a fast tick we send NO mac_hosts POST at all, which the server reads as
+# "keep previous" (mac_hosts null/absent === keep previous — handlers.js step 7).
+#
+# CHUNKING + the mac↔arp JOIN: the server joins mac_hosts to arp BY MAC *within a single
+# POST body* (transform.joinMacHosts builds ipByMac from that body's arp array). So a
+# batch's mac_hosts and its matching arp entries MUST ride in the SAME POST or the IP
+# won't attach. We therefore resolve each host's IP from ARP HERE, and store mac, the
+# port it was learned on, and that IP together in one array element ($hostArr). The send
+# loop emits, per batch, BOTH a mac_hosts slice and a matching arp slice from the same
+# elements — keeping every batch self-joining and small.
+:local hostArr [:toarray ""]
 :if ($doSlow) do={
-    :set macHosts "["
-    :local mf true
-    :do {
-        :foreach h in=[/interface bridge host find local=no] do={
-            :do {
-                :local hm [/interface bridge host get $h mac-address]
-                :local hi [/interface bridge host get $h interface]
-                :if (!$mf) do={ :set macHosts ($macHosts . ",") }
-                :set mf false
-                :set macHosts ($macHosts . "{\"mac\":\"" . $hm . "\",\"interface\":\"" . $hi . "\"}")
-            } on-error={}
-        }
-    } on-error={}
-    :set macHosts ($macHosts . "]")
-    :set arpList "["
-    :local af true
+    # Build a mac->ip lookup from ARP once, then attach the IP to each bridge host.
+    :local arpIp [:toarray ""]
     :do {
         :foreach a in=[/ip arp find] do={
             :do {
                 :local am [/ip arp get $a mac-address]
                 :local aa [/ip arp get $a address]
-                :if (([:len $am] > 0) && ([:len $aa] > 0)) do={
-                    :if (!$af) do={ :set arpList ($arpList . ",") }
-                    :set af false
-                    :set arpList ($arpList . "{\"mac\":\"" . $am . "\",\"ip\":\"" . $aa . "\"}")
-                }
+                :if (([:len $am] > 0) && ([:len $aa] > 0)) do={ :set ($arpIp->$am) $aa }
             } on-error={}
         }
     } on-error={}
-    :set arpList ($arpList . "]")
+    :do {
+        :foreach h in=[/interface bridge host find local=no] do={
+            :do {
+                :local hm [/interface bridge host get $h mac-address]
+                :local hi [/interface bridge host get $h interface]
+                :local hip ($arpIp->$hm)
+                :if ([:typeof $hip] = "nothing") do={ :set hip "" }
+                # Store the three fields as a ";"-delimited tuple; the send loop splits it
+                # back into the mac_hosts object and the matching arp object.
+                :set hostArr ($hostArr , ($hm . ";" . $hi . ";" . $hip))
+            } on-error={}
+        }
+    } on-error={}
 }
-:set ifaces ($ifaces . "]")
 
-# ── assemble payload ─────────────────────────────────────────────────
-# Build via explicit concatenation, NOT a multi-line "\"-continued double-quoted literal.
-# RouterOS REFORMATS a script's source when it is fetched -> /system script add -> run
-# (it rejoins lines with ";  \n" separators), which BREAKS backslash line-continuations
-# inside a string literal — the body then truncates to its first fragment (~32 bytes,
-# which is exactly the "body-bytes=32" we saw) or malforms. Each :set below is one
-# self-contained statement that survives that round-trip, like the $ifaces/$nbrs loops.
-:local body "{"
-:set body ($body . "\"serial\":\"" . $serial . "\",\"identity\":\"" . $identity . "\",\"uptime\":\"" . $uptime . "\",")
-:set body ($body . "\"cpu_load\":" . $cpuLoad . ",\"free_memory\":" . $freeMem . ",\"total_memory\":" . $totMem . ",\"free_hdd\":" . $freeHdd . ",")
-:set body ($body . "\"ros_version\":\"" . $rosVer . "\",\"temperature\":" . $temp . ",\"cpu_temperature\":" . $cpuTemp . ",\"board_temperature\":" . $brdTemp . ",")
-:set body ($body . "\"voltage\":" . $volt . ",\"fan1_speed\":" . $fan1 . ",\"write_sect_total\":" . $writeSect . ",")
-:set body ($body . "\"firmware_current\":\"" . $fwCur . "\",\"firmware_upgrade\":\"" . $fwUpg . "\",\"ntp_synced\":" . $ntpSynced . ",")
-:set body ($body . "\"public_ip\":\"" . $publicIp . "\",\"pppoe_running\":" . $pppoeUp . ",\"ppp_sessions\":" . $pppSessions . ",\"dhcp_leases\":" . $dhcpLeases . ",")
-:set body ($body . "\"lte\":" . $lteJson . ",\"interfaces\":" . $ifaces . ",\"neighbors\":" . $nbrs . ",")
-:set body ($body . "\"mac_hosts\":" . $macHosts . ",\"arp\":" . $arpList . "}")
+# ── push telemetry in SMALL CHUNKS ───────────────────────────────────
+# WHY CHUNKED: RouterOS /tool fetch serialises the WHOLE command — including the entire
+# `http-data` string — into ONE message on the scripting↔tool message bus, which has a
+# hard size cap. A multi-interface router's full rich telemetry body (per-interface
+# counters for every bridge + VLAN + pppoe-out1 + lte1 + wifi, plus neighbours + system +
+# the slow-tick host/arp tables) is tens of KB and OVERFLOWS that cap → the fetch is
+# rejected before a byte leaves the box ("maximum message size exceeded"). output=none
+# does NOT help: that governs the RESPONSE coming back, not the OUTBOUND http-data arg.
+# Fix: split each tick into several SMALL POSTs, each well under ~1500 bytes, that the
+# server treats as idempotent partial upserts (see docs/CONTRACT.md §chunked telemetry):
+#   * CORE  — serial + identity + system/health + WAN/ppp/dhcp + lte. NO arrays.
+#             This is the chunk that writes device_state + marks the device 'online'.
+#   * DETAIL (partial:true) — interfaces in small batches; neighbours in small batches;
+#             slow-tick mac_hosts+arp in small batches. Each carries ONLY its subset, so
+#             it never clobbers device_state and a dropped batch only ages out its subset.
+# NOTE on headers: send ONLY the Authorization header. RouterOS /tool fetch does not
+# reliably split a comma-joined http-header-field into multiple headers — a trailing
+# ",Content-Type: …" gets folded into the bearer value (401). The ingest parses JSON
+# regardless of Content-Type, so the header is unnecessary.
+# NOTE on $body length: log it from the OUTER scope (computed before the fetch). The old
+# "[:len $body]" inside the :onerror handler could not see the outer body and reported a
+# misleading constant (the "body-bytes=32" scope artifact) — never use that pattern.
 
-# ── push, and read back control + pending job ────────────────────────
-# NOTE: send ONLY the Authorization header. RouterOS /tool fetch does not reliably split a
-# comma-joined http-header-field into multiple headers — a ",Content-Type: application/json"
-# suffix gets folded into the Authorization value, so the server reads the bearer as
-# "<token>,Content-Type: …" and returns 401 (seen live as "telemetry POST failed"). The
-# ingest parses the JSON body regardless of Content-Type, so the header is unnecessary.
+# Reusable single-POST helper: POST $1 (a body string) to /telemetry, fire-and-forget
+# (output=none), single Authorization header, TLS mode $3, concise failure log that
+# includes the TRUE outbound size. $2 is a short label for the log line.
+#   We capture the error into a function-scope variable INSIDE the :onerror and log it
+#   AFTERWARDS, in the function body — NOT from inside the :onerror do={} block. The old
+#   code logged "[:len $body]" from inside the handler, where the outer body string was
+#   not reliably bound, yielding the misleading "body-bytes=32" scope artifact. Computing
+#   blen and reading the captured error out here avoids that trap entirely.
+:global vigilantPost do={
+    :global vigilantUrl
+    :global vigilantToken
+    :local cc  $3
+    :local b   [:tostr $1]
+    :local lbl [:tostr $2]
+    :local blen [:len $b]
+    :local failMsg ""
+    :onerror perr in={
+        /tool fetch http-method=post mode=https check-certificate=$cc \
+            url=("$vigilantUrl/telemetry") \
+            http-header-field=("Authorization: Bearer " . $vigilantToken) \
+            http-data=$b output=none
+    } do={
+        :set failMsg $perr
+    }
+    :if ([:len $failMsg] > 0) do={
+        :log warning ("vigilant-agent: " . $lbl . " POST failed: " . $failMsg . " | body-bytes=" . $blen)
+    }
+}
+:global vigilantPost
+
+# ── 1) CORE chunk — system/health + WAN + ppp + lte. Small + bounded. ──
+# This is the ONLY chunk carrying the system block, so it is the one that writes
+# device_state and flips the device 'online'. No arrays → size is independent of how
+# many interfaces/neighbours/hosts the router has.
+:local core "{"
+:set core ($core . "\"serial\":\"" . $serial . "\",\"identity\":\"" . $identity . "\",\"uptime\":\"" . $uptime . "\",")
+:set core ($core . "\"cpu_load\":" . $cpuLoad . ",\"free_memory\":" . $freeMem . ",\"total_memory\":" . $totMem . ",\"free_hdd\":" . $freeHdd . ",")
+:set core ($core . "\"ros_version\":\"" . $rosVer . "\",\"temperature\":" . $temp . ",\"cpu_temperature\":" . $cpuTemp . ",\"board_temperature\":" . $brdTemp . ",")
+:set core ($core . "\"voltage\":" . $volt . ",\"fan1_speed\":" . $fan1 . ",\"write_sect_total\":" . $writeSect . ",")
+:set core ($core . "\"firmware_current\":\"" . $fwCur . "\",\"firmware_upgrade\":\"" . $fwUpg . "\",\"ntp_synced\":" . $ntpSynced . ",")
+:set core ($core . "\"public_ip\":\"" . $publicIp . "\",\"pppoe_running\":" . $pppoeUp . ",\"ppp_sessions\":" . $pppSessions . ",\"dhcp_leases\":" . $dhcpLeases . ",")
+:set core ($core . "\"lte\":" . $lteJson . "}")
+[$vigilantPost $core "telemetry-core" $vigilantCC]
+
+# ── 2) INTERFACE detail in small BATCHES (partial:true) ──
+# 3 interfaces per POST keeps each body in the few-hundred-bytes range even with long
+# 10-13 digit counters. Each batch carries ONLY {serial,partial,interfaces[...]} — no
+# system fields — so the server upserts just those ports and never touches device_state.
+# We deliberately send NO `ts`: the server then stamps each interface with that chunk's
+# receive time, and per-interface bps is computed against the SAME port's prior sample
+# (matched by name), so the delta window stays correct across ticks regardless of which
+# batch a port rode in (the single-payload path also omitted ts and relied on this).
+:local ifBatch 3
+:local ifN [:len $ifaceArr]
+:local ifI 0
+:while ($ifI < $ifN) do={
+    :local body "{\"serial\":\"" . $serial . "\",\"partial\":true,\"interfaces\":["
+    :local j 0
+    :local sep ""
+    :while (($j < $ifBatch) && (($ifI + $j) < $ifN)) do={
+        :set body ($body . $sep . ($ifaceArr->($ifI + $j)))
+        :set sep ","
+        :set j ($j + 1)
+    }
+    :set body ($body . "]}")
+    [$vigilantPost $body "telemetry-ifaces" $vigilantCC]
+    :set ifI ($ifI + $ifBatch)
+}
+
+# ── 3) NEIGHBOUR detail in small BATCHES (partial:true) ──
+:local nbBatch 4
+:local nbN [:len $nbrArr]
+:local nbI 0
+:while ($nbI < $nbN) do={
+    :local body "{\"serial\":\"" . $serial . "\",\"partial\":true,\"neighbors\":["
+    :local j 0
+    :local sep ""
+    :while (($j < $nbBatch) && (($nbI + $j) < $nbN)) do={
+        :set body ($body . $sep . ($nbrArr->($nbI + $j)))
+        :set sep ","
+        :set j ($j + 1)
+    }
+    :set body ($body . "]}")
+    [$vigilantPost $body "telemetry-neighbors" $vigilantCC]
+    :set nbI ($nbI + $nbBatch)
+}
+
+# ── 4) SLOW-TICK mac_hosts + arp in small BATCHES (partial:true) ──
+# Only runs on the slow tick (otherwise $hostArr is empty → no POST → server keeps the
+# previous host table). Each batch emits BOTH a mac_hosts slice and the MATCHING arp
+# slice from the same elements, so transform.joinMacHosts attaches each IP within the
+# batch. We send mac_hosts even when a host has no ARP IP (arp entry omitted for it) —
+# the server left-joins, leaving ip:null, which is the intended "MAC seen, no IP" row.
+:if ([:len $hostArr] > 0) do={
+    :local hBatch 4
+    :local hN [:len $hostArr]
+    :local hI 0
+    :while ($hI < $hN) do={
+        :local hosts ""
+        :local arps  ""
+        :local j 0
+        :local hsep ""
+        :local asep ""
+        :while (($j < $hBatch) && (($hI + $j) < $hN)) do={
+            :local tuple ($hostArr->($hI + $j))
+            # Split "mac;interface;ip" back into fields.
+            :local p1 [:find $tuple ";"]
+            :local hm [:pick $tuple 0 $p1]
+            :local rest [:pick $tuple ($p1 + 1) [:len $tuple]]
+            :local p2 [:find $rest ";"]
+            :local hi [:pick $rest 0 $p2]
+            :local hip [:pick $rest ($p2 + 1) [:len $rest]]
+            :set hosts ($hosts . $hsep . "{\"mac\":\"" . $hm . "\",\"interface\":\"" . $hi . "\"}")
+            :set hsep ","
+            :if ([:len $hip] > 0) do={
+                :set arps ($arps . $asep . "{\"mac\":\"" . $hm . "\",\"ip\":\"" . $hip . "\"}")
+                :set asep ","
+            }
+            :set j ($j + 1)
+        }
+        :local body "{\"serial\":\"" . $serial . "\",\"partial\":true,\"mac_hosts\":[" . $hosts . "],\"arp\":[" . $arps . "]}"
+        [$vigilantPost $body "telemetry-hosts" $vigilantCC]
+        :set hI ($hI + $hBatch)
+    }
+}
+
+# NOTE: telemetry is now FIRE-AND-FORGET across all chunks (output=none everywhere), so we
+# never capture a telemetry response. $resp therefore stays empty and the DRAFT config-apply
+# block below — which extracts its job fields from $resp->"data" — cleanly finds NO job and
+# no-ops (it is also gated off by $vigilantApplyEnabled=false by default). This matches the
+# old behaviour: the previous single POST also used output=none, leaving $resp empty. When
+# the apply path is taken live it must source the pending job from GET /config/pending (see
+# handlers.js configPending) rather than a telemetry response — out of scope for this change.
 :local resp ""
-:onerror telErr in={
-    # output=none — do NOT capture the response. /tool fetch with output=user/as-value
-    # buffers the result back through the scripting message bus, which trips
-    # "maximum message size exceeded" on a real device. Telemetry doesn't need the
-    # response (config-apply is gated off and reads via GET /config/pending instead),
-    # so we fire-and-forget. $resp stays "" and the config block below cleanly no-ops.
-    /tool fetch http-method=post mode=https check-certificate=$vigilantCC \
-        url=("$vigilantUrl/telemetry") \
-        http-header-field=("Authorization: Bearer " . $vigilantToken) \
-        http-data=$body output=none
-} do={
-    :log warning ("vigilant-agent: telemetry POST failed: " . $telErr . " | body-bytes=" . [:len $body])
-}
 
 # ─────────────────────────────────────────────────────────────────────
 # CONFIG-JOB APPLY PATH  —  DRAFT / REVIEW-BEFORE-LIVE

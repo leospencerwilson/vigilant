@@ -175,6 +175,22 @@ function makeMemStore(_config) {
     deviceState.set(deviceId, row);
   }
 
+  // CHUNKED TELEMETRY: bump only last_seen_at (+ keep status 'online') WITHOUT touching the
+  // system columns. Used when a detail-only chunk arrives (interfaces/neighbors/… but no
+  // system block): we must record the device is alive without nulling cpu_load/uptime/etc.
+  // that an earlier core chunk wrote this tick. If no device_state row exists yet (a detail
+  // chunk raced ahead of the core chunk), seed a minimal online row so the device still shows.
+  async function touchDeviceState(deviceId, ts) {
+    const prev = deviceState.get(deviceId);
+    const stamp = ts != null ? ts : iso();
+    if (!prev) {
+      deviceState.set(deviceId, { device_id: deviceId, status: 'online', last_seen_at: stamp });
+      return;
+    }
+    prev.status = 'online';
+    prev.last_seen_at = stamp;
+  }
+
   async function upsertInterfaceStates(deviceId, rows) {
     if (!Array.isArray(rows)) return;
     let m = interfaceState.get(deviceId);
@@ -624,6 +640,7 @@ function makeMemStore(_config) {
     setDeviceToken,
     getInterfaceStates,
     upsertDeviceState,
+    touchDeviceState,
     upsertInterfaceStates,
     upsertLteState,
     upsertNeighbors,

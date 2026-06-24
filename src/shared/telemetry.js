@@ -110,6 +110,15 @@ const telemetrySchema = z
     // optional agent-reported sample time (epoch ms or ISO string); the ingest uses it
     // for the bps delta window when present, else falls back to receive time.
     ts: loose.optional().nullable(),
+    // CHUNKED-TELEMETRY hint (see docs/CONTRACT.md §chunked telemetry). The agent may split
+    // one large tick across several smaller POSTs because RouterOS /tool fetch caps the size
+    // of the http-data argument it can hand the fetch subsystem (a multi-interface router's
+    // full body overflows it). `partial:true` marks a DETAIL chunk that carries only a subset
+    // of fields (e.g. just a batch of interfaces, or just neighbors) and must NOT be treated
+    // as the authoritative system/device_state sample for the tick. It is only a HINT —
+    // the handler also infers "is this a detail chunk?" from the absence of the system block,
+    // so a single full payload (partial absent/false) keeps the existing behaviour byte-for-byte.
+    partial: loose.optional().nullable(),
     identity: z.string().optional().nullable(),
     uptime: loose.optional().nullable(),
     cpu_load: loose.optional().nullable(),
@@ -181,14 +190,62 @@ function str(v) {
 //   * passes interfaces/neighbors through with booleans/numbers coerced.
 //   * leaves mac_hosts/arp as null when null (meaning "keep previous").
 //   * never throws on extra / missing optional keys.
+// The set of top-level keys that make a payload a "core"/system sample — i.e. the device_state
+// row. A chunked DETAIL POST omits ALL of these (it carries only interfaces/neighbors/lte/
+// mac_hosts/arp), so the handler can tell "this chunk has no system block" from raw-key presence
+// alone, WITHOUT relying on the agent setting partial:true. We must test the RAW object: after
+// coercion every absent system field becomes `null`, which is indistinguishable from an explicit
+// null, so the present/absent decision has to be made before normalize() flattens it.
+const CORE_KEYS = [
+  "uptime",
+  "cpu_load",
+  "free_memory",
+  "total_memory",
+  "free_hdd",
+  "ros_version",
+  "temperature",
+  "cpu_temperature",
+  "board_temperature",
+  "voltage",
+  "fan1_speed",
+  "fan2_speed",
+  "write_sect_total",
+  "firmware_current",
+  "firmware_upgrade",
+  "ntp_synced",
+  "public_ip",
+  "pppoe_running",
+  "ppp_sessions",
+  "dhcp_leases",
+  "lte",
+];
+
+// True when the raw payload carries at least one system/device_state field — i.e. it is a
+// CORE sample whose device_state should be written. A detail-only chunk (interfaces/neighbors/…
+// only) returns false, so the handler can skip the destructive device_state overwrite.
+function hasCoreFields(raw) {
+  if (!raw || typeof raw !== "object") return false;
+  for (const k of CORE_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(raw, k) && raw[k] !== undefined) return true;
+  }
+  return false;
+}
+
 function normalize(raw) {
   const p = telemetrySchema.parse(raw); // throws only on missing/invalid `serial`
+
+  // Record whether the RAW payload carried any system/core fields (decided pre-coercion;
+  // see hasCoreFields). The handler uses this to decide whether to write device_state.
+  const coreHere = hasCoreFields(raw);
 
   const out = {
     serial: p.serial,
     // pass the agent-reported sample time through verbatim (number epoch ms or ISO
     // string); the handler resolves it to ms and falls back to receive time if absent.
     ts: p.ts != null ? p.ts : null,
+    // explicit "this is a detail chunk" hint from a chunked agent; the handler treats
+    // missing system fields as the same signal, so this is belt-and-braces.
+    partial: parseBool(p.partial) === true,
     identity: str(p.identity),
     uptime: typeof p.uptime === "string" ? p.uptime : str(p.uptime),
     cpu_load: transform.parseNum(p.cpu_load),
@@ -217,6 +274,12 @@ function normalize(raw) {
     // null = "keep previous": preserve null vs [] distinction.
     mac_hosts: normalizeMacHosts(p.mac_hosts),
     arp: normalizeArp(p.arp),
+    // CHUNKED TELEMETRY: did the raw payload carry a system/core block? When false this is a
+    // detail-only chunk and the handler must NOT overwrite device_state with nulls — it only
+    // bumps last_seen_at. Computed from raw-key presence (see hasCoreFields), NOT from the
+    // always-null-filled coerced fields. An explicit `partial:true` forces detail treatment
+    // even if a stray core key slipped in, so an agent can be unambiguous.
+    has_core: parseBool(p.partial) === true ? false : coreHere,
   };
 
   return out;

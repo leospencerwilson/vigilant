@@ -230,6 +230,23 @@ function makePgStore(poolOrConfig) {
     );
   }
 
+  // CHUNKED TELEMETRY: bump ONLY status + last_seen_at, leaving every system column intact.
+  // Called for a detail-only chunk (interfaces/neighbors/… with no system block) so we record
+  // the device is alive WITHOUT clobbering cpu_load/uptime/free_memory/etc. that a core chunk
+  // wrote this tick. ON CONFLICT updates only those two columns; the INSERT branch seeds a
+  // minimal 'online' row when a detail chunk races ahead of the core chunk (all system cols
+  // default to NULL until the core chunk fills them).
+  async function touchDeviceState(deviceId, ts) {
+    await q(
+      `INSERT INTO device_state (device_id, status, last_seen_at)
+         VALUES ($1, 'online', COALESCE($2, now()))
+       ON CONFLICT (device_id) DO UPDATE SET
+         status       = 'online',
+         last_seen_at = COALESCE(EXCLUDED.last_seen_at, now())`,
+      [deviceId, ts || null]
+    );
+  }
+
   // Each row already has rx_bps/tx_bps/role/is_wan computed by the ingest.
   async function upsertInterfaceStates(deviceId, rowsIn) {
     const list = Array.isArray(rowsIn) ? rowsIn : [];
@@ -845,6 +862,7 @@ function makePgStore(poolOrConfig) {
     setDeviceToken,
     getInterfaceStates,
     upsertDeviceState,
+    touchDeviceState,
     upsertInterfaceStates,
     upsertLteState,
     upsertNeighbors,

@@ -194,6 +194,36 @@ logical transaction: upsert device_state, interface_state, lte_state, neighbors,
 (mac_hosts), append *_history. 9. compute poll_interval_s from device.poll_until. 10.
 `getPendingConfigJob`. 11. respond.
 
+### Chunked telemetry (partial upserts)
+
+RouterOS `/tool fetch` caps the size of the `http-data` argument a script can hand the fetch
+subsystem (the script→tool message bus has a low-tens-of-KiB ceiling, surfacing as
+`maximum message size exceeded`). A multi-interface router's full rich body (per-interface
+counters for every bridge/VLAN/pppoe/lte/wifi + neighbours + mac_hosts) overflows it, so the
+POST is rejected before a byte leaves the box. This is an **undocumented platform constraint**
+— keep every `/tool fetch` body in the single-KB range.
+
+To stay under the cap the agent MAY split one tick across several smaller POSTs to `/telemetry`.
+Every POST is an **idempotent partial upsert** of whatever it carries — a chunk must NEVER wipe
+data it does not carry:
+
+- **CORE chunk** — carries the system block (`cpu_load`/`uptime`/`free_memory`/`lte`/… any of
+  the device_state fields). This is the ONLY chunk that writes `device_state` (status `online` +
+  metrics-history row + `lte_signal` mirror), and where the agent reads back the control fields
+  (`poll_interval_s`/`agent_version`/`job`/`confirm`). It carries no interfaces.
+- **DETAIL chunk** — carries only interfaces (in small batches) / neighbors / mac_hosts / arp,
+  and SHOULD set `"partial": true`. It does NOT overwrite the system columns; the server only
+  bumps `last_seen_at` (`store.touchDeviceState`) so the device stays `online` between core
+  ticks. Per-interface `bps` is matched by name against the prior sample, so it is computed
+  correctly across chunked calls regardless of which chunk a port rode in. An interface/neighbor
+  not present in a chunk is left untouched (upsert, never replace). `mac_hosts:null` still means
+  "keep previous".
+
+Detection: the server treats a payload as a DETAIL chunk when it carries no system field
+(`telemetry.normalize` → `has_core:false`) OR when `partial:true` is set; otherwise it is a CORE
+sample and the existing full-payload path runs byte-for-byte unchanged. A single full payload
+(system block + interfaces + neighbors in one body) keeps the original behaviour exactly.
+
 ## Env (`config.js` + `.env.example`)
 
 ```
