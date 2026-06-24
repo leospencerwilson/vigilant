@@ -58,12 +58,24 @@ collection once (server-side, `agent_scripts.is_current=true`) and the estate se
 
 ### Easiest path: the admin UI
 
-Open **`https://vigilant.internal.western-communication.com/`** in a browser, paste the
-admin `ENROLL_TOKEN` into the token bar, fill the **Enrol a device** form (serial + a few
-fields), and click **Generate key & install block**. It mints the per-device token and
-shows the **complete copy-paste install block** (the same one `/enroll` returns), plus a
-live fleet table. You still do the router-side work under **Safe Mode** per §3, and the
-prereqs in §2 still apply. The curl/API flow (§4) is the scripted equivalent.
+Open **`https://vigilant.internal.western-communication.com/`** in a browser and paste the
+admin `ENROLL_TOKEN` into the token bar. Then follow the two on-screen steps — **no typing**:
+
+1. **Copy the one-line snippet** the page shows and paste it into the router's terminal
+   (New Terminal / SSH). It prints the serial and identity, e.g.:
+   ```
+   VIGILANT serial=HGT0A023T6C
+   VIGILANT identity=Allied Huddersfield
+   ```
+2. **Paste that output back** into the box on the page and click **Generate key & install
+   block**.
+
+The page parses the **serial**, sets the **site name to the router's identity**, mints the
+per-device token, and shows the **complete copy-paste install block** (the same one `/enroll`
+returns) plus a live fleet table. (Customer / WAN-type / tags are not collected — keep it
+simple; set them later via the API if needed.) You still do the router-side install under
+**Safe Mode** per §3, and the prereqs in §2 still apply. The curl/API flow (§4) is the
+scripted equivalent.
 
 ### What the installer sets up for you (one paste, reboot-safe)
 

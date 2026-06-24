@@ -26,8 +26,12 @@
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px}
   .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:0 0 14px}
   label{display:block;font-size:12px;color:var(--mut);margin:12px 0 5px}
-  input,select{width:100%;padding:9px 11px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--fg);font-family:var(--sans);font-size:13px}
-  input:focus,select:focus{outline:none;border-color:var(--acc)}
+  input,select,textarea{width:100%;padding:9px 11px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--fg);font-family:var(--sans);font-size:13px}
+  textarea{font-family:var(--mono);font-size:12px;resize:vertical}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--acc)}
+  .step{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em;display:flex;justify-content:space-between;align-items:center;margin:14px 0 6px}
+  pre.snippet{margin:0;white-space:pre-wrap;word-break:break-word;border-color:var(--acc)}
+  .ok-parse{color:#86efac}
   .row{display:flex;gap:10px}.row>*{flex:1}
   button{cursor:pointer;border:none;border-radius:8px;padding:10px 14px;font-weight:600;font-size:13px;font-family:var(--sans)}
   button.primary{background:var(--acc);color:#fff;margin-top:16px;width:100%}
@@ -69,18 +73,15 @@
 <main>
   <section class="card">
     <h2>Enrol a device</h2>
-    <label>Serial number <span class="hint">(must match <code>/system routerboard get serial-number</code>)</span></label>
-    <input id="serial" placeholder="e.g. HGT0A023T6C" autocomplete="off" />
-    <div class="row">
-      <div><label>Site name</label><input id="site" placeholder="e.g. Allied Huddersfield" /></div>
-      <div><label>Customer</label><input id="customer" placeholder="e.g. Allied" /></div>
-    </div>
-    <div class="row">
-      <div><label>WAN type</label>
-        <select id="wan"><option>pppoe</option><option>sim</option><option>dhcp</option><option>static</option><option value="unknown">unknown</option></select>
-      </div>
-      <div><label>Tags <span class="hint">(comma-sep)</span></label><input id="tags" placeholder="test, allied" /></div>
-    </div>
+    <p class="hint">Two steps — no typing. Paste the snippet into the router's terminal, then paste what it prints back here. The site name is taken from the router's identity.</p>
+
+    <div class="step"><span>1 · Paste this into the router (New Terminal / SSH)</span><button class="ghost" data-copy="probe">Copy</button></div>
+    <pre class="snippet" id="probe">:put ("VIGILANT serial=" . [/system routerboard get serial-number]); :put ("VIGILANT identity=" . [/system identity get name])</pre>
+
+    <label>2 · Paste the router's output here</label>
+    <textarea id="probeout" rows="4" placeholder="VIGILANT serial=HGT0A023T6C&#10;VIGILANT identity=Allied Huddersfield" autocomplete="off"></textarea>
+    <div class="hint" id="parsed">Waiting for router output…</div>
+
     <button class="primary" id="enrol">Generate key &amp; install block</button>
     <div class="msg" id="msg"></div>
 
@@ -120,17 +121,26 @@ document.querySelectorAll('[data-copy]').forEach(b => b.onclick = () => {
   const el = $('#'+b.dataset.copy); navigator.clipboard.writeText(el.textContent).then(()=>{ b.textContent='Copied'; setTimeout(()=>b.textContent='Copy',1200); });
 });
 
+// Parse the router's pasted output. Serial is to end-of-line; identity (may contain
+// spaces) is captured to end-of-line too. Tolerant of extra terminal noise.
+function parseProbe(){
+  const t = $('#probeout').value || '';
+  const s = (t.match(/serial\s*=\s*([^\r\n]+)/i)||[])[1];
+  const id = (t.match(/identity\s*=\s*([^\r\n]+)/i)||[])[1];
+  return { serial: s && s.trim(), identity: id && id.trim() };
+}
+$('#probeout').addEventListener('input', () => {
+  const { serial, identity } = parseProbe();
+  $('#parsed').innerHTML = serial
+    ? '<span class="ok-parse">✓ serial <b>'+serial+'</b>'+(identity?' · identity “'+identity+'”':' · no identity found')+'</span>'
+    : 'Waiting for router output…';
+});
+
 $('#enrol').onclick = async () => {
   if(!tok()){ setMsg('Set the admin token first.', 'err'); return; }
-  const serial = $('#serial').value.trim();
-  if(!serial){ setMsg('Serial is required.', 'err'); return; }
-  const body = {
-    serial,
-    site_name: $('#site').value.trim() || null,
-    customer: $('#customer').value.trim() || null,
-    wan_type: $('#wan').value,
-    tags: $('#tags').value.split(',').map(s=>s.trim()).filter(Boolean),
-  };
+  const { serial, identity } = parseProbe();
+  if(!serial){ setMsg('No serial found. Paste the snippet output from the router (it should contain "serial=…").', 'err'); return; }
+  const body = { serial, site_name: identity || null };
   $('#enrol').disabled = true; setMsg('Enrolling…','');
   try{
     const r = await fetch('/enroll', { method:'POST', headers:authHeaders(), body:JSON.stringify(body) });
@@ -139,7 +149,7 @@ $('#enrol').onclick = async () => {
     $('#tokval').textContent = j.token || '';
     $('#installval').textContent = j.install || j.bootstrap || '';
     $('#result').style.display='block';
-    setMsg('Device '+serial+' enrolled. Copy the token and install block below.', 'ok');
+    setMsg('Device '+serial+' enrolled'+(identity?' as “'+identity+'”':'')+'. Copy the token + install block below, then paste the block into the router under Safe Mode.', 'ok');
     loadFleet();
   }catch(e){ setMsg('Network error: '+e.message, 'err'); }
   finally{ $('#enrol').disabled = false; }
