@@ -278,11 +278,16 @@
 \"mac_hosts\":$macHosts,\"arp\":$arpList}"
 
 # ── push, and read back control + pending job ────────────────────────
+# NOTE: send ONLY the Authorization header. RouterOS /tool fetch does not reliably split a
+# comma-joined http-header-field into multiple headers — a ",Content-Type: application/json"
+# suffix gets folded into the Authorization value, so the server reads the bearer as
+# "<token>,Content-Type: …" and returns 401 (seen live as "telemetry POST failed"). The
+# ingest parses the JSON body regardless of Content-Type, so the header is unnecessary.
 :local resp ""
 :do {
     :set resp [/tool fetch http-method=post mode=https check-certificate=$vigilantCC \
         url=("$vigilantUrl/telemetry") \
-        http-header-field=("Authorization: Bearer " . $vigilantToken . ",Content-Type: application/json") \
+        http-header-field=("Authorization: Bearer " . $vigilantToken) \
         http-data=$body output=user as-value]
 } on-error={ :log warning "vigilant-agent: telemetry POST failed" }
 
@@ -382,7 +387,7 @@
             :local rb ("{\"job_id\":\"" . $vigilantPendingJob . "\",\"status\":\"applied\"," . \
                 "\"result_log\":\"rollback cancelled on server confirm\"}")
             /tool fetch http-method=post mode=https check-certificate=$vigilantCC url=("$vigilantUrl/config/result") \
-                http-header-field=("Authorization: Bearer " . $vigilantToken . ",Content-Type: application/json") \
+                http-header-field=("Authorization: Bearer " . $vigilantToken) \
                 http-data=$rb output=none
         } on-error={ :log warning "vigilant-agent: applied-result POST failed" }
         :log info ("vigilant-agent: config job " . $vigilantPendingJob . " confirmed applied")
@@ -494,7 +499,7 @@
         :local rb ("{\"job_id\":\"" . $jobId . "\",\"status\":\"" . $resultStatus . "\"," . \
             "\"result_log\":\"" . $rl . "\",\"export\":\"" . $ex . "\"}")
         /tool fetch http-method=post mode=https check-certificate=$vigilantCC url=("$vigilantUrl/config/result") \
-            http-header-field=("Authorization: Bearer " . $vigilantToken . ",Content-Type: application/json") \
+            http-header-field=("Authorization: Bearer " . $vigilantToken) \
             http-data=$rb output=none
     } on-error={ :log warning "vigilant-agent: config result POST failed" }
 }
