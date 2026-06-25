@@ -1,6 +1,16 @@
 # Vigilant install/bootstrap — DRAFT. REVIEW BEFORE APPLYING TO ANY LIVE ROUTER.
 # RouterOS 7.x. Paste under Safe Mode (Ctrl-X / F4).
 #
+# ┌─ HOW TO PASTE ─────────────────────────────────────────────────────────────┐
+# │ Paste sections 1–3 (everything down to "section 4") in one go — they are    │
+# │ script/scheduler definitions only, with NO network I/O, so nothing can be   │
+# │ corrupted mid-paste. Let it settle, THEN run the single section-4 line on   │
+# │ its own. Section 4 starts a /tool fetch whose async progress prints to the  │
+# │ console; running it LAST means that output has no later lines to clobber.   │
+# │ (Pasting the whole file at once also works, since the fetch is the last     │
+# │ line — but separating it is the safe habit.)                                │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
 # This is the COMPLETE per-device installer (telemetry-only; config-apply is OFF).
 # The Vigilant /enroll endpoint serves a copy of this with <VIGILANT_URL> and
 # <VIGILANT_TOKEN> already substituted — so the admin UI / API hand you a ready block.
@@ -78,11 +88,10 @@
     on-event="/system script run vigilant-bootstrap" \
     comment="Vigilant: daily agent self-update"
 
-# ── 3) Fetch the agent NOW (creates the vigilant-agent script) ───────
-/system script run vigilant-bootstrap
-:delay 3s
-
-# ── 4) Telemetry tick: run the collector every 1s ────────────────────
+# ── 3) Telemetry tick scheduler (every 1s) ───────────────────────────
+# Created BEFORE the agent script is fetched (section 4), so it must NOT assume the script
+# already exists: the on-event GUARDS on the script's presence and cleanly no-ops until the
+# fetch lands it — otherwise it would log "no such script" once per second in the gap.
 # NOTE: 1s is aggressive — each tick fires several chunked /tool fetch POSTs, so a busy
 # multi-interface router can spend real CPU here and, if a tick takes >1s to gather + post,
 # RouterOS simply skips the overlapping run (you get jitter, not a crash). Raise this (e.g.
@@ -90,7 +99,16 @@
 # scheduler, so this interval persists across updates.
 /system scheduler remove [find name="vigilant-agent"]
 /system scheduler add name=vigilant-agent interval=1s \
-    on-event="/system script run vigilant-agent" \
+    on-event=":if ([:len [/system script find name=\"vigilant-agent\"]] > 0) do={ /system script run vigilant-agent }" \
     comment="Vigilant: telemetry tick"
+
+# ── 4) Fetch the agent NOW — !! RUN THIS LINE LAST, ON ITS OWN !! ─────
+# This triggers a /tool fetch whose async progress (status / downloaded / duration) prints to
+# the console a moment later. Keeping it as the FINAL command means that async output has NO
+# subsequent pasted lines to corrupt — which is exactly what broke a paste-the-whole-block
+# install before (a stray "…isabled)" syntax error as the fetch output overwrote the next
+# line). Everything above this point is script/scheduler definitions only — no network I/O —
+# so it pastes safely in one go. Paste sections 1–3, let them settle, THEN run this line.
+/system script run vigilant-bootstrap
 
 :log info "vigilant: install complete (telemetry-only; apply disabled)"
