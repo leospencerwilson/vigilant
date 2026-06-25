@@ -547,6 +547,73 @@ function drawLineChart(el, series, opts){
     }
     flush();
   }
+
+  // ── hover crosshair + value tooltip ──────────────────────────────────────
+  // A transparent overlay over the plot captures the mouse; on move we snap a dashed vertical
+  // guide to the nearest RAW sample (we show the true measured value, not the smoothed line),
+  // drop a dot on each series, and draw a small tooltip with the timestamp + per-series values.
+  // Everything is re-created on each redraw, so there are no stale listeners.
+  const plotX0=padL, plotX1=W-padR, plotY0=padT, plotY1=H-padB;
+  const sData = (series||[]).map(s=>({
+    color:s.color||'var(--acc)', label:s.label||'',
+    pts:(s.points||[]).filter(p=>p&&p.value!=null&&isFinite(p.value)).map(p=>({t:new Date(p.ts).getTime(), v:p.value}))
+  })).filter(s=>s.pts.length);
+  if (sData.length && (plotX1-plotX0) > 0){
+    const hover = svgEl('g', { style:'pointer-events:none', visibility:'hidden' });
+    const vline = svgEl('line', { stroke:'#8b9aa9', 'stroke-width':1, 'stroke-dasharray':'3 3' });
+    hover.appendChild(vline);
+    const dots = sData.map(s=>{ const c=svgEl('circle',{ r:3.2, fill:s.color, stroke:'#0b0f14', 'stroke-width':1.2, visibility:'hidden' }); hover.appendChild(c); return c; });
+    const box = svgEl('rect', { rx:4, fill:'#0e141d', stroke:'#1f2a37', 'stroke-width':1, opacity:0.97 });
+    hover.appendChild(box);
+    const tgroup = svgEl('g', {}); hover.appendChild(tgroup);
+    el.appendChild(hover);
+
+    const overlay = svgEl('rect', { x:plotX0, y:plotY0, width:(plotX1-plotX0), height:Math.max(0,plotY1-plotY0), fill:'transparent', style:'cursor:crosshair' });
+    el.appendChild(overlay);
+
+    const fmtFull = t=>{ const d=new Date(t); return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0'); };
+    const nearest = (pts,tc)=>{ let best=pts[0],bd=Math.abs(pts[0].t-tc); for(let i=1;i<pts.length;i++){ const dd=Math.abs(pts[i].t-tc); if(dd<bd){bd=dd;best=pts[i];} } return best; };
+    let ref=sData[0]; for(const s of sData) if(s.pts.length>ref.pts.length) ref=s;
+
+    overlay.addEventListener('mousemove', (e)=>{
+      const rect = el.getBoundingClientRect();
+      let mx = (e.clientX-rect.left) * (W/(rect.width||W));
+      mx = Math.max(plotX0, Math.min(plotX1, mx));
+      const tc = tMin + (mx-plotX0)/((plotX1-plotX0)||1)*(tMax-tMin);
+      const refN = nearest(ref.pts, tc);
+      const lineX = x(refN.t);
+      vline.setAttribute('x1',lineX); vline.setAttribute('y1',plotY0);
+      vline.setAttribute('x2',lineX); vline.setAttribute('y2',plotY1);
+
+      while (tgroup.firstChild) tgroup.removeChild(tgroup.firstChild);
+      const lines=[{ str:fmtFull(refN.t) }];
+      sData.forEach((s,i)=>{
+        const np = nearest(s.pts, refN.t);
+        dots[i].setAttribute('cx', x(np.t)); dots[i].setAttribute('cy', y(np.v)); dots[i].setAttribute('visibility','visible');
+        lines.push({ color:s.color, text:(s.label?s.label+'  ':'')+yFmt(np.v) });
+      });
+
+      const lh=12, padTxt=6, sw=8;
+      let maxChars=0; lines.forEach(l=>{ const t=l.str||l.text; if(t.length>maxChars)maxChars=t.length; });
+      const hasSwatch = lines.some(l=>l.color);
+      const boxW = padTxt*2 + (hasSwatch?(sw+4):0) + Math.ceil(maxChars*5.6);
+      const boxH = padTxt*2 + lines.length*lh;
+      let bx = lineX + 10; if (bx + boxW > plotX1) bx = lineX - 10 - boxW; if (bx < plotX0) bx = plotX0;
+      const by = plotY0 + 4;
+      box.setAttribute('x',bx); box.setAttribute('y',by); box.setAttribute('width',boxW); box.setAttribute('height',boxH);
+      lines.forEach((l,i)=>{
+        const ty = by + padTxt + (i+1)*lh - 3;
+        if (l.str){ const t=svgEl('text',{ x:bx+padTxt, y:ty, fill:'#8b9aa9' }); t.textContent=l.str; tgroup.appendChild(t); }
+        else {
+          const swx=bx+padTxt;
+          tgroup.appendChild(svgEl('rect',{ x:swx, y:ty-7, width:sw, height:sw, rx:1, fill:l.color }));
+          const t=svgEl('text',{ x:swx+sw+4, y:ty, fill:'#e6edf3' }); t.textContent=l.text; tgroup.appendChild(t);
+        }
+      });
+      hover.setAttribute('visibility','visible');
+    });
+    overlay.addEventListener('mouseleave', ()=>{ hover.setAttribute('visibility','hidden'); });
+  }
 }
 function fmtClock(t){ const d=new Date(t); return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); }
 
@@ -839,10 +906,10 @@ function renderHistory(h){
 
   // CPU + memory device-level charts.
   drawLineChart($('#c-cpu'),
-    [{ color:'var(--acc)', points: metrics.map(m=>({ ts:m.ts, value:m.cpu_load })) }],
+    [{ color:'var(--acc)', label:'CPU', points: metrics.map(m=>({ ts:m.ts, value:m.cpu_load })) }],
     { min:0, max:100, yFmt:v=>Math.round(v)+'%' });
   drawLineChart($('#c-mem'),
-    [{ color:'var(--ok)', points: metrics.map(m=>({ ts:m.ts, value:m.free_memory })) }],
+    [{ color:'var(--ok)', label:'free', points: metrics.map(m=>({ ts:m.ts, value:m.free_memory })) }],
     { yFmt:humanBytes });
 
   // Per-interface rx/tx charts for the top N busy interfaces (by peak rx+tx across window).
@@ -864,8 +931,8 @@ function renderHistory(h){
   // Draw after the SVG nodes exist in the DOM (so clientWidth is real).
   ranked.forEach((r,idx)=>{
     drawLineChart($('#cif-'+idx),
-      [ { color:'var(--rx)', points: (r.it.points||[]).map(p=>({ ts:p.ts, value:p.rx_bps })) },
-        { color:'var(--tx)', points: (r.it.points||[]).map(p=>({ ts:p.ts, value:p.tx_bps })) } ],
+      [ { color:'var(--rx)', label:'rx', points: (r.it.points||[]).map(p=>({ ts:p.ts, value:p.rx_bps })) },
+        { color:'var(--tx)', label:'tx', points: (r.it.points||[]).map(p=>({ ts:p.ts, value:p.tx_bps })) } ],
       { min:0, yFmt:humanBps });
   });
 }
