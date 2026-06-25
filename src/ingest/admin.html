@@ -448,10 +448,51 @@ function fillVendorCell(el, mac){
 // drawLineChart(svgEl, series, opts)
 //   series: [{ points:[{ts, value}], color:'#hex' }, ...]   (null values are skipped)
 //   opts:   { yFmt:fn(v)->str, min, max }   (min/max auto from data when absent)
+//   opts.smooth: default true — light moving-average + curved path. Set false for raw lines.
 // Time on x (from earliest to latest ts across all series), value on y. Pure SVG;
-// no libraries. Renders axis min/max labels + a couple of gridlines + multiple polylines.
+// no libraries. Renders axis min/max labels + a couple of gridlines + smoothed curves.
 const SVGNS = 'http://www.w3.org/2000/svg';
 function svgEl(tag, attrs){ const e=document.createElementNS(SVGNS, tag); for(const k in attrs) e.setAttribute(k, attrs[k]); return e; }
+
+// Light centred moving-average over the values, preserving null gaps (so the line still
+// breaks where data is missing). Tames 1s-sample jitter without lagging the trend. The
+// window auto-scales with point density so sparse series aren't over-smoothed.
+function smoothValues(points){
+  const pts = points || [];
+  const n = pts.length;
+  if (n < 5) return pts;                       // too few to smooth meaningfully
+  const w = n > 240 ? 4 : n > 90 ? 3 : 2;      // ±w samples → (2w+1)-point average
+  const out = new Array(n);
+  for (let i=0;i<n;i++){
+    const p = pts[i];
+    if (!p || p.value==null || !isFinite(p.value)){ out[i]=p; continue; }
+    let sum=0, c=0;
+    for (let k=-w;k<=w;k++){
+      const q = pts[i+k];
+      if (q && q.value!=null && isFinite(q.value)){ sum+=q.value; c++; }
+    }
+    out[i] = { ts:p.ts, value: c ? sum/c : p.value };
+  }
+  return out;
+}
+
+// Build a smooth SVG path through [{x,y}] via Catmull-Rom → cubic Bézier (tension ~0.16).
+// Falls back to straight segments for <3 points. Rounds the corners so the line reads as a
+// curve, not a zig-zag.
+function smoothPathD(p){
+  const n = p.length;
+  if (n === 0) return '';
+  if (n < 3) return 'M' + p.map(q=>q.x+','+q.y).join(' L');
+  const t = 0.16;
+  let d = 'M'+p[0].x+','+p[0].y;
+  for (let i=0;i<n-1;i++){
+    const p0=p[i-1]||p[i], p1=p[i], p2=p[i+1], p3=p[i+2]||p2;
+    const c1x=p1.x+(p2.x-p0.x)*t, c1y=p1.y+(p2.y-p0.y)*t;
+    const c2x=p2.x-(p3.x-p1.x)*t, c2y=p2.y-(p3.y-p1.y)*t;
+    d += ' C'+c1x.toFixed(1)+','+c1y.toFixed(1)+' '+c2x.toFixed(1)+','+c2y.toFixed(1)+' '+p2.x.toFixed(1)+','+p2.y.toFixed(1);
+  }
+  return d;
+}
 function drawLineChart(el, series, opts){
   opts = opts || {};
   while (el.firstChild) el.removeChild(el.firstChild);
@@ -491,12 +532,17 @@ function drawLineChart(el, series, opts){
   const tl=svgEl('text',{x:padL,y:H-4}); tl.textContent=fmtClock(tMin); el.appendChild(tl);
   const tr=svgEl('text',{x:W-padR,y:H-4,'text-anchor':'end'}); tr.textContent=fmtClock(tMax); el.appendChild(tr);
 
-  // polylines per series (break the line at null gaps)
+  // smoothed curves per series (smooth the values, then draw a Catmull-Rom path; break the
+  // line into separate paths at null gaps so missing data still shows as a gap).
   for (const s of (series||[])){
+    const sp = opts.smooth === false ? (s.points||[]) : smoothValues(s.points||[]);
     let run = [];
-    const flush = () => { if (run.length>1) el.appendChild(svgEl('polyline', { fill:'none', stroke:s.color||'var(--acc)', 'stroke-width':1.6, points:run.join(' ') })); run=[]; };
-    for (const p of (s.points||[])){
-      if (p && p.value != null && isFinite(p.value)) run.push(x(new Date(p.ts).getTime())+','+y(p.value));
+    const flush = () => {
+      if (run.length>1) el.appendChild(svgEl('path', { fill:'none', stroke:s.color||'var(--acc)', 'stroke-width':1.7, 'stroke-linejoin':'round', 'stroke-linecap':'round', d:smoothPathD(run) }));
+      run=[];
+    };
+    for (const p of sp){
+      if (p && p.value != null && isFinite(p.value)) run.push({ x:x(new Date(p.ts).getTime()), y:y(p.value) });
       else flush();
     }
     flush();
