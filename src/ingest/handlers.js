@@ -886,9 +886,28 @@ async function speedtestList(ctx) {
   return json(res, 200, { ok: true, serial: device.serial, jobs: jobs || [] });
 }
 
+// POST /admin/migrate (admin) — apply the bundled, idempotent db/schema.sql. This exists so
+// schema changes can be applied over the tunnel (the ingest container can reach the DB; an
+// office machine can't). It runs ONLY the schema.sql baked into this image — never arbitrary
+// SQL — and every statement is CREATE … IF NOT EXISTS / CREATE OR REPLACE, so it's safe to
+// re-run. Admin-token gated like the other admin routes.
+async function adminMigrate(ctx) {
+  const { res, store, log } = ctx;
+  if (typeof store.migrate !== 'function') return json(res, 501, { ok: false, error: 'migrate not supported' });
+  try {
+    await store.migrate();
+    log.info('admin: schema migrate applied');
+    return json(res, 200, { ok: true, migrated: true });
+  } catch (e) {
+    log.error('admin: migrate failed', { msg: e && e.message });
+    return json(res, 500, { ok: false, error: 'migrate failed' });
+  }
+}
+
 module.exports = {
   healthz,
   adminUi,
+  adminMigrate,
   telemetry: telemetryIngest,
   agentScript,
   configPending,

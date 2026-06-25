@@ -220,6 +220,12 @@ function createServer({ store, config: cfg }) {
         return handlers.fleet(ctx);
       }
 
+      // POST /admin/migrate — apply the bundled idempotent schema.sql (admin only).
+      if (method === 'POST' && pathname === '/admin/migrate') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.adminMigrate(ctx);
+      }
+
       // GET /devices/:serial/history?window=1h (admin) — dashboard chart series.
       // Matched BEFORE /devices/:serial so the trailing /history segment is routed here
       // and not swallowed (the bare-serial regex anchors on a no-slash segment, but keep
