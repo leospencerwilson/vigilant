@@ -157,6 +157,24 @@
   .lte-cell{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px}
   .lte-cell .lab{font-size:10px;text-transform:uppercase;color:var(--mut);letter-spacing:.05em}
   .lte-cell .v{font-family:var(--mono);font-size:14px;margin-top:3px}
+  /* ── LTE signal bars ── */
+  .ltebars{display:flex;align-items:flex-end;gap:3px;height:28px}
+  .ltebars .bar{width:7px;border-radius:2px 2px 0 0;background:var(--line)}
+  .ltebars.good .bar.on{background:var(--ok)}
+  .ltebars.fair .bar.on{background:var(--warn)}
+  .ltebars.poor .bar.on{background:var(--bad)}
+  .ltebars .sig{font-family:var(--mono);font-size:12px;color:var(--mut);align-self:center;margin-left:8px}
+  /* ── availability strip ── */
+  .availbar{display:flex;gap:1px;height:22px;border-radius:6px;overflow:hidden;background:var(--panel2)}
+  .availbar .seg{flex:1 1 0;min-width:0}
+  .availbar .seg.up{background:var(--ok)}
+  .availbar .seg.down{background:rgba(239,68,68,.55)}
+  .availbar .seg.none{background:var(--line)}
+  /* ── topology map ── */
+  #d-topo{width:100%;height:320px;display:block}
+  #d-topo text{font-family:var(--mono);font-size:10px;fill:var(--fg)}
+  #d-topo .edge{stroke:#1f2a37;stroke-width:1.5}
+  #d-topo .elbl{fill:#8b9aa9;font-size:9px}
 </style>
 </head>
 <body>
@@ -225,6 +243,12 @@
 
     <div class="tiles" id="d-tiles"></div>
 
+    <div class="card" id="d-availcard" style="margin-bottom:18px">
+      <div class="between"><h2>Uptime &amp; availability <span class="hint" id="d-availwin"></span></h2><span class="hint" id="d-uptime2"></span></div>
+      <div class="availbar" id="d-avail"></div>
+      <div class="hint" id="d-availnote" style="margin-top:8px"></div>
+    </div>
+
     <div class="card" style="margin-bottom:18px">
       <div class="between"><h2>Port map</h2><span class="hint" id="d-portcount"></span></div>
       <div class="portpanel" id="d-portpanel"></div>
@@ -274,9 +298,14 @@
         </div>
       </div>
       <div class="card hidden" id="d-ltebox">
-        <h2>LTE / cellular</h2>
+        <div class="between"><h2>LTE / cellular</h2><div class="ltebars" id="d-ltebars"></div></div>
         <div class="ltegrid" id="d-lte"></div>
       </div>
+    </div>
+
+    <div class="card" id="d-topocard" style="margin-top:18px">
+      <div class="between"><h2>Topology <span class="hint">(LLDP / CDP neighbours)</span></h2><span class="hint" id="d-topocount"></span></div>
+      <svg id="d-topo"></svg>
     </div>
 
     <div class="card" style="margin-top:18px">
@@ -759,6 +788,7 @@ function renderDevice(d){
   $('#d-model').textContent = dev.model || '—';
   $('#d-ros').textContent = st.ros_version || dev.ros_version || '—';
   $('#d-uptime').textContent = humanUptime(st.uptime_s);
+  $('#d-uptime2').textContent = st.uptime_s != null ? ('uptime ' + humanUptime(st.uptime_s)) : '';
   $('#d-status').innerHTML = pill(st.status);
 
   // ── addresses: Public IP + each outbound L2TP management tunnel (name + local IP) ──
@@ -884,9 +914,65 @@ function renderDevice(d){
       ['Cell', l.cell_id], ['ICCID', l.iccid],
     ];
     $('#d-lte').innerHTML = cells.map(c=>'<div class="lte-cell"><div class="lab">'+c[0]+'</div><div class="v">'+dash(c[1])+'</div></div>').join('');
+    renderLteBars(l.rsrp != null ? +l.rsrp : null);
   } else {
     $('#d-ltebox').classList.add('hidden');
   }
+
+  // ── topology map (LLDP/CDP neighbours around this device) ──
+  renderTopology(dev, nbrs);
+}
+
+// Map RSRP (dBm) → 0..5 bars + quality tier. LTE rule of thumb: ≥-80 excellent, -90 good,
+// -100 fair, -110 poor, below that ≈ unusable. Fills #d-ltebars.
+function renderLteBars(rsrp){
+  const el = $('#d-ltebars'); if (!el) return;
+  let n = 0, tier = 'poor';
+  if (rsrp != null && isFinite(rsrp)){
+    if (rsrp >= -80){ n=5; tier='good'; }
+    else if (rsrp >= -90){ n=4; tier='good'; }
+    else if (rsrp >= -100){ n=3; tier='fair'; }
+    else if (rsrp >= -110){ n=2; tier='poor'; }
+    else if (rsrp > -120){ n=1; tier='poor'; }
+    else { n=0; tier='poor'; }
+  }
+  el.className = 'ltebars ' + tier;
+  let bars = '';
+  for (let i=1;i<=5;i++) bars += '<span class="bar'+(i<=n?' on':'')+'" style="height:'+(8+i*4)+'px"></span>';
+  const sig = (rsrp != null && isFinite(rsrp)) ? (rsrp + ' dBm') : 'no signal';
+  el.innerHTML = bars + '<span class="sig">'+esc(sig)+'</span>';
+}
+
+// Radial topology: this device in the centre, one node per LLDP/CDP neighbour around it,
+// edges labelled with the local interface. Pure SVG, redrawn each device refresh.
+function renderTopology(dev, nbrs){
+  const svg = $('#d-topo'); if (!svg) return;
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  const W = svg.clientWidth || 800, H = 320;
+  svg.setAttribute('viewBox', '0 0 '+W+' '+H);
+  $('#d-topocount').textContent = nbrs.length ? (nbrs.length + ' neighbour' + (nbrs.length>1?'s':'')) : '';
+  if (!nbrs.length){
+    const t = svgEl('text', { x:W/2, y:H/2, 'text-anchor':'middle', fill:'#8b9aa9' });
+    t.textContent = 'No LLDP/CDP neighbours seen.'; svg.appendChild(t); return;
+  }
+  const cx = W/2, cy = H/2, R = Math.min(W, H)/2 - 56, n = nbrs.length;
+  nbrs.forEach((nb,i)=>{
+    const ang = (i/n)*2*Math.PI - Math.PI/2;
+    const nx = cx + R*Math.cos(ang), ny = cy + R*Math.sin(ang);
+    svg.appendChild(svgEl('line', { class:'edge', x1:cx, y1:cy, x2:nx, y2:ny }));
+    const il = svgEl('text', { class:'elbl', x:(cx+nx)/2, y:(cy+ny)/2 - 2, 'text-anchor':'middle' });
+    il.textContent = nb.interface || ''; svg.appendChild(il);
+    svg.appendChild(svgEl('circle', { cx:nx, cy:ny, r:24, fill:'#0e141d', stroke:'#1f2a37', 'stroke-width':1.5 }));
+    const lbl = String(nb.identity || nb.address || nb.mac || '?');
+    const t = svgEl('text', { x:nx, y:ny+3, 'text-anchor':'middle' }); t.textContent = lbl.slice(0,13);
+    const title = svgEl('title', {}); title.textContent = (nb.identity||'') + (nb.mac?(' · '+nb.mac):'') + (nb.platform?(' · '+nb.platform):'');
+    t.appendChild(title); svg.appendChild(t);
+    if (nb.platform){ const p = svgEl('text', { class:'elbl', x:nx, y:ny+15, 'text-anchor':'middle' }); p.textContent = String(nb.platform).slice(0,16); svg.appendChild(p); }
+  });
+  // centre node last so it sits on top of the edge ends
+  svg.appendChild(svgEl('circle', { cx:cx, cy:cy, r:32, fill:'#13243a', stroke:'#3b82f6', 'stroke-width':2 }));
+  const c = svgEl('text', { x:cx, y:cy+4, 'text-anchor':'middle' });
+  c.textContent = String(dev.site_name || dev.identity || dev.serial || 'this').slice(0,15); svg.appendChild(c);
 }
 
 async function refreshHistory(){
@@ -900,9 +986,39 @@ async function refreshHistory(){
   renderHistory(h);
 }
 
+// Availability strip: bucket the window into N segments and colour each by whether ANY
+// telemetry sample landed in it (presence = reachable). It's a proxy — we don't store a
+// status history — so the note says so. Gaps (no sample) read as "down/unreachable".
+const WIN_SECONDS = { '1h':3600, '6h':6*3600, '24h':24*3600, '7d':7*24*3600 };
+function renderAvailability(metrics, windowKey){
+  const el = $('#d-avail'); if (!el) return;
+  $('#d-availwin').textContent = '(' + (windowKey||'1h') + ')';
+  const N = 60;
+  const winS = WIN_SECONDS[windowKey] || 3600;
+  const now = Date.now(), start = now - winS*1000, bw = (winS*1000)/N;
+  if (!metrics.length){
+    el.innerHTML = Array.from({length:N}, ()=>'<span class="seg none"></span>').join('');
+    $('#d-availnote').textContent = 'No telemetry history in this window yet.';
+    return;
+  }
+  const buckets = new Array(N).fill(false);
+  for (const m of metrics){
+    const t = new Date(m.ts).getTime();
+    if (t >= start){ const bi = Math.min(N-1, Math.max(0, Math.floor((t-start)/bw))); buckets[bi] = true; }
+  }
+  let up = 0; buckets.forEach(b=>{ if(b) up++; });
+  el.innerHTML = buckets.map((b,i)=>
+    '<span class="seg '+(b?'up':'down')+'" title="'+fmtClock(start+i*bw)+(b?' · telemetry received':' · no telemetry')+'"></span>'
+  ).join('');
+  const pct = Math.round(up/N*100);
+  $('#d-availnote').textContent = pct + '% of the window had telemetry (reachability proxy — Vigilant stores no separate status history). Red = no telemetry received in that slice.';
+}
+
 function renderHistory(h){
   const metrics = h.metrics || [];
   const ifaces = h.interfaces || [];
+
+  renderAvailability(metrics, h.window || curWindow);
 
   // CPU + memory device-level charts.
   drawLineChart($('#c-cpu'),
