@@ -367,9 +367,12 @@ BEGIN
       BEGIN
         EXECUTE format('ALTER PUBLICATION supabase_realtime ADD TABLE vigilant.%I', t);
       EXCEPTION
-        WHEN duplicate_object THEN NULL;                 -- already published
-        WHEN insufficient_privilege THEN
-          RAISE NOTICE 'vigilant: no privilege to add vigilant.% to supabase_realtime — add it via the Supabase dashboard', t;
+        -- Swallow ANY failure here (already a member, no privilege, or the publication is
+        -- defined FOR ALL TABLES — which raises a non-duplicate error). Realtime wiring is
+        -- best-effort and must NEVER abort the migration transaction (this aborted the whole
+        -- schema apply, so new tables like speedtest_jobs were never created).
+        WHEN OTHERS THEN
+          RAISE NOTICE 'vigilant: could not add vigilant.% to supabase_realtime (%) — skipping', t, SQLERRM;
       END;
     END LOOP;
   END IF;
