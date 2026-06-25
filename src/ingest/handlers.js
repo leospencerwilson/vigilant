@@ -760,6 +760,132 @@ async function configJobCancel(ctx) {
   return json(res, 200, { ok: true, job: updated });
 }
 
+// ── active speedtest (server-timed; HTTP to the Vigilant server) ─────
+// An operator requests a test (admin route); the DEVICE pulls it (GET /speedtest/pending),
+// downloads bytes_down from GET /speedtest/down and uploads bytes_up to POST /speedtest/up.
+// The SERVER times each transfer (wall-clock to stream the bytes ≈ throughput) and stores
+// down_bps/up_bps — so the agent needs no sub-second clock. ⚠️ An active test deliberately
+// saturates the WAN; it is operator-gated + audit-logged and capped server-side.
+const SPEEDTEST_MAX_BYTES = 64 * 1024 * 1024; // hard cap per leg (defence in depth)
+const SPEEDTEST_CHUNK = 64 * 1024;
+const SPEEDTEST_ZEROS = Buffer.alloc(SPEEDTEST_CHUNK);
+
+// GET /speedtest/pending (device) — hand the device its next pending test (and mark it running
+// so it isn't re-offered every tick). 200 with {job} when there is one, else 200 {ok:true}.
+async function speedtestPending(ctx) {
+  const { res, store, config, device } = ctx;
+  if (typeof store.getPendingSpeedtestJob !== 'function') return json(res, 200, { ok: true });
+  const job = await store.getPendingSpeedtestJob(device.id);
+  if (!job) return json(res, 200, { ok: true });
+  await store.markSpeedtestRunning(job.id);
+  const base = config.publicBaseUrl || '';
+  return json(res, 200, {
+    ok: true,
+    job: {
+      id: job.id,
+      bytes_down: job.bytes_down,
+      bytes_up: job.bytes_up,
+      down_url: `${base}/speedtest/down?job=${job.id}&bytes=${job.bytes_down}`,
+      up_url: `${base}/speedtest/up?job=${job.id}`,
+    },
+  });
+}
+
+// GET /speedtest/down?job=&bytes= (device) — stream N zero bytes with backpressure; time from
+// first write to flush and store down_bps. Honours backpressure so send time ≈ the device's
+// receive rate (true download throughput) for payloads larger than the socket buffer.
+async function speedtestDown(ctx) {
+  const { res, store, device, query } = ctx;
+  const jobId = query.get('job');
+  const job = jobId && typeof store.getSpeedtestJob === 'function' ? await store.getSpeedtestJob(jobId) : null;
+  if (!job || job.device_id !== device.id) return json(res, 404, { ok: false, error: 'not found' });
+  let n = parseInt(query.get('bytes') || String(job.bytes_down || 0), 10);
+  if (!Number.isFinite(n) || n < 0) n = 0;
+  n = Math.min(SPEEDTEST_MAX_BYTES, n);
+
+  res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(n), 'cache-control': 'no-store' });
+  let sent = 0;
+  const t0 = process.hrtime.bigint();
+  res.on('finish', () => {
+    const secs = Number(process.hrtime.bigint() - t0) / 1e9;
+    const bps = secs > 0 ? Math.round((n * 8) / secs) : null;
+    Promise.resolve(store.recordSpeedtestResult(jobId, { down_bps: bps })).catch(() => {});
+  });
+  const pump = () => {
+    while (sent < n) {
+      const len = Math.min(SPEEDTEST_CHUNK, n - sent);
+      const buf = len === SPEEDTEST_CHUNK ? SPEEDTEST_ZEROS : SPEEDTEST_ZEROS.subarray(0, len);
+      sent += len;
+      if (!res.write(buf)) { res.once('drain', pump); return; }
+    }
+    res.end();
+  };
+  pump();
+}
+
+// POST /speedtest/up?job= (device) — consume + discard the body, counting bytes and timing from
+// the first byte; store up_bps and mark the job done. Streamed (server.js does NOT pre-buffer
+// this route) so timing reflects the device's upload rate.
+async function speedtestUp(ctx) {
+  const { req, res, store, device, query } = ctx;
+  const jobId = query.get('job');
+  const job = jobId && typeof store.getSpeedtestJob === 'function' ? await store.getSpeedtestJob(jobId) : null;
+  if (!job || job.device_id !== device.id) return json(res, 404, { ok: false, error: 'not found' });
+  let bytes = 0;
+  let t0 = null;
+  req.on('data', (c) => { if (t0 === null) t0 = process.hrtime.bigint(); bytes += c.length; });
+  req.on('end', () => {
+    const secs = t0 !== null ? Number(process.hrtime.bigint() - t0) / 1e9 : 0;
+    const bps = secs > 0 ? Math.round((bytes * 8) / secs) : null;
+    Promise.resolve(store.recordSpeedtestResult(jobId, { up_bps: bps, status: 'done', result_log: 'down+up measured' })).catch(() => {});
+    json(res, 200, { ok: true, bytes });
+  });
+  req.on('error', () => { try { json(res, 400, { ok: false, error: 'upload error' }); } catch (e) { /* sent */ } });
+}
+
+// POST /speedtest/result (device) — optional finaliser the agent posts after its run, e.g. to
+// mark the job failed (download error) or done when no upload leg ran. Body {job_id,status,result_log}.
+async function speedtestResult(ctx) {
+  const { res, store, device, body } = ctx;
+  let p;
+  try { p = JSON.parse(body || ''); } catch (e) { return json(res, 400, { ok: false, error: 'bad json' }); }
+  const jobId = p && p.job_id;
+  if (!jobId) return json(res, 400, { ok: false, error: 'job_id required' });
+  const job = typeof store.getSpeedtestJob === 'function' ? await store.getSpeedtestJob(jobId) : null;
+  if (!job || job.device_id !== device.id) return json(res, 404, { ok: false, error: 'not found' });
+  const status = p.status === 'failed' ? 'failed' : 'done';
+  await store.recordSpeedtestResult(jobId, { status, result_log: p.result_log != null ? p.result_log : null });
+  return json(res, 200, { ok: true });
+}
+
+// POST /devices/:serial/speedtests (admin) — request a test. Caps byte counts server-side.
+async function speedtestCreate(ctx) {
+  const { res, store, log, params, body } = ctx;
+  const device = await store.getDeviceBySerial(params.serial);
+  if (!device) return json(res, 404, { ok: false, error: 'not found' });
+  let p = {};
+  try { p = body ? JSON.parse(body) : {}; } catch (e) { return json(res, 400, { ok: false, error: 'bad json' }); }
+  const by = p && typeof p.requested_by === 'string' ? p.requested_by.trim() : '';
+  if (!by) return json(res, 400, { ok: false, error: 'requested_by required' });
+  if (typeof store.createSpeedtestJob !== 'function') return json(res, 501, { ok: false, error: 'speedtest not supported by this store' });
+  const num = transform.parseNum;
+  let bd = num(p.bytes_down); bd = bd == null ? 26214400 : Math.max(1048576, Math.min(SPEEDTEST_MAX_BYTES, Math.round(bd)));
+  let bu = num(p.bytes_up); bu = bu == null ? 8388608 : Math.max(0, Math.min(SPEEDTEST_MAX_BYTES, Math.round(bu)));
+  const job = await store.createSpeedtestJob({ device_id: device.id, bytes_down: bd, bytes_up: bu, requested_by: by });
+  if (typeof store.appendAudit === 'function') await store.appendAudit(by, 'speedtest.request', device.serial, `job=${job.id} down=${bd} up=${bu}`);
+  log.info('speedtest: requested', { serial: device.serial, job: job.id });
+  return json(res, 201, { ok: true, job });
+}
+
+// GET /devices/:serial/speedtests (admin) — recent tests for this device.
+async function speedtestList(ctx) {
+  const { res, store, params } = ctx;
+  const device = await store.getDeviceBySerial(params.serial);
+  if (!device) return json(res, 404, { ok: false, error: 'not found' });
+  const jobs = typeof store.listSpeedtestJobs === 'function' ? await store.listSpeedtestJobs(device.id, 20) : [];
+  return json(res, 200, { ok: true, serial: device.serial, jobs: jobs || [] });
+}
+
 module.exports = {
   healthz,
   adminUi,
@@ -777,4 +903,10 @@ module.exports = {
   configJobCreate,
   configJobApprove,
   configJobCancel,
+  speedtestPending,
+  speedtestDown,
+  speedtestUp,
+  speedtestResult,
+  speedtestCreate,
+  speedtestList,
 };

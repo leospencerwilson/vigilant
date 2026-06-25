@@ -741,3 +741,57 @@
     } on-error={ :log warning "vigilant-agent: config result POST failed" }
 }
 # ── end config-job apply path (DRAFT / REVIEW-BEFORE-LIVE) ───────────────
+
+# ── ACTIVE SPEEDTEST (server-timed) ──────────────────────────────────────
+# Checked at most every 5th tick (so it is NOT a per-second poll). When the operator has
+# requested a test, the server hands us a descriptor via GET /speedtest/pending; we DOWNLOAD
+# bytes_down to a temp file (the server times its own send → download Mbps) and re-UPLOAD that
+# file to /speedtest/up (the server times its own receive → upload Mbps), then POST a result.
+# The SERVER does all the timing/maths, so we need no sub-second clock here. ⚠️ This deliberately
+# saturates the WAN for the test's duration — it only runs when an operator has requested one,
+# and the server caps the byte counts. Uses the $vigilantJsonStr helper defined above.
+:if (($vigilantTick % 5) = 0) do={
+    :do {
+        :local sp [/tool fetch url=("$vigilantUrl/speedtest/pending") http-method=get mode=https \
+            check-certificate=$vigilantCC http-header-field=("Authorization: Bearer " . $vigilantToken) \
+            output=user as-value]
+        :local sb ""; :do { :set sb ($sp->"data") } on-error={}
+        :local sjid [$vigilantJsonStr $sb "id"]
+        :if ([:len $sjid] > 0) do={
+            :local durl [$vigilantJsonStr $sb "down_url"]
+            :local uurl [$vigilantJsonStr $sb "up_url"]
+            :local dlok false
+            :local ulok false
+            :do { /file remove [find name="vigilant-speedtest.bin"] } on-error={}
+            # DOWNLOAD leg → temp file (server times the send).
+            :if ([:len $durl] > 0) do={
+                :do {
+                    /tool fetch url=$durl http-method=get mode=https check-certificate=$vigilantCC \
+                        http-header-field=("Authorization: Bearer " . $vigilantToken) \
+                        dst-path="vigilant-speedtest.bin"
+                    :set dlok true
+                } on-error={ :set dlok true }
+            }
+            # UPLOAD leg → POST the file back (server times the receive). HTTP file upload via
+            # /tool fetch is best-effort across ROS builds; on failure we still report 'done'
+            # because the download leg already gave us a measurement.
+            :if (($dlok) && ([:len $uurl] > 0)) do={
+                :do {
+                    /tool fetch url=$uurl http-method=post mode=https check-certificate=$vigilantCC \
+                        http-header-field=("Authorization: Bearer " . $vigilantToken) \
+                        src-path="vigilant-speedtest.bin" upload=yes output=none
+                    :set ulok true
+                } on-error={ :set ulok false }
+            }
+            :do { /file remove [find name="vigilant-speedtest.bin"] } on-error={}
+            :local sst "done"
+            :if (!$dlok) do={ :set sst "failed" }
+            :do {
+                /tool fetch url=("$vigilantUrl/speedtest/result") http-method=post mode=https \
+                    check-certificate=$vigilantCC http-header-field=("Authorization: Bearer " . $vigilantToken) \
+                    http-data=("{\"job_id\":\"" . $sjid . "\",\"status\":\"" . $sst . "\"}") output=none
+            } on-error={}
+            :log info ("vigilant-agent: speedtest " . $sjid . " " . $sst . " (dl=" . $dlok . " ul=" . $ulok . ")")
+        }
+    } on-error={ :log warning "vigilant-agent: speedtest check failed" }
+}

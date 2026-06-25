@@ -106,6 +106,9 @@
   .pill.applied{background:rgba(34,197,94,.15);color:#86efac}
   .pill.failed,.pill.rolled_back{background:rgba(239,68,68,.15);color:#fca5a5}
   .pill.cancelled{background:rgba(71,85,105,.25);color:#94a3b8}
+  .pill.pending{background:rgba(139,154,169,.15);color:#cbd5e1}
+  .pill.running{background:rgba(245,158,11,.15);color:#fcd34d}
+  .pill.done{background:rgba(34,197,94,.15);color:#86efac}
   .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:18px}
   .tile{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px}
   .tile .lab{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
@@ -254,6 +257,31 @@
       <div class="between"><h2>WAN throughput <span class="hint">(live · observed)</span></h2><span class="hint" id="d-wanname"></span></div>
       <div class="wanspeed" id="d-wanspeed"></div>
       <div class="hint" id="d-wanpeak" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card" id="d-speedcard" style="margin-bottom:18px">
+      <div class="between"><h2>Speedtest <span class="hint">(active · saturates the WAN)</span></h2><span class="hint" id="d-speedlatest"></span></div>
+      <div class="cfg-warn">⚠️ An active speedtest <b>saturates this site's WAN</b> for a few seconds and can disrupt live VoIP / HSCN traffic. Run only when it's safe to do so. The server caps the test size; the device runs it within ~5s of the request.</div>
+      <div class="row" style="align-items:flex-end">
+        <div>
+          <label>Size (download / upload)</label>
+          <select id="speed-size">
+            <option value="26214400,8388608">25 MiB ↓ / 8 MiB ↑ (default)</option>
+            <option value="10485760,5242880">10 MiB ↓ / 5 MiB ↑ (light)</option>
+            <option value="52428800,26214400">50 MiB ↓ / 25 MiB ↑ (heavy)</option>
+          </select>
+        </div>
+        <div><label>Your name</label><input id="speed-by" placeholder="e.g. leo" autocomplete="off" /></div>
+        <div><button class="primary" id="speed-run" style="margin-top:0">Run speedtest</button></div>
+      </div>
+      <div class="msg" id="speed-msg"></div>
+      <div class="scroll" style="max-height:260px;margin-top:12px">
+        <table class="fixed">
+          <colgroup><col style="width:20%"><col style="width:15%"><col style="width:22%"><col style="width:22%"><col style="width:21%"></colgroup>
+          <thead><tr><th>When</th><th>Status</th><th>Download</th><th>Upload</th><th>By</th></tr></thead>
+          <tbody id="speed-jobs"><tr><td colspan="5" class="empty">No tests yet.</td></tr></tbody>
+        </table>
+      </div>
     </div>
 
     <div class="card" id="d-availcard" style="margin-bottom:18px">
@@ -786,7 +814,58 @@ async function refreshDevice(){
   }catch(e){ return; }
   renderDevice(detail);
   refreshConfigJobs();
+  refreshSpeedtests();
 }
+
+// ════════════════════ active speedtest ════════════════════
+function speedMsg(t, cls){ const m=$('#speed-msg'); if(!m) return; m.textContent=t; m.className='msg '+(cls||''); }
+
+async function refreshSpeedtests(){
+  if (!curSerial || !tok()) return;
+  let data;
+  try{
+    const r = await fetch('/devices/'+encodeURIComponent(curSerial)+'/speedtests', { headers:authHeaders() });
+    if (!r.ok) return;
+    data = await r.json();
+  }catch(e){ return; }
+  const jobs = (data && data.jobs) || [];
+  const last = jobs.find(j => j.status==='done' && (j.down_bps!=null || j.up_bps!=null));
+  $('#d-speedlatest').textContent = last ? ('last  ↓ '+humanBps(last.down_bps)+'   ↑ '+humanBps(last.up_bps)) : '';
+  const tb = $('#speed-jobs');
+  if (!jobs.length){ tb.innerHTML = '<tr><td colspan="5" class="empty">No tests yet.</td></tr>'; return; }
+  tb.innerHTML = jobs.map(j =>
+    '<tr title="'+esc(j.id)+'">'
+    + '<td>'+(j.created_at?ago(j.created_at):'—')+'</td>'
+    + '<td>'+pill(j.status)+'</td>'
+    + '<td>'+(j.down_bps!=null?humanBps(j.down_bps):'—')+'</td>'
+    + '<td>'+(j.up_bps!=null?humanBps(j.up_bps):'—')+'</td>'
+    + '<td title="'+esc(j.requested_by||'')+'">'+dash(j.requested_by)+'</td>'
+    + '</tr>'
+  ).join('');
+}
+
+async function runSpeedtest(){
+  if (!curSerial) return;
+  if (!tok()){ speedMsg('Enter the admin token (top right).','err'); return; }
+  const by = ($('#speed-by').value||'').trim();
+  if (!by){ speedMsg('Enter your name.','err'); return; }
+  // Hard confirm: type the site name (WAN-saturation guard on live prod).
+  const name = ($('#d-name').textContent||'').trim();
+  const typed = prompt('⚠️ This SATURATES the WAN at "'+name+'" for a few seconds and may disrupt live VoIP / HSCN.\n\nType the site name to confirm:', '');
+  if (typed === null) return;
+  if (typed.trim().toLowerCase() !== name.toLowerCase()){ speedMsg('Site name did not match — cancelled.','err'); return; }
+  const sz = ($('#speed-size').value||'26214400,8388608').split(',');
+  const btn = $('#speed-run'); btn.disabled = true;
+  try{
+    const r = await fetch('/devices/'+encodeURIComponent(curSerial)+'/speedtests',
+      { method:'POST', headers:authHeaders(), body:JSON.stringify({ requested_by:by, bytes_down:+sz[0], bytes_up:+sz[1] }) });
+    const j = await r.json().catch(()=>({}));
+    if (r.ok) speedMsg('Test queued — the device runs it within ~5s; results appear below as the server measures them.','ok');
+    else speedMsg('Request failed: '+(j.error||('HTTP '+r.status)),'err');
+  }catch(e){ speedMsg('Request failed (network).','err'); }
+  finally{ btn.disabled=false; refreshSpeedtests(); }
+}
+$('#speed-run').onclick = runSpeedtest;
 
 function renderDevice(d){
   const dev = d.device || {};

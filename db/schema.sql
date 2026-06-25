@@ -292,6 +292,30 @@ CREATE TABLE IF NOT EXISTS config_snapshots (
 );
 CREATE INDEX IF NOT EXISTS config_snapshots_device_idx ON config_snapshots (device_id, ts DESC);
 
+-- ─────────────────────────── speedtest jobs ───────────────────────────
+-- Operator-triggered, device-pulled active bandwidth test. The DEVICE pulls a pending job
+-- (GET /speedtest/pending), downloads bytes_down from GET /speedtest/down and uploads
+-- bytes_up to POST /speedtest/up; the SERVER times each transfer (wall-clock to stream the
+-- bytes ≈ throughput) and writes down_bps/up_bps — so the agent needs no sub-second clock.
+-- ⚠️ An active test deliberately saturates the WAN; it is operator-gated + audit-logged.
+CREATE TABLE IF NOT EXISTS speedtest_jobs (
+    id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    device_id     uuid        NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    status        text        NOT NULL DEFAULT 'pending'
+                              CHECK (status IN ('pending','running','done','failed','cancelled')),
+    bytes_down    bigint      NOT NULL DEFAULT 26214400,   -- 25 MiB
+    bytes_up      bigint      NOT NULL DEFAULT 8388608,     -- 8 MiB
+    down_bps      bigint,                                   -- server-measured
+    up_bps        bigint,                                   -- server-measured
+    requested_by  text        NOT NULL,
+    result_log    text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    started_at    timestamptz,
+    finished_at   timestamptz
+);
+CREATE INDEX IF NOT EXISTS speedtest_jobs_pickup_idx ON speedtest_jobs (device_id, status)
+    WHERE status = 'pending';
+
 -- ─────────────────────────── enrolment / secrets ───────────────────────────
 -- Per-device bearer for ingest auth — replaces the single shared X-API-Key.
 CREATE TABLE IF NOT EXISTS enrollment_tokens (

@@ -25,6 +25,12 @@
 //   POST /devices/:serial/config-jobs   admin  author a DRAFT config-push job
 //   POST /config-jobs/:id/approve       admin  two-person approve a draft
 //   POST /config-jobs/:id/cancel        admin  cancel a draft / not-yet-picked-up job
+//   GET  /speedtest/pending             device next pending active speedtest (marks running)
+//   GET  /speedtest/down?job=&bytes=    device server-timed download payload
+//   POST /speedtest/up?job=             device server-timed upload sink
+//   POST /speedtest/result              device agent's done/failed finaliser
+//   GET  /devices/:serial/speedtests    admin  list recent speedtests
+//   POST /devices/:serial/speedtests    admin  request an active speedtest
 
 const http = require('node:http');
 const crypto = require('node:crypto');
@@ -168,6 +174,38 @@ function createServer({ store, config: cfg }) {
         return handlers.configResult(ctx);
       }
 
+      // ── speedtest (device) — server-timed active bandwidth test ──
+      // GET /speedtest/pending — next pending test for this device.
+      if (method === 'GET' && pathname === '/speedtest/pending') {
+        const device = await authDevice(req, store);
+        if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.device = device;
+        return handlers.speedtestPending(ctx);
+      }
+      // GET /speedtest/down — streamed download payload (handler writes the body).
+      if (method === 'GET' && pathname === '/speedtest/down') {
+        const device = await authDevice(req, store);
+        if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.device = device;
+        return handlers.speedtestDown(ctx);
+      }
+      // POST /speedtest/up — streamed upload; do NOT pre-buffer the body, the handler
+      // consumes the stream itself so it can TIME the transfer.
+      if (method === 'POST' && pathname === '/speedtest/up') {
+        const device = await authDevice(req, store);
+        if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.device = device;
+        return handlers.speedtestUp(ctx);
+      }
+      // POST /speedtest/result — optional finaliser from the agent.
+      if (method === 'POST' && pathname === '/speedtest/result') {
+        const device = await authDevice(req, store);
+        if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.device = device;
+        ctx.body = await readBody(req);
+        return handlers.speedtestResult(ctx);
+      }
+
       // ── admin routes ─────────────────────────────────────────────
       // POST /enroll
       if (method === 'POST' && pathname === '/enroll') {
@@ -220,6 +258,15 @@ function createServer({ store, config: cfg }) {
         ctx.params = { id: decodeURIComponent(mCfgCancel[1]) };
         ctx.body = await readBody(req);
         return handlers.configJobCancel(ctx);
+      }
+
+      // GET|POST /devices/:serial/speedtests (admin) — list / request an active speedtest.
+      const mSt = /^\/devices\/([^/]+)\/speedtests$/.exec(pathname);
+      if (mSt && (method === 'GET' || method === 'POST')) {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { serial: decodeURIComponent(mSt[1]) };
+        if (method === 'POST') ctx.body = await readBody(req);
+        return method === 'GET' ? handlers.speedtestList(ctx) : handlers.speedtestCreate(ctx);
       }
 
       // GET /devices/:serial

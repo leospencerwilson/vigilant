@@ -90,6 +90,9 @@ function makeMemStore(_config) {
   /** append-only audit trail (actor + action + serial + details) */
   const auditLog = []; // {id, ts, actor, action, serial, details}
 
+  /** jobId -> speedtest_jobs row */
+  const speedtestJobs = new Map();
+
   // ── helpers ─────────────────────────────────────────────────────────────
   function deviceTags(deviceId) {
     const d = devices.get(deviceId);
@@ -447,6 +450,72 @@ function makeMemStore(_config) {
     return j ? { ...j } : null;
   }
 
+  // ── speedtest jobs ───────────────────────────────────────────────────────────
+  async function createSpeedtestJob(fields = {}) {
+    const f = fields || {};
+    const id = f.id || randomUUID();
+    const row = {
+      id,
+      device_id: f.device_id != null ? f.device_id : null,
+      status: 'pending',
+      bytes_down: f.bytes_down != null ? f.bytes_down : 26214400,
+      bytes_up: f.bytes_up != null ? f.bytes_up : 8388608,
+      down_bps: null,
+      up_bps: null,
+      requested_by: f.requested_by || 'unknown',
+      result_log: null,
+      created_at: iso(f.created_at),
+      started_at: null,
+      finished_at: null,
+    };
+    speedtestJobs.set(id, row);
+    return { ...row };
+  }
+
+  // Most-recent pending job for this device (the one the agent should run next), or null.
+  async function getPendingSpeedtestJob(deviceId) {
+    let best = null;
+    for (const j of speedtestJobs.values()) {
+      if (j.device_id !== deviceId || j.status !== 'pending') continue;
+      const at = new Date(j.created_at).getTime();
+      if (!best || at >= best.at) best = { job: j, at };
+    }
+    return best ? { ...best.job } : null;
+  }
+
+  async function markSpeedtestRunning(jobId) {
+    const j = speedtestJobs.get(jobId);
+    if (!j) return null;
+    if (j.status === 'pending') { j.status = 'running'; j.started_at = iso(); }
+    return { ...j };
+  }
+
+  // Record a measured leg (down or up). The handler computes bps from its own transfer timing
+  // and calls this per leg; finishing (status done/failed) is set explicitly via fields.status.
+  async function recordSpeedtestResult(jobId, fields = {}) {
+    const j = speedtestJobs.get(jobId);
+    if (!j) return null;
+    const f = fields || {};
+    if (f.down_bps != null) j.down_bps = f.down_bps;
+    if (f.up_bps != null) j.up_bps = f.up_bps;
+    if (f.result_log != null) j.result_log = f.result_log;
+    if (f.status != null) j.status = f.status;
+    if (f.status === 'done' || f.status === 'failed') j.finished_at = iso();
+    return { ...j };
+  }
+
+  async function getSpeedtestJob(jobId) {
+    const j = speedtestJobs.get(jobId);
+    return j ? { ...j } : null;
+  }
+
+  async function listSpeedtestJobs(deviceId, limit = 20) {
+    const out = [];
+    for (const j of speedtestJobs.values()) if (j.device_id === deviceId) out.push({ ...j });
+    out.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    return out.slice(0, Math.max(0, limit));
+  }
+
   // ── audit ────────────────────────────────────────────────────────────────────
   async function appendAudit(actor, action, serial, details) {
     auditLog.push({
@@ -770,6 +839,7 @@ function makeMemStore(_config) {
       alertRules,
       alerts,
       auditLog,
+      speedtestJobs,
     },
   };
 
@@ -800,6 +870,12 @@ function makeMemStore(_config) {
     cancelConfigJob,
     listConfigJobs,
     getConfigJob,
+    createSpeedtestJob,
+    getPendingSpeedtestJob,
+    markSpeedtestRunning,
+    recordSpeedtestResult,
+    getSpeedtestJob,
+    listSpeedtestJobs,
     appendAudit,
     getCurrentAgentScript,
     getFleet,

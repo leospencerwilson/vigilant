@@ -698,6 +698,73 @@ function makePgStore(poolOrConfig) {
     return one(`SELECT * FROM config_jobs WHERE id = $1`, [jobId]);
   }
 
+  // ── speedtest jobs ───────────────────────────────────────────────────────────
+  async function createSpeedtestJob(fields = {}) {
+    const f = fields || {};
+    return one(
+      `INSERT INTO speedtest_jobs (device_id, status, bytes_down, bytes_up, requested_by)
+       VALUES ($1,'pending',$2,$3,$4)
+       RETURNING *`,
+      [
+        f.device_id || null,
+        f.bytes_down != null ? f.bytes_down : 26214400,
+        f.bytes_up != null ? f.bytes_up : 8388608,
+        f.requested_by || 'unknown',
+      ]
+    );
+  }
+
+  async function getPendingSpeedtestJob(deviceId) {
+    return one(
+      `SELECT * FROM speedtest_jobs
+        WHERE device_id = $1 AND status = 'pending'
+        ORDER BY created_at DESC LIMIT 1`,
+      [deviceId]
+    );
+  }
+
+  async function markSpeedtestRunning(jobId) {
+    return one(
+      `UPDATE speedtest_jobs
+          SET status = 'running', started_at = now()
+        WHERE id = $1 AND status = 'pending'
+        RETURNING *`,
+      [jobId]
+    );
+  }
+
+  async function recordSpeedtestResult(jobId, fields = {}) {
+    const f = fields || {};
+    return one(
+      `UPDATE speedtest_jobs
+          SET down_bps    = COALESCE($2, down_bps),
+              up_bps      = COALESCE($3, up_bps),
+              result_log  = COALESCE($4, result_log),
+              status      = COALESCE($5, status),
+              finished_at = CASE WHEN $5 IN ('done','failed') THEN now() ELSE finished_at END
+        WHERE id = $1
+        RETURNING *`,
+      [
+        jobId,
+        f.down_bps != null ? f.down_bps : null,
+        f.up_bps != null ? f.up_bps : null,
+        f.result_log != null ? f.result_log : null,
+        f.status != null ? f.status : null,
+      ]
+    );
+  }
+
+  async function getSpeedtestJob(jobId) {
+    return one(`SELECT * FROM speedtest_jobs WHERE id = $1`, [jobId]);
+  }
+
+  async function listSpeedtestJobs(deviceId, limit = 20) {
+    return rows(
+      `SELECT * FROM speedtest_jobs WHERE device_id = $1 ORDER BY created_at DESC LIMIT $2`,
+      [deviceId, limit]
+    );
+  }
+
   // ── audit ────────────────────────────────────────────────────────────────────
   async function appendAudit(actor, action, serial, details) {
     await q(
@@ -1078,6 +1145,12 @@ function makePgStore(poolOrConfig) {
     cancelConfigJob,
     listConfigJobs,
     getConfigJob,
+    createSpeedtestJob,
+    getPendingSpeedtestJob,
+    markSpeedtestRunning,
+    recordSpeedtestResult,
+    getSpeedtestJob,
+    listSpeedtestJobs,
     appendAudit,
     getCurrentAgentScript,
     getFleet,
