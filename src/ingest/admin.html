@@ -53,6 +53,10 @@
   table{width:100%;border-collapse:collapse;font-size:13px}
   th{text-align:left;color:var(--mut);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.05em;padding:8px 8px;border-bottom:1px solid var(--line)}
   td{padding:9px 8px;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:12px}
+  /* Fixed layout: column widths come from the <colgroup>, NOT cell content — so columns don't
+     jump when a poll rewrites cells (changing bps digit-counts, async manufacturer fill-in). */
+  table.fixed{table-layout:fixed}
+  table.fixed th,table.fixed td{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;font-family:var(--sans)}
   .pill.online{background:rgba(34,197,94,.15);color:#86efac}
   .pill.stale{background:rgba(245,158,11,.15);color:#fcd34d}
@@ -112,6 +116,19 @@
   .rtag.unused{background:rgba(100,116,139,.18);color:#cbd5e1}
   .rtag.disabled{background:rgba(71,85,105,.25);color:#94a3b8}
   .up{background:var(--ok);box-shadow:0 0 6px var(--ok)} .down{background:#374151}
+  /* ── physical-port faceplate (green = link up / plugged, red = enabled but no link, grey = disabled) ── */
+  .portpanel{display:flex;flex-wrap:wrap;gap:9px;margin-bottom:6px}
+  .portbox{position:relative;width:48px;height:44px;border-radius:7px;border:1px solid var(--line);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:14px;font-weight:700;background:#374151;color:#cbd5e1;overflow:hidden;cursor:default}
+  .portbox .pnum{position:relative;z-index:1;line-height:1}
+  .portbox.up{background:var(--ok);color:#06210f;box-shadow:0 0 9px rgba(34,197,94,.45);border-color:var(--ok)}
+  .portbox.down{background:rgba(239,68,68,.16);border-color:var(--bad);color:#fca5a5}
+  .portbox.disabled{background:rgba(71,85,105,.22);border-style:dashed;color:#94a3b8}
+  .portbox .prole{position:absolute;left:0;right:0;bottom:0;height:4px;background:transparent}
+  .portbox .prole.wan{background:var(--wan)} .portbox .prole.lan{background:var(--lan)} .portbox .prole.vpn{background:var(--vpn)}
+  .portbox .prole.bridge-member{background:var(--bridge)} .portbox .prole.unused{background:var(--unused)} .portbox .prole.disabled{background:var(--disabled)}
+  .portlegend{display:flex;flex-wrap:wrap;gap:14px;margin:8px 0 14px;font-size:11px;color:var(--mut);font-family:var(--sans)}
+  .portlegend span{display:inline-flex;align-items:center;gap:5px}
+  .portlegend i{width:11px;height:11px;border-radius:3px;display:inline-block}
   .scroll{max-height:420px;overflow:auto}
   .nbr-list{display:grid;grid-template-columns:1fr;gap:8px}
   .nbr{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px 11px;font-size:12px}
@@ -190,8 +207,19 @@
 
     <div class="card" style="margin-bottom:18px">
       <div class="between"><h2>Port map</h2><span class="hint" id="d-portcount"></span></div>
+      <div class="portpanel" id="d-portpanel"></div>
+      <div class="portlegend" id="d-portlegend">
+        <span><i style="background:var(--ok)"></i> link up</span>
+        <span><i style="background:rgba(239,68,68,.6)"></i> no link</span>
+        <span><i style="background:rgba(71,85,105,.5)"></i> disabled</span>
+        <span><i style="background:var(--wan)"></i> WAN</span>
+        <span><i style="background:var(--lan)"></i> LAN</span>
+        <span><i style="background:var(--vpn)"></i> VPN</span>
+        <span><i style="background:var(--bridge)"></i> bridge</span>
+      </div>
       <div class="scroll">
-        <table>
+        <table class="fixed">
+          <colgroup><col style="width:24%"><col style="width:15%"><col style="width:9%"><col style="width:16%"><col style="width:18%"><col style="width:18%"></colgroup>
           <thead><tr><th>Port</th><th>Role</th><th>Link</th><th>Speed</th><th>RX</th><th>TX</th></tr></thead>
           <tbody id="d-ports"><tr><td colspan="6" class="empty">No interfaces.</td></tr></tbody>
         </table>
@@ -218,7 +246,8 @@
       <div class="card">
         <h2>Neighbours <span class="hint">(LLDP / CDP)</span></h2>
         <div class="scroll">
-          <table>
+          <table class="fixed">
+            <colgroup><col style="width:22%"><col style="width:16%"><col style="width:22%"><col style="width:26%"><col style="width:14%"></colgroup>
             <thead><tr><th>Neighbour</th><th>Interface</th><th>MAC</th><th>Manufacturer</th><th>Type</th></tr></thead>
             <tbody id="d-nbrs"><tr><td colspan="5" class="empty">No neighbours seen.</td></tr></tbody>
           </table>
@@ -233,7 +262,8 @@
     <div class="card" style="margin-top:18px">
       <div class="between"><h2>Hosts <span class="hint">(learned MACs)</span></h2><span class="hint" id="d-hostcount"></span></div>
       <div class="scroll">
-        <table>
+        <table class="fixed">
+          <colgroup><col style="width:26%"><col style="width:18%"><col style="width:24%"><col style="width:32%"></colgroup>
           <thead><tr><th>MAC</th><th>Interface</th><th>IP</th><th>Manufacturer</th></tr></thead>
           <tbody id="d-hosts"><tr><td colspan="4" class="empty">No hosts learned.</td></tr></tbody>
         </table>
@@ -357,6 +387,7 @@ function fillVendorCell(el, mac){
   lookupVendor(mac).then(vendor => {
     if (el.dataset.ouiMac !== mac) return;   // row changed while we were awaiting — leave it
     el.textContent = vendor || '—';
+    el.title = vendor || '';                 // full name on hover (cell is ellipsis-clipped)
   });
 }
 
@@ -519,6 +550,20 @@ $$('.win').forEach(b => b.onclick = () => {
 // role precedence for the port-map sort: WAN first.
 const ROLE_ORDER = { wan:0, vpn:1, 'bridge-member':2, lan:3, unused:4, disabled:5 };
 
+// A physical port = an ethernet/SFP/combo interface (not a bridge, vlan, tunnel, etc.).
+const PHYS_RE = /^(ether|sfp|sfpplus|combo|qsfp)/i;
+function isPhysical(name){ return PHYS_RE.test(String(name||'')); }
+// Numeric suffix for left-to-right faceplate ordering (ether1 < ether2 < sfp1 ...).
+function portNum(name){ const m=/(\d+)\s*$/.exec(String(name||'')); return m ? +m[1] : 999; }
+// Short faceplate label: trailing number, prefixed by a letter for non-ether media (S/C/Q).
+function portShort(name){
+  const m=/^([a-z]+).*?(\d+)\s*$/i.exec(String(name||''));
+  if (!m) return String(name||'?').slice(0,4);
+  const p=m[1].toLowerCase();
+  const pre = p.startsWith('sfp')?'S' : p.startsWith('combo')?'C' : p.startsWith('qsfp')?'Q' : '';
+  return pre + m[2];
+}
+
 async function refreshDevice(){
   if (!curSerial) return;
   if (!tok()){ $('#d-tiles').innerHTML='<div class="empty">Enter the admin token (top right).</div>'; return; }
@@ -565,6 +610,21 @@ function renderDevice(d){
     '<div class="tile'+(t.flag?' flag':'')+'"><div class="lab">'+t.lab+'</div><div class="val">'+esc(t.val)+'</div>'
     + (t.sub?'<div class="sub">'+t.sub+'</div>':'')+'</div>').join('');
 
+  // ── physical-port faceplate: a switch-style row of boxes, green=link up, red=no link ──
+  const phys = ifaces.filter(i => isPhysical(i.name))
+    .sort((a,b)=> portNum(a.name)-portNum(b.name) || String(a.name||'').localeCompare(String(b.name||'')));
+  $('#d-portpanel').innerHTML = phys.length ? phys.map(i=>{
+    const role = i.role || 'lan';
+    const disabled = i.disabled===true;
+    const up = !disabled && (i.plugged===true || i.running===true);
+    const cls = disabled ? 'disabled' : (up ? 'up' : 'down');
+    const state = disabled ? 'disabled' : (up ? 'link up' : 'no link');
+    const title = esc(i.name) + ' · ' + role + (i.speed?(' · '+esc(i.speed)):'') + ' · ' + state;
+    return '<div class="portbox '+cls+'" title="'+title+'"><span class="pnum">'+esc(portShort(i.name))
+      + '</span><span class="prole '+role+'"></span></div>';
+  }).join('') : '<div class="hint">No physical ports reported.</div>';
+  $('#d-portlegend').style.display = phys.length ? '' : 'none';
+
   // ── port map (WAN first, then role order, then name) ──
   $('#d-portcount').textContent = ifaces.length + ' interfaces';
   const sorted = ifaces.slice().sort((a,b)=>{
@@ -578,7 +638,7 @@ function renderDevice(d){
     const up = (i.plugged===true || i.running===true);
     const linkTitle = i.disabled===true ? 'disabled' : (up?'link up':'link down');
     return '<tr>'
-      + '<td>'+esc(i.name)+(i.bridge?' <span class="hint">@'+esc(i.bridge)+'</span>':'')+'</td>'
+      + '<td title="'+esc(i.name)+(i.bridge?(' @'+esc(i.bridge)):'')+'">'+esc(i.name)+(i.bridge?' <span class="hint">@'+esc(i.bridge)+'</span>':'')+'</td>'
       + '<td><span class="rtag '+role+'">'+role+'</span></td>'
       + '<td><span class="linkdot '+(i.disabled===true?'down':(up?'up':'down'))+'" title="'+linkTitle+'"></span></td>'
       + '<td>'+dash(i.speed)+'</td>'
@@ -591,11 +651,11 @@ function renderDevice(d){
   // Each row carries a data-oui-mac vendor cell filled lazily after render (deduped/cached).
   $('#d-nbrs').innerHTML = nbrs.length ? nbrs.map((n,idx)=>
     '<tr>'
-    + '<td>'+dash(n.identity||n.address||n.mac)+'</td>'
-    + '<td>'+dash(n.interface)+'</td>'
-    + '<td>'+dash(n.mac)+'</td>'
+    + '<td title="'+esc(n.identity||n.address||n.mac||'')+'">'+dash(n.identity||n.address||n.mac)+'</td>'
+    + '<td title="'+esc(n.interface||'')+'">'+dash(n.interface)+'</td>'
+    + '<td title="'+esc(n.mac||'')+'">'+dash(n.mac)+'</td>'
     + '<td class="nbr-vendor" data-idx="'+idx+'">—</td>'
-    + '<td>'+dash(n.platform)+'</td>'
+    + '<td title="'+esc(n.platform||'')+'">'+dash(n.platform)+'</td>'
     + '</tr>'
   ).join('') : '<tr><td colspan="5" class="empty">No neighbours seen.</td></tr>';
   // Lazily resolve the manufacturer for the rows currently shown (deduped by OUI in lookupVendor).
@@ -610,9 +670,9 @@ function renderDevice(d){
   $('#d-hostcount').textContent = hosts.length ? (hosts.length + ' hosts') : '';
   $('#d-hosts').innerHTML = hosts.length ? hosts.map((h,idx)=>
     '<tr>'
-    + '<td>'+dash(h.mac)+'</td>'
-    + '<td>'+dash(h.interface)+'</td>'
-    + '<td>'+dash(h.ip)+'</td>'
+    + '<td title="'+esc(h.mac||'')+'">'+dash(h.mac)+'</td>'
+    + '<td title="'+esc(h.interface||'')+'">'+dash(h.interface)+'</td>'
+    + '<td title="'+esc(h.ip||'')+'">'+dash(h.ip)+'</td>'
     + '<td class="host-vendor" data-idx="'+idx+'">—</td>'
     + '</tr>'
   ).join('') : '<tr><td colspan="4" class="empty">No hosts learned.</td></tr>';
