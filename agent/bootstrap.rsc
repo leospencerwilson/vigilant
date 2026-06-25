@@ -12,7 +12,7 @@
 #   2. vigilant-bootstrap — fetches the CURRENT agent script from Vigilant once a day, so
 #                           the whole estate self-updates from one place.
 #   3. vigilant-agent     — the collector script itself (fetched by the bootstrap).
-#   4. vigilant-agent scheduler — runs the collector every 10s (the telemetry tick).
+#   4. vigilant-agent scheduler — runs the collector every 1s (the telemetry tick).
 #
 # TLS: vigilantTlsCheck controls /tool fetch check-certificate. NOTE: real estate boxes
 # (e.g. a 7.18 unit) returned "SSL: no trusted CA certificate found" on a validating fetch —
@@ -82,9 +82,14 @@
 /system script run vigilant-bootstrap
 :delay 3s
 
-# ── 4) Telemetry tick: run the collector every 10s ───────────────────
+# ── 4) Telemetry tick: run the collector every 1s ────────────────────
+# NOTE: 1s is aggressive — each tick fires several chunked /tool fetch POSTs, so a busy
+# multi-interface router can spend real CPU here and, if a tick takes >1s to gather + post,
+# RouterOS simply skips the overlapping run (you get jitter, not a crash). Raise this (e.g.
+# 5s/10s) if the box is loaded. The daily self-updater only swaps the agent SCRIPT, never this
+# scheduler, so this interval persists across updates.
 /system scheduler remove [find name="vigilant-agent"]
-/system scheduler add name=vigilant-agent interval=10s \
+/system scheduler add name=vigilant-agent interval=1s \
     on-event="/system script run vigilant-agent" \
     comment="Vigilant: telemetry tick"
 

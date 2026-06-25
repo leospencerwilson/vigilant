@@ -1,7 +1,7 @@
 # Vigilant agent — DRAFT. REVIEW BEFORE APPLYING TO ANY LIVE ROUTER.
 # RouterOS 7.x. This is the rewritten replacement for the current 6-minute push script.
 #
-# What it does each tick (default every 10s, driven by the scheduler):
+# What it does each tick (every 1s, driven by the vigilant-agent scheduler):
 #   1. Collect a rich snapshot: system/health, per-interface CUMULATIVE counters
 #      (the server computes bps from deltas — we do NOT compute rates here),
 #      WAN/PPP/Wi-Fi/DHCP state.
