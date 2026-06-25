@@ -899,8 +899,16 @@ async function adminMigrate(ctx) {
     log.info('admin: schema migrate applied');
     return json(res, 200, { ok: true, migrated: true });
   } catch (e) {
+    // Surface the DB error detail (admin-gated route) so a schema problem can be diagnosed
+    // over the API without shell access to the server logs.
     log.error('admin: migrate failed', { msg: e && e.message });
-    return json(res, 500, { ok: false, error: 'migrate failed' });
+    return json(res, 500, {
+      ok: false,
+      error: 'migrate failed',
+      detail: e && e.message ? e.message : String(e),
+      code: e && e.code ? e.code : null,
+      position: e && e.position ? e.position : null,
+    });
   }
 }
 
