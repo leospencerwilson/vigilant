@@ -589,8 +589,8 @@ function openDevice(serial){
   refreshHistory();
   if (liveTimer) clearInterval(liveTimer);
   if (histTimer) clearInterval(histTimer);
-  liveTimer = setInterval(refreshDevice, 5000);   // live values every 5s
-  histTimer = setInterval(refreshHistory, 30000); // charts every 30s
+  liveTimer = setInterval(refreshDevice, 2000);   // live values every 2s (agent posts ~1s)
+  histTimer = setInterval(refreshHistory, 5000);  // charts every 5s
 }
 
 $$('.win').forEach(b => b.onclick = () => {
@@ -940,7 +940,7 @@ $('#cfg-rsc').addEventListener('input', updateCfgSha);
 fetch('/healthz').then(r=>{ $('#health').style.background = r.ok ? 'var(--ok)' : 'var(--bad)'; }).catch(()=>{ $('#health').style.background='var(--bad)'; });
 if (tok()) loadFleet();
 // Refresh the fleet list periodically only while it's the visible view.
-setInterval(()=>{ if (!curSerial) loadFleet(); }, 10000);
+setInterval(()=>{ if (!curSerial) loadFleet(); }, 5000);
 // Re-flow charts on resize (debounced) so the SVG viewBox tracks the container width.
 let rzT=null;
 window.addEventListener('resize', ()=>{ if(rzT)clearTimeout(rzT); rzT=setTimeout(()=>{ if(curSerial) refreshHistory(); }, 250); });
