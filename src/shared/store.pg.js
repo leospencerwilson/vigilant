@@ -624,6 +624,88 @@ function makePgStore(poolOrConfig) {
     });
   }
 
+  // ── config jobs: ADMIN-facing authoring/approval (operator side) ─────────────
+  // Operator counterparts to the device-side getPendingConfigJob/…Fetch above. They never
+  // serve a router; the "only approved + targeted + checksum-verified" serving gate stays in
+  // getPendingConfigJob / getConfigJobForFetch, so authoring/approving here cannot bypass it.
+
+  // Create a DRAFT job (never served until approved). Computes rsc_sha256 from rsc_text when
+  // not supplied. confirm_window_s/kind default at the DB level if omitted.
+  async function createConfigJob(fields = {}) {
+    const f = fields || {};
+    const rsc = f.rsc_text != null ? String(f.rsc_text) : '';
+    const sha =
+      f.rsc_sha256 != null && f.rsc_sha256 !== '' ? f.rsc_sha256 : transform.sha256Hex(rsc);
+    return one(
+      `INSERT INTO config_jobs
+         (device_id, target_tag, is_canary, kind, rsc_text, rsc_sha256, status,
+          confirm_window_s, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,'draft',$7,$8)
+       RETURNING *`,
+      [
+        f.device_id || null,
+        f.target_tag || null,
+        f.is_canary === true,
+        f.kind || 'snippet',
+        rsc,
+        sha,
+        f.confirm_window_s != null ? f.confirm_window_s : 300,
+        f.created_by || 'unknown',
+      ]
+    );
+  }
+
+  // Approve a DRAFT -> 'approved'. The WHERE status='draft' guard makes this a no-op (returns
+  // null) if the job was already advanced/cancelled, so a double-approve can't reopen it.
+  async function approveConfigJob(jobId, approvedBy) {
+    return one(
+      `UPDATE config_jobs
+          SET status = 'approved', approved_by = $2, approved_at = now()
+        WHERE id = $1 AND status = 'draft'
+        RETURNING *`,
+      [jobId, approvedBy != null ? approvedBy : null]
+    );
+  }
+
+  // Cancel a not-yet-picked-up job (draft or approved) -> 'cancelled'. Returns null if the
+  // job has already moved past approval (fetched/applying/applied/…), which cannot be cancelled.
+  async function cancelConfigJob(jobId) {
+    return one(
+      `UPDATE config_jobs
+          SET status = 'cancelled'
+        WHERE id = $1 AND status IN ('draft','approved')
+        RETURNING *`,
+      [jobId]
+    );
+  }
+
+  // All jobs targeting this device (directly or via a tag), newest first, capped.
+  async function listConfigJobs(deviceId, limit = 50) {
+    return rows(
+      `SELECT *
+         FROM config_jobs
+        WHERE device_id = $1
+           OR (device_id IS NULL
+               AND target_tag IS NOT NULL
+               AND target_tag = ANY (SELECT unnest(tags) FROM devices WHERE id = $1))
+        ORDER BY created_at DESC
+        LIMIT $2`,
+      [deviceId, limit]
+    );
+  }
+
+  async function getConfigJob(jobId) {
+    return one(`SELECT * FROM config_jobs WHERE id = $1`, [jobId]);
+  }
+
+  // ── audit ────────────────────────────────────────────────────────────────────
+  async function appendAudit(actor, action, serial, details) {
+    await q(
+      `INSERT INTO audit_log (actor, action, serial, details) VALUES ($1,$2,$3,$4)`,
+      [actor != null ? actor : 'unknown', action, serial != null ? serial : null, details != null ? details : null]
+    );
+  }
+
   // ── agent script ───────────────────────────────────────────────────────────
   async function getCurrentAgentScript() {
     const row = await one(
@@ -991,6 +1073,12 @@ function makePgStore(poolOrConfig) {
     getConfirmedJob,
     markConfigJob,
     recordConfigResult,
+    createConfigJob,
+    approveConfigJob,
+    cancelConfigJob,
+    listConfigJobs,
+    getConfigJob,
+    appendAudit,
     getCurrentAgentScript,
     getFleet,
     getDeviceDetail,

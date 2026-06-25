@@ -87,6 +87,9 @@ function makeMemStore(_config) {
   const alerts = []; // {id, device_id, rule_id, severity, state, detail, opened_at, cleared_at}
   let alertSeq = 0;
 
+  /** append-only audit trail (actor + action + serial + details) */
+  const auditLog = []; // {id, ts, actor, action, serial, details}
+
   // ── helpers ─────────────────────────────────────────────────────────────
   function deviceTags(deviceId) {
     const d = devices.get(deviceId);
@@ -381,6 +384,79 @@ function makeMemStore(_config) {
         source: 'pre-apply',
       });
     }
+  }
+
+  // ── config jobs: ADMIN-facing authoring/approval (operator side) ─────────────
+  // These are the operator counterparts to the device-side getPendingConfigJob/…Fetch above.
+  // They never serve a router — they let the dashboard author a draft, approve it (two-person),
+  // cancel it, and list a device's jobs. The serving gate stays in getPendingConfigJob /
+  // getConfigJobForFetch, so creating/approving here can never bypass the "only approved +
+  // targeted + checksum-verified" contract.
+
+  // Create a DRAFT job (status='draft' — never served until approved). Computes rsc_sha256
+  // from rsc_text when the caller doesn't supply one. Mirrors createConfigJob in store.pg.js.
+  async function createConfigJob(fields = {}) {
+    const f = fields || {};
+    const rsc = f.rsc_text != null ? String(f.rsc_text) : '';
+    const sha =
+      f.rsc_sha256 != null && f.rsc_sha256 !== ''
+        ? f.rsc_sha256
+        : require('./transform').sha256Hex(rsc);
+    return _test.addConfigJob({ ...f, rsc_text: rsc, rsc_sha256: sha, status: 'draft' });
+  }
+
+  // Approve a DRAFT -> 'approved' (the only status a device will pull). Returns the updated
+  // row, or null if the job doesn't exist; throws if it isn't a draft (the caller checks
+  // status + the two-person rule first, but defend the transition here too).
+  async function approveConfigJob(jobId, approvedBy) {
+    const job = configJobs.get(jobId);
+    if (!job) return null;
+    if (job.status !== 'draft') {
+      throw new Error(`approveConfigJob: job ${jobId} is '${job.status}', not 'draft'`);
+    }
+    job.status = 'approved';
+    job.approved_by = approvedBy != null ? approvedBy : null;
+    job.approved_at = iso();
+    return { ...job };
+  }
+
+  // Cancel a job that has not yet been picked up (draft or approved) -> 'cancelled'.
+  async function cancelConfigJob(jobId) {
+    const job = configJobs.get(jobId);
+    if (!job) return null;
+    if (job.status !== 'draft' && job.status !== 'approved') {
+      throw new Error(`cancelConfigJob: job ${jobId} is '${job.status}', cannot cancel`);
+    }
+    job.status = 'cancelled';
+    return { ...job };
+  }
+
+  // All jobs targeting this device (directly or via a tag), newest first, capped.
+  async function listConfigJobs(deviceId, limit = 50) {
+    const out = [];
+    for (const job of configJobs.values()) {
+      if (!jobTargetsDevice(job, deviceId)) continue;
+      out.push({ ...job });
+    }
+    out.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    return out.slice(0, Math.max(0, limit));
+  }
+
+  async function getConfigJob(jobId) {
+    const j = configJobs.get(jobId);
+    return j ? { ...j } : null;
+  }
+
+  // ── audit ────────────────────────────────────────────────────────────────────
+  async function appendAudit(actor, action, serial, details) {
+    auditLog.push({
+      id: auditLog.length + 1,
+      ts: iso(),
+      actor: actor != null ? actor : 'unknown',
+      action,
+      serial: serial != null ? serial : null,
+      details: details != null ? details : null,
+    });
   }
 
   // ── agent script ───────────────────────────────────────────────────────────
@@ -693,6 +769,7 @@ function makeMemStore(_config) {
       agentScripts,
       alertRules,
       alerts,
+      auditLog,
     },
   };
 
@@ -718,6 +795,12 @@ function makeMemStore(_config) {
     getConfirmedJob,
     markConfigJob,
     recordConfigResult,
+    createConfigJob,
+    approveConfigJob,
+    cancelConfigJob,
+    listConfigJobs,
+    getConfigJob,
+    appendAudit,
     getCurrentAgentScript,
     getFleet,
     getDeviceDetail,

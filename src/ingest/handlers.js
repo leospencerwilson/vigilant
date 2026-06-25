@@ -628,6 +628,138 @@ async function ouiLookup(ctx) {
   });
 }
 
+// ── admin config-push management (author + two-person approve) ───────
+// Operator-facing side of the review-gated config push (docs/RUNBOOK-config-push.md): list a
+// device's jobs, author a DRAFT, approve it (two-person), or cancel a not-yet-picked-up job.
+// None of these touch a router — a device only ever PULLS an approved job on its own tick. All
+// are admin-token gated by the server, and every state change is written to audit_log.
+const CONFIG_JOB_KINDS = new Set(['snippet', 'full']);
+
+// GET /devices/:serial/config-jobs — recent jobs targeting this device (newest first).
+async function configJobsList(ctx) {
+  const { res, store, params } = ctx;
+  const device = await store.getDeviceBySerial(params.serial);
+  if (!device) return json(res, 404, { ok: false, error: 'not found' });
+  const jobs =
+    typeof store.listConfigJobs === 'function' ? await store.listConfigJobs(device.id, 50) : [];
+  return json(res, 200, { ok: true, serial: device.serial, jobs: jobs || [] });
+}
+
+// POST /devices/:serial/config-jobs — author a DRAFT job. A draft is NEVER served to a device;
+// it must be approved by a second operator first (configJobApprove).
+async function configJobCreate(ctx) {
+  const { res, store, log, params, body } = ctx;
+  const device = await store.getDeviceBySerial(params.serial);
+  if (!device) return json(res, 404, { ok: false, error: 'not found' });
+
+  let parsed;
+  try {
+    parsed = JSON.parse(body || '');
+  } catch (e) {
+    return json(res, 400, { ok: false, error: 'bad json' });
+  }
+
+  const rscText = parsed && typeof parsed.rsc_text === 'string' ? parsed.rsc_text : '';
+  const createdBy =
+    parsed && typeof parsed.created_by === 'string' ? parsed.created_by.trim() : '';
+  const kind = parsed && parsed.kind ? String(parsed.kind) : 'snippet';
+  if (!rscText.trim()) return json(res, 400, { ok: false, error: 'rsc_text required' });
+  if (!createdBy) return json(res, 400, { ok: false, error: 'created_by required' });
+  if (!CONFIG_JOB_KINDS.has(kind)) return json(res, 400, { ok: false, error: 'invalid kind' });
+
+  if (typeof store.createConfigJob !== 'function') {
+    return json(res, 501, { ok: false, error: 'config push not supported by this store' });
+  }
+
+  // Clamp the dead-man confirm window to a 30s floor so an operator can't disarm the auto-
+  // rollback by setting it to 0. Default 300s (RUNBOOK §2.1).
+  let confirmWindow = transform.parseNum(parsed && parsed.confirm_window_s);
+  confirmWindow = confirmWindow == null ? 300 : Math.max(30, Math.round(confirmWindow));
+
+  const job = await store.createConfigJob({
+    device_id: device.id,
+    kind,
+    rsc_text: rscText,
+    confirm_window_s: confirmWindow,
+    is_canary: !!(parsed && parsed.is_canary === true),
+    created_by: createdBy,
+  });
+  if (typeof store.appendAudit === 'function') {
+    await store.appendAudit(
+      createdBy,
+      'config.draft',
+      device.serial,
+      `job=${job.id} kind=${kind} sha=${job.rsc_sha256}`
+    );
+  }
+  log.info('config: draft created', { serial: device.serial, job: job.id });
+  return json(res, 201, { ok: true, job });
+}
+
+// POST /config-jobs/:id/approve — second-person approval. Enforces the two-person rule
+// (approver must differ from the author) and that the job is still a DRAFT.
+async function configJobApprove(ctx) {
+  const { res, store, log, params, body } = ctx;
+  let parsed;
+  try {
+    parsed = JSON.parse(body || '');
+  } catch (e) {
+    return json(res, 400, { ok: false, error: 'bad json' });
+  }
+  const approvedBy =
+    parsed && typeof parsed.approved_by === 'string' ? parsed.approved_by.trim() : '';
+  if (!approvedBy) return json(res, 400, { ok: false, error: 'approved_by required' });
+
+  if (typeof store.getConfigJob !== 'function' || typeof store.approveConfigJob !== 'function') {
+    return json(res, 501, { ok: false, error: 'config push not supported by this store' });
+  }
+  const job = await store.getConfigJob(params.id);
+  if (!job) return json(res, 404, { ok: false, error: 'not found' });
+  if (job.status !== 'draft') {
+    return json(res, 409, { ok: false, error: `job is '${job.status}', not 'draft'` });
+  }
+  // Two-person rule (RUNBOOK §0): the approver must not be the author.
+  if (job.created_by && approvedBy.toLowerCase() === String(job.created_by).toLowerCase()) {
+    return json(res, 409, { ok: false, error: 'two-person rule: approver must differ from author' });
+  }
+  const updated = await store.approveConfigJob(params.id, approvedBy);
+  if (!updated) return json(res, 409, { ok: false, error: 'could not approve (status changed?)' });
+  if (typeof store.appendAudit === 'function') {
+    await store.appendAudit(approvedBy, 'config.approve', null, `job=${params.id} author=${job.created_by}`);
+  }
+  log.info('config: job approved', { job: params.id });
+  return json(res, 200, { ok: true, job: updated });
+}
+
+// POST /config-jobs/:id/cancel — cancel a draft or a not-yet-picked-up approved job.
+async function configJobCancel(ctx) {
+  const { res, store, log, params, body } = ctx;
+  let parsed = {};
+  try {
+    parsed = body ? JSON.parse(body) : {};
+  } catch (e) {
+    parsed = {};
+  }
+  const actor =
+    parsed && typeof parsed.actor === 'string' && parsed.actor.trim() ? parsed.actor.trim() : 'operator';
+
+  if (typeof store.getConfigJob !== 'function' || typeof store.cancelConfigJob !== 'function') {
+    return json(res, 501, { ok: false, error: 'config push not supported by this store' });
+  }
+  const job = await store.getConfigJob(params.id);
+  if (!job) return json(res, 404, { ok: false, error: 'not found' });
+  if (job.status !== 'draft' && job.status !== 'approved') {
+    return json(res, 409, { ok: false, error: `job is '${job.status}', cannot cancel` });
+  }
+  const updated = await store.cancelConfigJob(params.id);
+  if (!updated) return json(res, 409, { ok: false, error: 'could not cancel (status changed?)' });
+  if (typeof store.appendAudit === 'function') {
+    await store.appendAudit(actor, 'config.cancel', null, `job=${params.id}`);
+  }
+  log.info('config: job cancelled', { job: params.id });
+  return json(res, 200, { ok: true, job: updated });
+}
+
 module.exports = {
   healthz,
   adminUi,
@@ -641,4 +773,8 @@ module.exports = {
   deviceDetail,
   deviceHistory,
   ouiLookup,
+  configJobsList,
+  configJobCreate,
+  configJobApprove,
+  configJobCancel,
 };

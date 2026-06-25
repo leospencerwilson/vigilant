@@ -143,6 +143,30 @@
 :local pppSessions [:len [/ppp active find]]
 :local dhcpLeases  [:len [/ip dhcp-server lease find]]
 
+# ── L2TP management tunnels (l2tp-CLIENT only) ───────────────────────
+# Emit each OUTBOUND l2tp tunnel this router dials as {name,address,running}. address is the
+# local IP RouterOS assigned the tunnel, looked up in /ip address (same technique as the
+# pppoe-out public-ip fallback above) — it may carry a /mask, the server/UI strips it.
+# DELIBERATELY only l2tp-CLIENT interfaces: a VPN concentrator can hold HUNDREDS of dynamic
+# l2tp-IN server sessions, which we must never enumerate here (it would blow the CORE chunk
+# size). Outbound management tunnels are a bounded handful, so this stays small. On any error
+# the array degrades to "[]" rather than breaking the core POST.
+:local l2tpJson "[]"
+:do {
+    :local arr ""
+    :local sep ""
+    :foreach lc in=[/interface l2tp-client find] do={
+        :local lname [/interface l2tp-client get $lc name]
+        :local lrun  [/interface l2tp-client get $lc running]
+        :local laddr "null"
+        :local pa [/ip address find interface=$lname]
+        :if ([:len $pa] > 0) do={ :set laddr [/ip address get [:pick $pa 0] address] }
+        :set arr ($arr . $sep . ("{\"name\":\"" . $lname . "\",\"address\":\"" . $laddr . "\",\"running\":" . $lrun . "}"))
+        :set sep ","
+    }
+    :set l2tpJson ("[" . $arr . "]")
+} on-error={ :set l2tpJson "[]" }
+
 # ── WAN detection (CONSERVATIVE) ──────────────────────────────────────
 # is_wan must be TRUE ONLY for a genuine internet uplink. On a VPN-concentrator router
 # (this box has bridge_HSCN, bridge_L2TP, l2tp-out1, ether2-5, …) the naive "egress of any
@@ -409,6 +433,7 @@
 :set core ($core . "\"voltage\":\"" . $volt . "\",\"fan1_speed\":\"" . $fan1 . "\",\"write_sect_total\":\"" . $writeSect . "\",")
 :set core ($core . "\"firmware_current\":\"" . $fwCur . "\",\"firmware_upgrade\":\"" . $fwUpg . "\",\"ntp_synced\":" . $ntpSynced . ",")
 :set core ($core . "\"public_ip\":\"" . $publicIp . "\",\"pppoe_running\":" . $pppoeUp . ",\"ppp_sessions\":" . $pppSessions . ",\"dhcp_leases\":" . $dhcpLeases . ",")
+:set core ($core . "\"l2tp_tunnels\":" . $l2tpJson . ",")
 :set core ($core . "\"lte\":" . $lteJson . "}")
 [$vigilantPost $core "telemetry-core" $vigilantCC]
 

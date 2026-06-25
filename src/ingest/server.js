@@ -21,6 +21,10 @@
 //   GET  /fleet                   admin   fleet read API
 //   GET  /devices/:serial         admin   device detail
 //   GET  /devices/:serial/history admin   dashboard time-series (window=1h|6h|24h|7d)
+//   GET  /devices/:serial/config-jobs   admin  list config-push jobs for the device
+//   POST /devices/:serial/config-jobs   admin  author a DRAFT config-push job
+//   POST /config-jobs/:id/approve       admin  two-person approve a draft
+//   POST /config-jobs/:id/cancel        admin  cancel a draft / not-yet-picked-up job
 
 const http = require('node:http');
 const crypto = require('node:crypto');
@@ -187,6 +191,35 @@ function createServer({ store, config: cfg }) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { serial: decodeURIComponent(mHist[1]) };
         return handlers.deviceHistory(ctx);
+      }
+
+      // GET|POST /devices/:serial/config-jobs (admin) — list / author review-gated config-push
+      // jobs. Matched before the bare /devices/:serial route (defence in depth; the bare regex
+      // can't match a path with a further /segment anyway).
+      const mCfgJobs = /^\/devices\/([^/]+)\/config-jobs$/.exec(pathname);
+      if (mCfgJobs && (method === 'GET' || method === 'POST')) {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { serial: decodeURIComponent(mCfgJobs[1]) };
+        if (method === 'POST') ctx.body = await readBody(req);
+        return method === 'GET' ? handlers.configJobsList(ctx) : handlers.configJobCreate(ctx);
+      }
+
+      // POST /config-jobs/:id/approve (admin) — two-person approval of a draft.
+      const mCfgApprove = /^\/config-jobs\/([^/]+)\/approve$/.exec(pathname);
+      if (method === 'POST' && mCfgApprove) {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mCfgApprove[1]) };
+        ctx.body = await readBody(req);
+        return handlers.configJobApprove(ctx);
+      }
+
+      // POST /config-jobs/:id/cancel (admin) — cancel a draft / not-yet-picked-up approved job.
+      const mCfgCancel = /^\/config-jobs\/([^/]+)\/cancel$/.exec(pathname);
+      if (method === 'POST' && mCfgCancel) {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mCfgCancel[1]) };
+        ctx.body = await readBody(req);
+        return handlers.configJobCancel(ctx);
       }
 
       // GET /devices/:serial

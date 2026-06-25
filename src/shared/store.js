@@ -108,6 +108,25 @@
  * @property {(jobId: string, status: string, resultLog: string, exportText?: string) => Promise<void>} recordConfigResult
  *   Records the apply outcome and, when exportText is given, inserts a config_snapshots row.
  *
+ * @property {(fields: Object) => Promise<Object>} createConfigJob
+ *   Operator side: insert a DRAFT job (never served until approved). Computes rsc_sha256 from
+ *   rsc_text when not supplied. Returns the new row.
+ *
+ * @property {(jobId: string, approvedBy: string) => Promise<?Object>} approveConfigJob
+ *   Draft -> approved (guarded: no-op/null if not a draft). Returns the updated row.
+ *
+ * @property {(jobId: string) => Promise<?Object>} cancelConfigJob
+ *   draft|approved -> cancelled (null if past pickup). Returns the updated row.
+ *
+ * @property {(deviceId: string, limit?: number) => Promise<Object[]>} listConfigJobs
+ *   Jobs targeting this device (directly or via a tag), newest first, capped.
+ *
+ * @property {(jobId: string) => Promise<?Object>} getConfigJob
+ *   Full config_jobs row by id, or null.
+ *
+ * @property {(actor: string, action: string, serial: ?string, details: ?string) => Promise<void>} appendAudit
+ *   Append one audit_log row (actor + action + serial + details).
+ *
  * @property {() => Promise<?{version: number, rsc_text: string}>} getCurrentAgentScript
  *   The agent_scripts row where is_current; null if none published yet.
  *

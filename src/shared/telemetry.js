@@ -89,6 +89,16 @@ const macHostSchema = z
   })
   .passthrough();
 
+// One outbound L2TP management tunnel (l2tp-client). `running` arrives as a real boolean
+// from the agent; `address` is the tunnel's local IP (may carry a /mask).
+const l2tpTunnelSchema = z
+  .object({
+    name: z.string().optional().nullable(),
+    address: z.string().optional().nullable(),
+    running: loose.optional().nullable(),
+  })
+  .passthrough();
+
 const arpSchema = z
   .object({
     mac: z.string().optional().nullable(),
@@ -140,6 +150,11 @@ const telemetrySchema = z
     pppoe_running: loose.optional().nullable(),
     ppp_sessions: loose.optional().nullable(),
     dhcp_leases: loose.optional().nullable(),
+    // Outbound L2TP management tunnels this router dials (l2tp-client only — never the
+    // hundreds of dynamic l2tp-in server sessions a concentrator may carry). Each entry is
+    // {name, address, running}; `address` may carry a CIDR /mask. Not promoted to a
+    // device_state column — it rides in device_state.raw and the dashboard reads it there.
+    l2tp_tunnels: z.array(l2tpTunnelSchema).optional().nullable(),
     lte: lteSchema.optional().nullable(),
     interfaces: z.array(interfaceSchema).optional().nullable(),
     neighbors: z.array(neighborSchema).optional().nullable(),

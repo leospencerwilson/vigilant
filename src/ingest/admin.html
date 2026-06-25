@@ -87,6 +87,25 @@
   #devView .dash-head h2{font-size:20px;margin:0 0 4px;text-transform:none;letter-spacing:0;color:var(--fg)}
   #devView .dash-head .ids{font-family:var(--mono);font-size:12px;color:var(--mut)}
   #devView .dash-head .ids b{color:var(--fg);font-weight:600}
+  #devView .dash-head .addrs{margin-top:8px;display:flex;flex-wrap:wrap;gap:8px}
+  .addr{display:inline-flex;align-items:baseline;gap:7px;font-family:var(--mono);font-size:12px;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:4px 10px}
+  .addr .lab{color:var(--mut);text-transform:uppercase;letter-spacing:.05em;font-size:10px;font-family:var(--sans)}
+  .addr b{color:var(--fg);font-weight:600}
+  .addr.l2tp.up{border-color:rgba(168,85,247,.5)}
+  .addr.l2tp.up b{color:#d8b4fe}
+  .addr.l2tp.down b{color:var(--mut)}
+  /* ── config push card ── */
+  .cfg-warn{background:rgba(245,158,11,.10);border:1px solid var(--warn);color:#fde68a;border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.45;margin-bottom:14px}
+  .cfg-grid{display:grid;grid-template-columns:minmax(320px,1fr) 1fr;gap:18px}
+  @media(max-width:900px){.cfg-grid{grid-template-columns:1fr}}
+  .cfg-act{display:flex;gap:6px;flex-wrap:wrap}
+  .cfg-act button{padding:4px 9px;font-size:11px;margin:0}
+  .pill.draft{background:rgba(139,154,169,.15);color:#cbd5e1}
+  .pill.approved{background:rgba(59,130,246,.18);color:#93c5fd}
+  .pill.fetched,.pill.applying{background:rgba(245,158,11,.15);color:#fcd34d}
+  .pill.applied{background:rgba(34,197,94,.15);color:#86efac}
+  .pill.failed,.pill.rolled_back{background:rgba(239,68,68,.15);color:#fca5a5}
+  .pill.cancelled{background:rgba(71,85,105,.25);color:#94a3b8}
   .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:18px}
   .tile{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px}
   .tile .lab{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
@@ -197,8 +216,9 @@
         <h2 id="d-name">—</h2>
         <div class="ids">
           <b id="d-serial">—</b> · <span id="d-model">—</span> · ROS <span id="d-ros">—</span>
-          · up <span id="d-uptime">—</span> · <span id="d-ip">—</span>
+          · up <span id="d-uptime">—</span>
         </div>
+        <div class="addrs" id="d-addrs"></div>
       </div>
       <div id="d-status"></div>
     </div>
@@ -267,6 +287,39 @@
           <thead><tr><th>MAC</th><th>Interface</th><th>IP</th><th>Manufacturer</th></tr></thead>
           <tbody id="d-hosts"><tr><td colspan="4" class="empty">No hosts learned.</td></tr></tbody>
         </table>
+      </div>
+    </div>
+
+    <!-- ══════ config push (review-gated; see docs/RUNBOOK-config-push.md) ══════ -->
+    <div class="card" id="d-cfgcard" style="margin-top:18px">
+      <div class="between"><h2>Config push <span class="hint">· review-gated · Safe Mode · dead-man rollback</span></h2><span class="hint" id="d-cfgcount"></span></div>
+      <div class="cfg-warn">⚠️ <b>Live production.</b> Approving a job lets <b>this device pull and <code>/import</code> these RouterOS commands</b> on its next tick. Keep the snippet minimal &amp; reversible. The device applies under Safe Mode and <b>auto-reverts after the confirm window</b> unless the change is confirmed healthy. Two-person rule: the approver must differ from the author.</div>
+
+      <div class="cfg-grid">
+        <div>
+          <label>Your name <span class="hint">— recorded as author</span></label>
+          <input id="cfg-author" placeholder="e.g. leo" autocomplete="off" />
+          <div class="row">
+            <div><label>Kind</label><select id="cfg-kind"><option value="snippet">snippet</option><option value="full">full</option></select></div>
+            <div><label>Confirm window (s)</label><input id="cfg-window" type="number" min="30" step="30" value="300" /></div>
+          </div>
+          <label style="display:flex;align-items:center;gap:7px;margin-top:12px"><input type="checkbox" id="cfg-canary" style="width:auto;margin:0" />Mark as canary</label>
+          <label>RouterOS <code>.rsc</code></label>
+          <textarea id="cfg-rsc" rows="7" placeholder="/system identity set name=...    # minimal, reversible — runs under Safe Mode" autocomplete="off"></textarea>
+          <div class="hint" id="cfg-sha">sha256 — (empty)</div>
+          <button class="primary" id="cfg-create">Create draft</button>
+          <div class="msg" id="cfg-msg"></div>
+        </div>
+        <div>
+          <div class="step"><span>Jobs for this device</span><button class="ghost" id="cfg-refresh">Refresh</button></div>
+          <div class="scroll" style="max-height:380px">
+            <table class="fixed">
+              <colgroup><col style="width:17%"><col style="width:12%"><col style="width:17%"><col style="width:22%"><col style="width:32%"></colgroup>
+              <thead><tr><th>Created</th><th>Kind</th><th>Status</th><th>Author → Appr</th><th>Actions</th></tr></thead>
+              <tbody id="cfg-jobs"><tr><td colspan="5" class="empty">No jobs.</td></tr></tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -576,6 +629,7 @@ async function refreshDevice(){
     detail = await r.json();
   }catch(e){ return; }
   renderDevice(detail);
+  refreshConfigJobs();
 }
 
 function renderDevice(d){
@@ -592,8 +646,31 @@ function renderDevice(d){
   $('#d-model').textContent = dev.model || '—';
   $('#d-ros').textContent = st.ros_version || dev.ros_version || '—';
   $('#d-uptime').textContent = humanUptime(st.uptime_s);
-  $('#d-ip').textContent = st.public_ip || '—';
   $('#d-status').innerHTML = pill(st.status);
+
+  // ── addresses: Public IP + each outbound L2TP management tunnel (name + local IP) ──
+  // The L2TP tunnels ride in device_state.raw.l2tp_tunnels (not promoted to a column); each is
+  // {name, address, running}. `address` may carry a /mask from /ip address — strip it for display.
+  const raw = st.raw || {};
+  const l2tps = Array.isArray(raw.l2tp_tunnels) ? raw.l2tp_tunnels : [];
+  const stripMask = a => (a == null ? '' : String(a).split('/')[0]);
+  const addrParts = [
+    '<span class="addr"><span class="lab">Public IP</span><b>' + dash(st.public_ip) + '</b></span>'
+  ];
+  if (l2tps.length){
+    for (const t of l2tps){
+      const ip = stripMask(t.address);
+      const up = t.running === true || t.running === 'true';
+      const shown = (ip && ip !== 'null') ? esc(ip) : '—';
+      const lab = 'L2TP' + (t.name ? (' · ' + esc(t.name)) : '');
+      addrParts.push('<span class="addr l2tp ' + (up ? 'up' : 'down') + '" title="'
+        + esc(t.name || 'l2tp') + (up ? ' · running' : ' · down') + '">'
+        + '<span class="lab">' + lab + '</span><b>' + shown + '</b></span>');
+    }
+  } else {
+    addrParts.push('<span class="addr l2tp down"><span class="lab">L2TP</span><b>—</b></span>');
+  }
+  $('#d-addrs').innerHTML = addrParts.join('');
 
   // ── tiles ──
   const memUsed = (st.total_memory!=null && st.free_memory!=null) ? (st.total_memory - st.free_memory) : null;
@@ -746,6 +823,118 @@ function renderHistory(h){
       { min:0, yFmt:humanBps });
   });
 }
+
+// ════════════════════ config push (author + two-person approve) ════════════════════
+// Operator UI over the review-gated config-push API (docs/RUNBOOK-config-push.md). Authoring a
+// draft never touches a router; only an APPROVED job is pulled by the device on its own tick,
+// which then applies it under Safe Mode with a dead-man rollback. We surface the full lifecycle.
+function cfgMsg(t, cls){ const m=$('#cfg-msg'); if(!m) return; m.textContent=t; m.className='msg '+(cls||''); }
+
+async function sha256HexBrowser(s){
+  try{
+    if (!(window.crypto && crypto.subtle)) return null;
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+    return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+  }catch(e){ return null; }
+}
+
+// Live sha256 hint as the operator edits the .rsc (informational — the server recomputes it
+// authoritatively and the device re-verifies the checksum before /import).
+async function updateCfgSha(){
+  const el=$('#cfg-rsc'); if(!el) return;
+  const txt=el.value||'';
+  if(!txt.trim()){ $('#cfg-sha').textContent='sha256 — (empty)'; return; }
+  const h=await sha256HexBrowser(txt);
+  $('#cfg-sha').textContent = h ? ('sha256 '+h) : 'sha256 — (computed server-side)';
+}
+
+async function refreshConfigJobs(){
+  if (!curSerial || !tok()) return;
+  let data;
+  try{
+    const r=await fetch('/devices/'+encodeURIComponent(curSerial)+'/config-jobs',{ headers:authHeaders() });
+    if(!r.ok) return;
+    data=await r.json();
+  }catch(e){ return; }
+  const jobs=(data && data.jobs)||[];
+  $('#d-cfgcount').textContent = jobs.length ? (jobs.length+' job'+(jobs.length>1?'s':'')) : '';
+  const tb=$('#cfg-jobs');
+  if(!jobs.length){ tb.innerHTML='<tr><td colspan="5" class="empty">No jobs.</td></tr>'; return; }
+  tb.innerHTML = jobs.map(j=>{
+    const created = j.created_at ? ago(j.created_at) : '—';
+    const who = esc(j.created_by||'—') + (j.approved_by ? (' → '+esc(j.approved_by)) : '');
+    const canary = j.is_canary ? ' <span class="hint">canary</span>' : '';
+    let actions='';
+    if(j.status==='draft'){
+      actions='<div class="cfg-act"><button class="ghost" data-act="approve" data-id="'+esc(j.id)+'" data-author="'+esc(j.created_by||'')+'">Approve</button>'
+            + '<button class="ghost" data-act="cancel" data-id="'+esc(j.id)+'">Cancel</button></div>';
+    } else if(j.status==='approved'){
+      actions='<div class="cfg-act"><span class="hint">awaiting device pull</span><button class="ghost" data-act="cancel" data-id="'+esc(j.id)+'">Cancel</button></div>';
+    } else {
+      actions='<span class="hint">'+(j.confirm_window_s?('window '+j.confirm_window_s+'s'):'')+'</span>';
+    }
+    return '<tr title="'+esc(j.id)+'">'
+      + '<td>'+created+'</td>'
+      + '<td>'+esc(j.kind||'—')+canary+'</td>'
+      + '<td>'+pill(j.status)+'</td>'
+      + '<td title="'+esc((j.created_by||'')+(j.approved_by?(' → '+j.approved_by):''))+'">'+who+'</td>'
+      + '<td>'+actions+'</td>'
+      + '</tr>';
+  }).join('');
+  $$('#cfg-jobs [data-act]').forEach(b=>b.onclick=()=>{
+    if(b.dataset.act==='approve') approveJob(b.dataset.id, b.dataset.author);
+    else if(b.dataset.act==='cancel') cancelJob(b.dataset.id);
+  });
+}
+
+async function createDraft(){
+  if(!curSerial) return;
+  if(!tok()){ cfgMsg('Enter the admin token (top right).','err'); return; }
+  const author=($('#cfg-author').value||'').trim();
+  const rsc=$('#cfg-rsc').value||'';
+  if(!author){ cfgMsg('Enter your name (recorded as author).','err'); return; }
+  if(!rsc.trim()){ cfgMsg('Paste the RouterOS .rsc to push.','err'); return; }
+  const win=parseInt($('#cfg-window').value,10);
+  const payload={ created_by:author, kind:$('#cfg-kind').value, rsc_text:rsc,
+    confirm_window_s:isNaN(win)?300:win, is_canary:$('#cfg-canary').checked===true };
+  const btn=$('#cfg-create'); btn.disabled=true;
+  try{
+    const r=await fetch('/devices/'+encodeURIComponent(curSerial)+'/config-jobs',
+      { method:'POST', headers:authHeaders(), body:JSON.stringify(payload) });
+    const j=await r.json().catch(()=>({}));
+    if(r.ok){ cfgMsg('Draft created — a second person must approve it before the device will pull it.','ok'); $('#cfg-rsc').value=''; updateCfgSha(); refreshConfigJobs(); }
+    else cfgMsg('Create failed: '+(j.error||('HTTP '+r.status)),'err');
+  }catch(e){ cfgMsg('Create failed (network).','err'); }
+  finally{ btn.disabled=false; }
+}
+
+async function approveJob(id, author){
+  const approver=(prompt('Approver name (two-person rule — must differ from author "'+(author||'?')+'"):','')||'').trim();
+  if(!approver) return;
+  try{
+    const r=await fetch('/config-jobs/'+encodeURIComponent(id)+'/approve',
+      { method:'POST', headers:authHeaders(), body:JSON.stringify({ approved_by:approver }) });
+    const j=await r.json().catch(()=>({}));
+    if(r.ok) cfgMsg('Approved — the device will pull & apply on its next tick (Safe Mode + dead-man rollback).','ok');
+    else cfgMsg('Approve failed: '+(j.error||('HTTP '+r.status)),'err');
+  }catch(e){ cfgMsg('Approve failed (network).','err'); }
+  refreshConfigJobs();
+}
+
+async function cancelJob(id){
+  if(!confirm('Cancel this config job? (only works before the device picks it up)')) return;
+  try{
+    const r=await fetch('/config-jobs/'+encodeURIComponent(id)+'/cancel',
+      { method:'POST', headers:authHeaders(), body:JSON.stringify({ actor:($('#cfg-author').value||'operator').trim() }) });
+    const j=await r.json().catch(()=>({}));
+    if(r.ok) cfgMsg('Job cancelled.','ok'); else cfgMsg('Cancel failed: '+(j.error||('HTTP '+r.status)),'err');
+  }catch(e){ cfgMsg('Cancel failed (network).','err'); }
+  refreshConfigJobs();
+}
+
+$('#cfg-create').onclick = createDraft;
+$('#cfg-refresh').onclick = refreshConfigJobs;
+$('#cfg-rsc').addEventListener('input', updateCfgSha);
 
 // ── liveness dot + initial load ──
 fetch('/healthz').then(r=>{ $('#health').style.background = r.ok ? 'var(--ok)' : 'var(--bad)'; }).catch(()=>{ $('#health').style.background='var(--bad)'; });
