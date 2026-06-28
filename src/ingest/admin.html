@@ -543,6 +543,18 @@ function pill(s){ s=(s||'unknown'); return '<span class="pill '+s+'">'+s+'</span
 function esc(s){ if(s==null) return ''; return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function dash(v, suffix){ return (v==null||v==='') ? '—' : (esc(v)+(suffix||'')); }
 
+// ── live-render performance ───────────────────────────────────────────
+// The dashboard polls every 2s. Rebuilding whole sections via innerHTML each tick causes
+// flicker, reflow storms, lost hover, and (for the WiFi card) wiped PSK-reveal state. So we:
+//   * skip a section's rebuild when its data signature is unchanged (secChanged),
+//   * update the hot port table's RX/TX in place rather than re-rendering rows,
+//   * guard against overlapping polls on the slow VM (_busy),
+//   * pause polling when the tab is hidden (visibilitychange).
+let _sec = {};                                  // section key -> last signature (reset per view)
+function secChanged(key, sig){ if (_sec[key] === sig) return false; _sec[key] = sig; return true; }
+function resetSections(){ _sec = {}; }
+const _busy = { dev:false, hist:false, fleet:false };
+
 // ════════════════════ OUI -> vendor (manufacturer) lookup ════════════════════
 // Resolve a MAC's manufacturer via the admin-gated GET /oui/<mac> endpoint (seed -> cache ->
 // external API server-side). We DEDUPE + CACHE client-side by 3-octet OUI prefix in a JS Map:
@@ -816,13 +828,15 @@ function tokenGate(target){
 }
 async function loadFleet(){
   if(!tok()){ tokenGate($('#fleet')); return; }
+  if(_busy.fleet) return;
+  _busy.fleet = true;
   try{
     const r = await fetch('/fleet', { headers:authHeaders() });
     if(r.status === 401){ tokenGate($('#fleet')); return; }
     if(!r.ok){ $('#fleet').innerHTML='<div class="empty">Fleet load failed ('+r.status+').</div>'; return; }
     const j = await r.json(); const rows=(j.devices||j||[]);
     if(!rows.length){ $('#fleet').innerHTML='<div class="empty">No devices enrolled yet.</div>'; return; }
-    $('#fleet').innerHTML = '<div class="fleetgrid">' + rows.map(d=>{
+    const html = '<div class="fleetgrid">' + rows.map(d=>{
       const cpu = d.cpu_load==null ? '—' : d.cpu_load+'%';
       return '<div class="devcard" data-serial="'+esc(d.serial)+'">'
         + '<div class="nm">'+dash(d.site_name||d.identity)+'</div>'
@@ -832,8 +846,13 @@ async function loadFleet(){
         + '<div class="meta"><span>CPU '+cpu+'</span><span>'+ago(d.last_seen_at)+'</span></div>'
         + '</div>';
     }).join('') + '</div>';
-    $$('#fleet .devcard').forEach(c => c.onclick = () => openDevice(c.dataset.serial));
+    // Only touch the DOM when the grid actually changed (preserves hover; no teardown).
+    if (secChanged('fleet', html)){
+      $('#fleet').innerHTML = html;
+      $$('#fleet .devcard').forEach(c => c.onclick = () => openDevice(c.dataset.serial));
+    }
   }catch(e){ /* leave as-is */ }
+  finally{ _busy.fleet = false; }
 }
 $('#refresh').onclick = loadFleet;
 
@@ -843,10 +862,20 @@ let curWindow = '1h';
 let liveTimer = null, histTimer = null;
 let wanNames = [];   // WAN interface names for the current device (set in renderDevice, used for peak)
 
-function showFleet(){
-  curSerial = null;
+function stopDeviceTimers(){
   if (liveTimer) clearInterval(liveTimer); liveTimer = null;
   if (histTimer) clearInterval(histTimer); histTimer = null;
+}
+function startDeviceTimers(){
+  stopDeviceTimers();
+  liveTimer = setInterval(refreshDevice, 2000);   // live values every 2s (agent posts ~1s)
+  histTimer = setInterval(refreshHistory, 5000);  // charts every 5s
+}
+
+function showFleet(){
+  curSerial = null;
+  stopDeviceTimers();
+  resetSections();
   $('#devView').classList.add('hidden');
   $('#fleetView').classList.remove('hidden');
   loadFleet();
@@ -855,17 +884,21 @@ $('#back').onclick = showFleet;
 
 function openDevice(serial){
   curSerial = serial;
+  resetSections();                                 // new device → rebuild every section once
   $('#fleetView').classList.add('hidden');
   $('#devView').classList.remove('hidden');
-  // reset chart selection to default window
-  // (keep whatever window was last chosen)
   refreshDevice();
   refreshHistory();
-  if (liveTimer) clearInterval(liveTimer);
-  if (histTimer) clearInterval(histTimer);
-  liveTimer = setInterval(refreshDevice, 2000);   // live values every 2s (agent posts ~1s)
-  histTimer = setInterval(refreshHistory, 5000);  // charts every 5s
+  startDeviceTimers();
 }
+
+// Pause all polling when the tab is hidden (no point churning the slow VM in the background);
+// resume + refresh immediately when it becomes visible again.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden){ stopDeviceTimers(); return; }
+  if (curSerial){ refreshDevice(); refreshHistory(); startDeviceTimers(); }
+  else { loadFleet(); }
+});
 
 $$('.win').forEach(b => b.onclick = () => {
   $$('.win').forEach(x => x.classList.remove('on'));
@@ -892,19 +925,21 @@ function portShort(name){
 }
 
 async function refreshDevice(){
-  if (!curSerial) return;
+  if (!curSerial || _busy.dev) return;            // skip if a previous poll is still in flight
   if (!tok()){ $('#d-tiles').innerHTML='<div class="empty">Enter the admin token (top right).</div>'; return; }
-  let detail;
+  _busy.dev = true;
   try{
+    let detail;
     const r = await fetch('/devices/'+encodeURIComponent(curSerial), { headers:authHeaders() });
     if (r.status === 401){ $('#d-tiles').innerHTML='<div class="empty">Enter the admin token (top right).</div>'; return; }
     if (r.status === 404){ $('#d-name').textContent='Device not found'; return; }
     if (!r.ok) return;
     detail = await r.json();
-  }catch(e){ return; }
-  renderDevice(detail);
-  refreshConfigJobs();
-  refreshSpeedtests();
+    renderDevice(detail);
+    refreshConfigJobs();
+    refreshSpeedtests();
+  }catch(e){ /* network hiccup — next tick retries */ }
+  finally{ _busy.dev = false; }
 }
 
 // ════════════════════ active speedtest ════════════════════
@@ -996,7 +1031,8 @@ function renderDevice(d){
   } else {
     addrParts.push('<span class="addr l2tp down"><span class="lab">L2TP</span><b>—</b></span>');
   }
-  $('#d-addrs').innerHTML = addrParts.join('');
+  const addrsHtml = addrParts.join('');
+  if (secChanged('addrs', addrsHtml)) $('#d-addrs').innerHTML = addrsHtml;
 
   // ── tiles ──
   const memUsed = (st.total_memory!=null && st.free_memory!=null) ? (st.total_memory - st.free_memory) : null;
@@ -1009,14 +1045,15 @@ function renderDevice(d){
     { lab:'DHCP leases', val: st.dhcp_leases==null?'—':st.dhcp_leases },
     { lab:'Firmware', val: st.firmware_current||'—', sub: fwBehind?('upgrade → '+esc(st.firmware_upgrade)):'', flag: fwBehind },
   ];
-  $('#d-tiles').innerHTML = tiles.map(t =>
+  const tilesHtml = tiles.map(t =>
     '<div class="tile'+(t.flag?' flag':'')+'"><div class="lab">'+t.lab+'</div><div class="val">'+esc(t.val)+'</div>'
     + (t.sub?'<div class="sub">'+t.sub+'</div>':'')+'</div>').join('');
+  if (secChanged('tiles', tilesHtml)) $('#d-tiles').innerHTML = tilesHtml;
 
   // ── physical-port faceplate: a switch-style row of boxes, green=link up, red=no link ──
   const phys = ifaces.filter(i => isPhysical(i.name))
     .sort((a,b)=> portNum(a.name)-portNum(b.name) || String(a.name||'').localeCompare(String(b.name||'')));
-  $('#d-portpanel').innerHTML = phys.length ? phys.map(i=>{
+  const faceHtml = phys.length ? phys.map(i=>{
     const role = i.role || 'lan';
     const disabled = i.disabled===true;
     const up = !disabled && (i.plugged===true || i.running===true);
@@ -1026,7 +1063,10 @@ function renderDevice(d){
     return '<div class="portbox '+cls+'" title="'+title+'"><span class="pnum">'+esc(portShort(i.name))
       + '</span><span class="prole '+role+'"></span></div>';
   }).join('') : '<div class="hint">No physical ports reported.</div>';
-  $('#d-portlegend').style.display = phys.length ? '' : 'none';
+  if (secChanged('face', faceHtml)){
+    $('#d-portpanel').innerHTML = faceHtml;
+    $('#d-portlegend').style.display = phys.length ? '' : 'none';
+  }
 
   // ── port map (WAN first, then role order, then name) ──
   $('#d-portcount').textContent = ifaces.length + ' interfaces';
@@ -1036,56 +1076,82 @@ function renderDevice(d){
     if (ra!==rb) return ra-rb;
     return (a.name||'').localeCompare(b.name||'');
   });
-  $('#d-ports').innerHTML = sorted.length ? sorted.map(i=>{
-    const role = i.role || 'lan';
-    const up = (i.plugged===true || i.running===true);
-    const linkTitle = i.disabled===true ? 'disabled' : (up?'link up':'link down');
-    return '<tr>'
-      + '<td title="'+esc(i.name)+(i.bridge?(' @'+esc(i.bridge)):'')+'">'+esc(i.name)+(i.bridge?' <span class="hint">@'+esc(i.bridge)+'</span>':'')+'</td>'
-      + '<td><span class="rtag '+role+'">'+role+'</span></td>'
-      + '<td><span class="linkdot '+(i.disabled===true?'down':(up?'up':'down'))+'" title="'+linkTitle+'"></span></td>'
-      + '<td>'+dash(i.speed)+'</td>'
-      + '<td>'+humanBps(i.rx_bps)+'</td>'
-      + '<td>'+humanBps(i.tx_bps)+'</td>'
-      + '</tr>';
-  }).join('') : '<tr><td colspan="6" class="empty">No interfaces.</td></tr>';
+  // Port table: rebuild the ROW STRUCTURE only when the set/role/link/speed changes; the
+  // RX/TX bps change every tick, so those two cells are updated IN PLACE (textContent) — no
+  // teardown of this scrollable table each poll (was the main flicker/scroll-jump source).
+  const portsBody = $('#d-ports');
+  const structSig = sorted.map(i =>
+    (i.name||'')+':'+(i.role||'')+':'+(i.disabled===true?'d':((i.plugged===true||i.running===true)?'u':'x'))+':'+(i.speed||'')
+  ).join('|');
+  if (secChanged('portsStruct', structSig)){
+    portsBody.innerHTML = sorted.length ? sorted.map(i=>{
+      const role = i.role || 'lan';
+      const up = (i.plugged===true || i.running===true);
+      const linkTitle = i.disabled===true ? 'disabled' : (up?'link up':'link down');
+      return '<tr data-pn="'+esc(i.name)+'">'
+        + '<td title="'+esc(i.name)+(i.bridge?(' @'+esc(i.bridge)):'')+'">'+esc(i.name)+(i.bridge?' <span class="hint">@'+esc(i.bridge)+'</span>':'')+'</td>'
+        + '<td><span class="rtag '+role+'">'+role+'</span></td>'
+        + '<td><span class="linkdot '+(i.disabled===true?'down':(up?'up':'down'))+'" title="'+linkTitle+'"></span></td>'
+        + '<td>'+dash(i.speed)+'</td>'
+        + '<td class="rx">'+humanBps(i.rx_bps)+'</td>'
+        + '<td class="tx">'+humanBps(i.tx_bps)+'</td>'
+        + '</tr>';
+    }).join('') : '<tr><td colspan="6" class="empty">No interfaces.</td></tr>';
+  } else {
+    for (const i of sorted){
+      const row = portsBody.querySelector('tr[data-pn="'+(i.name||'').replace(/"/g,'\\"')+'"]');
+      if (!row) continue;
+      const rx = row.querySelector('.rx'), tx = row.querySelector('.tx');
+      const rxv = humanBps(i.rx_bps), txv = humanBps(i.tx_bps);
+      if (rx && rx.textContent !== rxv) rx.textContent = rxv;
+      if (tx && tx.textContent !== txv) tx.textContent = txv;
+    }
+  }
 
   // ── neighbours (LLDP/CDP): MAC + platform-as-Type + resolved Manufacturer ──
   // Each row carries a data-oui-mac vendor cell filled lazily after render (deduped/cached).
-  $('#d-nbrs').innerHTML = nbrs.length ? nbrs.map((n,idx)=>
-    '<tr>'
-    + '<td title="'+esc(n.identity||n.address||n.mac||'')+'">'+dash(n.identity||n.address||n.mac)+'</td>'
-    + '<td title="'+esc(n.interface||'')+'">'+dash(n.interface)+'</td>'
-    + '<td title="'+esc(n.mac||'')+'">'+dash(n.mac)+'</td>'
-    + '<td class="nbr-vendor" data-idx="'+idx+'">—</td>'
-    + '<td title="'+esc(n.platform||'')+'">'+dash(n.platform)+'</td>'
-    + '</tr>'
-  ).join('') : '<tr><td colspan="5" class="empty">No neighbours seen.</td></tr>';
-  // Lazily resolve the manufacturer for the rows currently shown (deduped by OUI in lookupVendor).
-  if (nbrs.length){
-    $$('#d-nbrs .nbr-vendor').forEach(cell=>{
-      const n = nbrs[+cell.dataset.idx];
-      if (n && n.mac) fillVendorCell(cell, n.mac); else cell.textContent = '—';
-    });
+  // Neighbours change rarely — rebuild (and re-fire the vendor lookups) only when the set does.
+  const nbrSig = nbrs.map(n=>(n.identity||'')+'|'+(n.mac||'')+'|'+(n.interface||'')+'|'+(n.platform||'')).join(';');
+  if (secChanged('nbrs', nbrSig)){
+    $('#d-nbrs').innerHTML = nbrs.length ? nbrs.map((n,idx)=>
+      '<tr>'
+      + '<td title="'+esc(n.identity||n.address||n.mac||'')+'">'+dash(n.identity||n.address||n.mac)+'</td>'
+      + '<td title="'+esc(n.interface||'')+'">'+dash(n.interface)+'</td>'
+      + '<td title="'+esc(n.mac||'')+'">'+dash(n.mac)+'</td>'
+      + '<td class="nbr-vendor" data-idx="'+idx+'">—</td>'
+      + '<td title="'+esc(n.platform||'')+'">'+dash(n.platform)+'</td>'
+      + '</tr>'
+    ).join('') : '<tr><td colspan="5" class="empty">No neighbours seen.</td></tr>';
+    if (nbrs.length){
+      $$('#d-nbrs .nbr-vendor').forEach(cell=>{
+        const n = nbrs[+cell.dataset.idx];
+        if (n && n.mac) fillVendorCell(cell, n.mac); else cell.textContent = '—';
+      });
+    }
   }
 
   // ── hosts (learned MACs): mac + interface + ip + resolved Manufacturer (no platform/type) ──
-  $('#d-hostcount').textContent = hosts.length ? (hosts.length + ' hosts') : '';
-  $('#d-hosts').innerHTML = hosts.length ? hosts.map((h,idx)=>{
-    const name = h.hostname || h.comment || null;
-    return '<tr>'
-    + '<td title="'+esc(name||h.mac||'')+'">'+(name?('<b style="color:var(--fg)">'+esc(name)+'</b>'):'<span class="muted">unknown</span>')+'</td>'
-    + '<td title="'+esc(h.mac||'')+'">'+dash(h.mac)+'</td>'
-    + '<td title="'+esc(h.interface||'')+'">'+dash(h.interface)+'</td>'
-    + '<td title="'+esc(h.ip||'')+'">'+dash(h.ip)+'</td>'
-    + '<td class="host-vendor" data-idx="'+idx+'">—</td>'
-    + '</tr>';
-  }).join('') : '<tr><td colspan="5" class="empty">No hosts learned.</td></tr>';
-  if (hosts.length){
-    $$('#d-hosts .host-vendor').forEach(cell=>{
-      const h = hosts[+cell.dataset.idx];
-      if (h && h.mac) fillVendorCell(cell, h.mac); else cell.textContent = '—';
-    });
+  // Hosts (can be hundreds of rows) change rarely — rebuild only when the set/identity changes,
+  // so the scrollable table doesn't tear down each poll and vendor lookups don't re-fire.
+  const hostSig = hosts.map(h=>(h.hostname||h.comment||'')+'|'+(h.mac||'')+'|'+(h.interface||'')+'|'+(h.ip||'')).join(';');
+  if (secChanged('hosts', hostSig)){
+    $('#d-hostcount').textContent = hosts.length ? (hosts.length + ' hosts') : '';
+    $('#d-hosts').innerHTML = hosts.length ? hosts.map((h,idx)=>{
+      const name = h.hostname || h.comment || null;
+      return '<tr>'
+      + '<td title="'+esc(name||h.mac||'')+'">'+(name?('<b style="color:var(--fg)">'+esc(name)+'</b>'):'<span class="muted">unknown</span>')+'</td>'
+      + '<td title="'+esc(h.mac||'')+'">'+dash(h.mac)+'</td>'
+      + '<td title="'+esc(h.interface||'')+'">'+dash(h.interface)+'</td>'
+      + '<td title="'+esc(h.ip||'')+'">'+dash(h.ip)+'</td>'
+      + '<td class="host-vendor" data-idx="'+idx+'">—</td>'
+      + '</tr>';
+    }).join('') : '<tr><td colspan="5" class="empty">No hosts learned.</td></tr>';
+    if (hosts.length){
+      $$('#d-hosts .host-vendor').forEach(cell=>{
+        const h = hosts[+cell.dataset.idx];
+        if (h && h.mac) fillVendorCell(cell, h.mac); else cell.textContent = '—';
+      });
+    }
   }
 
   // ── LTE (only when present) ──
@@ -1136,7 +1202,8 @@ function renderDevice(d){
   renderWifi(d);
 
   // ── topology map (LLDP/CDP neighbours around this device) ──
-  renderTopology(dev, nbrs);
+  // Heavy SVG — only redraw when the neighbour set changes (same signature as the table).
+  if (secChanged('topo', nbrSig)) renderTopology(dev, nbrs);
 }
 
 // Map WiFi RSSI (dBm) → 0..4 compact bars + quality tier. WiFi rule of thumb: ≥-60 great,
@@ -1175,51 +1242,70 @@ function renderWifi(d){
       : 'awaiting telemetry';
 
   // ── networks ──
-  $('#d-wifinets').innerHTML = wifi.length ? wifi.map((w,idx)=>{
-    const drv = (w.driver||'').toUpperCase();
-    const chan = w.channel || (w.frequency_mhz!=null ? (w.frequency_mhz+(w.width_mhz!=null?('/'+w.width_mhz):'')+' MHz') : '');
-    const chips = [w.band, chan, w.security, drv, (w.disabled===true?'disabled':null),
-                   (w.clients!=null?(w.clients+' client'+(w.clients===1?'':'s')):null)]
-      .filter(Boolean).map(x=>'<span class="chip">'+esc(x)+'</span>').join('');
-    const hasPsk = w.passphrase!=null && w.passphrase!=='';
-    return '<div class="wifi-net">'
-      + '<div class="ssid">'+dash(w.ssid)+(w.hidden===true?' <span class="hint">(hidden)</span>':'')+'</div>'
-      + '<div class="wmeta">'+(chips||'<span class="muted">—</span>')+'</div>'
-      + '<div class="psk"><span class="lab">PSK</span>'
-      +   '<span class="val" data-psk="'+esc(w.passphrase||'')+'">'+(hasPsk?'••••••••':'—')+'</span>'
-      +   (hasPsk?'<button class="ghost psk-toggle">Reveal</button><button class="ghost psk-copy">Copy</button>':'')
-      + '</div></div>';
-  }).join('') : '<div class="empty">No WiFi telemetry yet — this device has no WLANs, or the agent hasn\'t reported WiFi on this build.</div>';
+  // Rebuild ONLY when the WiFi config changes (SSID/PSK/channel/security) — NOT on client
+  // churn or every tick. Critical: rebuilding here would wipe a user's PSK "Reveal" state.
+  const netSig = wifi.map(w=>(w.ssid||'')+'|'+(w.passphrase||'')+'|'+(w.channel||'')+'|'+(w.frequency_mhz||'')+'|'+(w.security||'')+'|'+(w.disabled?'1':'0')+'|'+(w.hidden?'1':'0')).join(';');
+  if (secChanged('wifinets', netSig)){
+    $('#d-wifinets').innerHTML = wifi.length ? wifi.map((w,idx)=>{
+      const drv = (w.driver||'').toUpperCase();
+      const chan = w.channel || (w.frequency_mhz!=null ? (w.frequency_mhz+(w.width_mhz!=null?('/'+w.width_mhz):'')+' MHz') : '');
+      const chips = [w.band, chan, w.security, drv, (w.disabled===true?'disabled':null),
+                     (w.clients!=null?(w.clients+' client'+(w.clients===1?'':'s')):null)]
+        .filter(Boolean).map(x=>'<span class="chip">'+esc(x)+'</span>').join('');
+      const hasPsk = w.passphrase!=null && w.passphrase!=='';
+      return '<div class="wifi-net">'
+        + '<div class="ssid">'+dash(w.ssid)+(w.hidden===true?' <span class="hint">(hidden)</span>':'')+'</div>'
+        + '<div class="wmeta">'+(chips||'<span class="muted">—</span>')+'</div>'
+        + '<div class="psk"><span class="lab">PSK</span>'
+        +   '<span class="val" data-psk="'+esc(w.passphrase||'')+'">'+(hasPsk?'••••••••':'—')+'</span>'
+        +   (hasPsk?'<button class="ghost psk-toggle">Reveal</button><button class="ghost psk-copy">Copy</button>':'')
+        + '</div></div>';
+    }).join('') : '<div class="empty">No WiFi telemetry yet — this device has no WLANs, or the agent hasn\'t reported WiFi on this build.</div>';
 
-  // reveal / copy (PSK stays in the DOM data-attr; revealed only on click)
-  $$('#d-wifinets .psk-toggle').forEach(b => b.onclick = () => {
-    const val = b.parentElement.querySelector('.val');
-    if (b.textContent === 'Reveal'){ val.textContent = val.dataset.psk||''; b.textContent='Hide'; }
-    else { val.textContent='••••••••'; b.textContent='Reveal'; }
-  });
-  $$('#d-wifinets .psk-copy').forEach(b => b.onclick = () => {
-    const psk = b.parentElement.querySelector('.val').dataset.psk||'';
-    navigator.clipboard.writeText(psk).then(()=>{ b.textContent='Copied'; setTimeout(()=>b.textContent='Copy',1200); });
-  });
+    // reveal / copy (PSK stays in the DOM data-attr; revealed only on click)
+    $$('#d-wifinets .psk-toggle').forEach(b => b.onclick = () => {
+      const val = b.parentElement.querySelector('.val');
+      if (b.textContent === 'Reveal'){ val.textContent = val.dataset.psk||''; b.textContent='Hide'; }
+      else { val.textContent='••••••••'; b.textContent='Reveal'; }
+    });
+    $$('#d-wifinets .psk-copy').forEach(b => b.onclick = () => {
+      const psk = b.parentElement.querySelector('.val').dataset.psk||'';
+      navigator.clipboard.writeText(psk).then(()=>{ b.textContent='Copied'; setTimeout(()=>b.textContent='Copy',1200); });
+    });
+  }
 
   // ── clients (with signal bars) ──
+  // Rebuild rows (and re-fire vendor lookups) only when the ROSTER changes; signal moves every
+  // tick, so its cell is updated in place — avoids re-flashing the lazy vendor cells each poll.
   const ssidByIf = {};
   wifi.forEach(w => { if (w.interface) ssidByIf[w.interface] = w.ssid || w.interface; });
-  $('#d-wifclients').innerHTML = clients.length ? clients.map((c,idx)=>
-    '<tr>'
-    + '<td title="'+esc(c.interface||'')+'">'+dash(ssidByIf[c.interface]||c.interface)+'</td>'
-    + '<td title="'+esc(c.mac||'')+'">'+dash(c.mac)+'</td>'
-    + '<td class="wcli-vendor" data-idx="'+idx+'">—</td>'
-    + '<td>'+dash(c.rx_rate)+'</td>'
-    + '<td>'+dash(c.tx_rate)+'</td>'
-    + '<td>'+wifiBars(c.signal!=null?+c.signal:null)+(c.signal!=null?' <span class="hint">'+esc(c.signal)+' dBm</span>':'')+'</td>'
-    + '</tr>'
-  ).join('') : '<tr><td colspan="6" class="empty">No clients connected.</td></tr>';
-  if (clients.length){
-    $$('#d-wifclients .wcli-vendor').forEach(cell=>{
-      const c = clients[+cell.dataset.idx];
-      if (c && c.mac) fillVendorCell(cell, c.mac); else cell.textContent = '—';
-    });
+  const cliBody = $('#d-wifclients');
+  const cliSig = clients.map(c=>(c.interface||'')+'/'+(c.mac||'')+'|'+(c.rx_rate||'')+'|'+(c.tx_rate||'')).join(';');
+  const sigCell = c => wifiBars(c.signal!=null?+c.signal:null)+(c.signal!=null?' <span class="hint">'+esc(c.signal)+' dBm</span>':'');
+  if (secChanged('wificlients', cliSig)){
+    cliBody.innerHTML = clients.length ? clients.map((c,idx)=>
+      '<tr data-cm="'+esc((c.interface||'')+'/'+(c.mac||''))+'">'
+      + '<td title="'+esc(c.interface||'')+'">'+dash(ssidByIf[c.interface]||c.interface)+'</td>'
+      + '<td title="'+esc(c.mac||'')+'">'+dash(c.mac)+'</td>'
+      + '<td class="wcli-vendor" data-idx="'+idx+'">—</td>'
+      + '<td>'+dash(c.rx_rate)+'</td>'
+      + '<td>'+dash(c.tx_rate)+'</td>'
+      + '<td class="wsig">'+sigCell(c)+'</td>'
+      + '</tr>'
+    ).join('') : '<tr><td colspan="6" class="empty">No clients connected.</td></tr>';
+    if (clients.length){
+      $$('#d-wifclients .wcli-vendor').forEach(cell=>{
+        const c = clients[+cell.dataset.idx];
+        if (c && c.mac) fillVendorCell(cell, c.mac); else cell.textContent = '—';
+      });
+    }
+  } else {
+    for (const c of clients){
+      const row = cliBody.querySelector('tr[data-cm="'+((c.interface||'')+'/'+(c.mac||'')).replace(/"/g,'\\"')+'"]');
+      if (!row) continue;
+      const cell = row.querySelector('.wsig');
+      if (cell){ const html = sigCell(c); if (cell.innerHTML !== html) cell.innerHTML = html; }
+    }
   }
 }
 
@@ -1276,14 +1362,18 @@ function renderTopology(dev, nbrs){
 }
 
 async function refreshHistory(){
-  if (!curSerial || !tok()) return;
-  let h;
+  if (!curSerial || !tok() || _busy.hist) return;  // skip overlapping polls (slow VM)
+  _busy.hist = true;
   try{
     const r = await fetch('/devices/'+encodeURIComponent(curSerial)+'/history?window='+encodeURIComponent(curWindow), { headers:authHeaders() });
     if (!r.ok) return;
-    h = await r.json();
-  }catch(e){ return; }
-  renderHistory(h);
+    const h = await r.json();
+    // Only redraw the (SVG) charts when the series actually changed — a no-op tick shouldn't
+    // rebuild the chart DOM. Keyed by serial+window so switching either always redraws.
+    const sig = curSerial + '|' + curWindow + '|' + JSON.stringify(h);
+    if (secChanged('history', sig)) renderHistory(h);
+  }catch(e){ /* next tick retries */ }
+  finally{ _busy.hist = false; }
 }
 
 // Availability strip: bucket the window into N segments and colour each by whether ANY
