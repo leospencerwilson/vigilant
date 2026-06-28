@@ -25,3 +25,6 @@ Thumbs.db
 # Logs / scratch
 *.log
 /tmp/
+
+# Generated OUI database (built at image build via `npm run build:oui`; ~1MB, not source).
+src/shared/oui-db.json

@@ -16,6 +16,11 @@ RUN npm ci --omit=dev
 # Now the application source. .dockerignore keeps node_modules / .env / .git out.
 COPY . .
 
+# Build the offline OUI database (full IEEE registry) so MAC→vendor resolves without the
+# rate-limited public API. Best-effort: if IEEE is unreachable at build time, the ingest
+# falls back to the small hand-curated seed (oui.js tolerates a missing oui-db.json).
+RUN npm run build:oui || echo "build-oui: skipped (no network at build) — using seed fallback"
+
 # Drop privileges. The 'node' user exists in the official image.
 USER node
 

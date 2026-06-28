@@ -137,11 +137,17 @@ CREATE TABLE IF NOT EXISTS mac_hosts (
     interface    text        NOT NULL,            -- physical port the MAC was learned on
     mac          macaddr     NOT NULL,
     ip           inet,                            -- from ARP, where known
+    hostname     text,                            -- DHCP lease host-name — the real device identity
+    comment      text,                            -- DHCP lease comment (operator label), where set
     vendor       text,                            -- OUI lookup (ingest-side), optional
     last_seen_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (device_id, interface, mac)
 );
 CREATE INDEX IF NOT EXISTS mac_hosts_device_idx ON mac_hosts (device_id);
+-- Existing deployments: add the identity columns idempotently (CREATE TABLE above is a no-op
+-- once the table exists, so new columns need an explicit ALTER).
+ALTER TABLE mac_hosts ADD COLUMN IF NOT EXISTS hostname text;
+ALTER TABLE mac_hosts ADD COLUMN IF NOT EXISTS comment  text;
 
 -- ─────────────────────────── lte_state (SIM + cell + signal) ──────────────
 -- One row per (device, lte interface), UPSERTed. Identifiers (iccid/imsi/imei/

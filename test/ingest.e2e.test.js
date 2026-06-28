@@ -138,8 +138,8 @@ test("POST /telemetry twice: bps derived, neighbors + mac_hosts stored, response
         { interface: "ether3", identity: "phone-1", mac: "AA:BB:CC:DD:EE:01",
           address: "10.0.0.5", platform: "Yealink" },
       ],
-      // slow tick: now mac_hosts present -> must be stored
-      mac_hosts: [{ mac: "AA:BB:CC:DD:EE:02", interface: "ether4" }],
+      // slow tick: now mac_hosts present -> must be stored (with DHCP host-name identity)
+      mac_hosts: [{ mac: "AA:BB:CC:DD:EE:02", interface: "ether4", hostname: "RECEPTION-PC" }],
       arp: [{ mac: "AA:BB:CC:DD:EE:02", ip: "10.0.0.9" }],
     });
 
@@ -172,6 +172,7 @@ test("POST /telemetry twice: bps derived, neighbors + mac_hosts stored, response
     const mh = detail.mac_hosts.find((m) => transform.normaliseMac(m.mac) === "AA:BB:CC:DD:EE:02");
     assert.ok(mh, "the provided mac_host is present");
     assert.equal(mh.interface, "ether4");
+    assert.equal(mh.hostname, "RECEPTION-PC", "DHCP host-name stored as device identity");
 
     // LTE: the full lte_state row is stored AND the single-number lte_signal is promoted
     // onto the bounded device_state row for the overview grid (regression: it used to be

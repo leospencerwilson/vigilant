@@ -337,6 +337,20 @@
             } on-error={}
         }
     } on-error={}
+    # Build a mac->host-name lookup from the DHCP leases. This is the BEST device identity we
+    # have (e.g. "Galaxy-S21", "RECEPTION-PC", "HP-LaserJet") — far better than an OUI vendor
+    # guess. host-names are DNS labels (no ';'), so they're tuple-safe; JSON-cleaned on send.
+    :local dhcpHost [:toarray ""]
+    :do {
+        :foreach l in=[/ip dhcp-server lease find] do={
+            :do {
+                :local lm [/ip dhcp-server lease get $l mac-address]
+                :local lh ""
+                :do { :set lh [/ip dhcp-server lease get $l host-name] } on-error={}
+                :if (([:len $lm] > 0) && ([:len $lh] > 0)) do={ :set ($dhcpHost->$lm) $lh }
+            } on-error={}
+        }
+    } on-error={}
     :do {
         :foreach h in=[/interface bridge host find local=no] do={
             :do {
@@ -344,9 +358,11 @@
                 :local hi [/interface bridge host get $h interface]
                 :local hip ($arpIp->$hm)
                 :if ([:typeof $hip] = "nothing") do={ :set hip "" }
-                # Store the three fields as a ";"-delimited tuple; the send loop splits it
-                # back into the mac_hosts object and the matching arp object.
-                :set hostArr ($hostArr , ($hm . ";" . $hi . ";" . $hip))
+                :local hh ($dhcpHost->$hm)
+                :if ([:typeof $hh] = "nothing") do={ :set hh "" }
+                # Store the fields as a ";"-delimited tuple; the send loop splits it back into
+                # the mac_hosts object (mac;interface;ip;host-name) and the matching arp object.
+                :set hostArr ($hostArr , ($hm . ";" . $hi . ";" . $hip . ";" . $hh))
             } on-error={}
         }
     } on-error={}
@@ -587,14 +603,21 @@
         :local asep ""
         :while (($j < $hBatch) && (($hI + $j) < $hN)) do={
             :local tuple ($hostArr->($hI + $j))
-            # Split "mac;interface;ip" back into fields.
+            # Split "mac;interface;ip;host-name" back into fields.
             :local p1 [:find $tuple ";"]
             :local hm [:pick $tuple 0 $p1]
             :local rest [:pick $tuple ($p1 + 1) [:len $tuple]]
             :local p2 [:find $rest ";"]
             :local hi [:pick $rest 0 $p2]
-            :local hip [:pick $rest ($p2 + 1) [:len $rest]]
-            :set hosts ($hosts . $hsep . "{\"mac\":\"" . $hm . "\",\"interface\":\"" . $hi . "\"}")
+            :local rest2 [:pick $rest ($p2 + 1) [:len $rest]]
+            :local p3 [:find $rest2 ";"]
+            :local hip [:pick $rest2 0 $p3]
+            :local hh [:pick $rest2 ($p3 + 1) [:len $rest2]]
+            # host-name is free text — JSON-clean it before interpolating.
+            :local hostObj ("{\"mac\":\"" . $hm . "\",\"interface\":\"" . $hi . "\"")
+            :if ([:len $hh] > 0) do={ :set hostObj ($hostObj . ",\"hostname\":\"" . [$vigilantClean $hh] . "\"") }
+            :set hostObj ($hostObj . "}")
+            :set hosts ($hosts . $hsep . $hostObj)
             :set hsep ","
             :if ([:len $hip] > 0) do={
                 :set arps ($arps . $asep . "{\"mac\":\"" . $hm . "\",\"ip\":\"" . $hip . "\"}")

@@ -205,6 +205,9 @@ function joinMacHosts(macHosts, arp) {
       mac: m,
       interface: h.interface != null ? h.interface : null,
       ip: ipByMac.has(m) ? ipByMac.get(m) : null,
+      // DHCP-derived identity (carried through from the host object when the agent attaches it).
+      hostname: h.hostname != null ? h.hostname : null,
+      comment: h.comment != null ? h.comment : null,
     });
   }
   return out;

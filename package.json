@@ -13,6 +13,7 @@
     "migrate": "node src/bin/migrate.js",
     "enroll": "node src/bin/enroll.js",
     "simulate": "node src/bin/simulate.js",
+    "build:oui": "node src/bin/build-oui.js",
     "test": "node --test"
   },
   "dependencies": {

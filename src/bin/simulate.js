@@ -115,8 +115,8 @@ function makeTelemetry(opts) {
     ? o.mac_hosts
     : isSlow
       ? [
-          { mac: 'AA:BB:CC:00:00:01', interface: 'ether2' },
-          { mac: 'AA:BB:CC:00:00:02', interface: 'ether3' },
+          { mac: 'AA:BB:CC:00:00:01', interface: 'ether2', hostname: 'RECEPTION-PC' },
+          { mac: 'AA:BB:CC:00:00:02', interface: 'ether3', hostname: 'HP-LaserJet-Pro' },
         ]
       : null;
   const arp = 'arp' in o

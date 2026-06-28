@@ -426,13 +426,15 @@ function makePgStore(poolOrConfig) {
       for (const r of list) {
         if (!r || !r.interface || !r.mac) continue;
         await client.query(
-          `INSERT INTO mac_hosts (device_id, interface, mac, ip, vendor, last_seen_at)
-           VALUES ($1,$2,$3,$4,$5, now())
+          `INSERT INTO mac_hosts (device_id, interface, mac, ip, hostname, comment, vendor, last_seen_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7, now())
            ON CONFLICT (device_id, interface, mac) DO UPDATE SET
              ip           = EXCLUDED.ip,
+             hostname     = COALESCE(EXCLUDED.hostname, mac_hosts.hostname),
+             comment      = COALESCE(EXCLUDED.comment,  mac_hosts.comment),
              vendor       = COALESCE(EXCLUDED.vendor, mac_hosts.vendor),
              last_seen_at = now()`,
-          [deviceId, r.interface, r.mac, nz(r.ip), nz(r.vendor)]
+          [deviceId, r.interface, r.mac, nz(r.ip), nz(r.hostname), nz(r.comment), nz(r.vendor)]
         );
       }
     });

@@ -440,12 +440,12 @@
     </div>
 
     <div class="card" style="margin-top:18px">
-      <div class="between"><h2>Hosts <span class="hint">(learned MACs)</span></h2><span class="hint" id="d-hostcount"></span></div>
+      <div class="between"><h2>Hosts <span class="hint">(DHCP name · learned MACs)</span></h2><span class="hint" id="d-hostcount"></span></div>
       <div class="scroll">
         <table class="fixed">
-          <colgroup><col style="width:26%"><col style="width:18%"><col style="width:24%"><col style="width:32%"></colgroup>
-          <thead><tr><th>MAC</th><th>Interface</th><th>IP</th><th>Manufacturer</th></tr></thead>
-          <tbody id="d-hosts"><tr><td colspan="4" class="empty">No hosts learned.</td></tr></tbody>
+          <colgroup><col style="width:26%"><col style="width:20%"><col style="width:13%"><col style="width:19%"><col style="width:22%"></colgroup>
+          <thead><tr><th>Device</th><th>MAC</th><th>Interface</th><th>IP</th><th>Manufacturer</th></tr></thead>
+          <tbody id="d-hosts"><tr><td colspan="5" class="empty">No hosts learned.</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -1071,14 +1071,16 @@ function renderDevice(d){
 
   // ── hosts (learned MACs): mac + interface + ip + resolved Manufacturer (no platform/type) ──
   $('#d-hostcount').textContent = hosts.length ? (hosts.length + ' hosts') : '';
-  $('#d-hosts').innerHTML = hosts.length ? hosts.map((h,idx)=>
-    '<tr>'
+  $('#d-hosts').innerHTML = hosts.length ? hosts.map((h,idx)=>{
+    const name = h.hostname || h.comment || null;
+    return '<tr>'
+    + '<td title="'+esc(name||h.mac||'')+'">'+(name?('<b style="color:var(--fg)">'+esc(name)+'</b>'):'<span class="muted">unknown</span>')+'</td>'
     + '<td title="'+esc(h.mac||'')+'">'+dash(h.mac)+'</td>'
     + '<td title="'+esc(h.interface||'')+'">'+dash(h.interface)+'</td>'
     + '<td title="'+esc(h.ip||'')+'">'+dash(h.ip)+'</td>'
     + '<td class="host-vendor" data-idx="'+idx+'">—</td>'
-    + '</tr>'
-  ).join('') : '<tr><td colspan="4" class="empty">No hosts learned.</td></tr>';
+    + '</tr>';
+  }).join('') : '<tr><td colspan="5" class="empty">No hosts learned.</td></tr>';
   if (hosts.length){
     $$('#d-hosts .host-vendor').forEach(cell=>{
       const h = hosts[+cell.dataset.idx];

@@ -219,6 +219,8 @@ async function telemetryIngest(ctx) {
       interface: h.interface,
       mac: h.mac,
       ip: h.ip,
+      hostname: h.hostname,   // DHCP host-name — the real device identity
+      comment: h.comment,     // operator-labelled DHCP lease comment, if any
       vendor: oui.ouiVendor(h.mac),
     }));
   }

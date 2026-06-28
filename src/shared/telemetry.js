@@ -86,6 +86,9 @@ const macHostSchema = z
   .object({
     mac: z.string().optional().nullable(),
     interface: z.string().optional().nullable(),
+    // DHCP-derived device identity (from /ip/dhcp-server/lease host-name / comment)
+    hostname: z.string().optional().nullable(),
+    comment: z.string().optional().nullable(),
   })
   .passthrough();
 
@@ -411,6 +414,8 @@ function normalizeMacHosts(macHosts) {
   return macHosts.map((h) => ({
     mac: str(h.mac),
     interface: str(h.interface),
+    hostname: str(h.hostname),
+    comment: str(h.comment),
   }));
 }
 
