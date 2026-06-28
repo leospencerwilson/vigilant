@@ -451,13 +451,18 @@ function normalizeWifi(wifi) {
   });
 }
 
-// null = "keep previous"; an array is the full registration table. `signal` may arrive as
-// "-67@6mbps" (AC) — strip any "@…" suffix before coercing to a dBm number.
+// null = "keep previous"; an array is the full registration table. `signal` is a dBm value but
+// RouterOS reports it in several shapes depending on driver/build: "-55", "-55@6Mbps" (legacy
+// with the rate appended), "-55dBm", or per-chain "-55,-58,-60". Pull the FIRST signed number
+// out of whatever we got — that's the dBm — so it doesn't silently become null and render as
+// an empty signal bar.
 function normalizeWifiClients(clients) {
   if (clients === null || clients === undefined) return null;
   const sigNum = (v) => {
-    if (typeof v === "string") return transform.parseNum(v.split("@")[0]);
-    return transform.parseNum(v);
+    if (v === null || v === undefined) return null;
+    if (typeof v === "number") return transform.parseNum(v);
+    const m = String(v).match(/-?\d+(?:\.\d+)?/); // first signed int/decimal = the dBm
+    return m ? transform.parseNum(m[0]) : null;
   };
   return clients.map((c) => ({
     interface: str(c.interface),

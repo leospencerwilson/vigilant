@@ -58,7 +58,10 @@ async function main() {
     process.exit(1);
   }
   process.stdout.write(`build-oui: fetching ${SOURCE} …\n`);
-  const res = await fetch(SOURCE);
+  // IEEE returns 403 to requests without a browser-ish User-Agent — set one explicitly.
+  const res = await fetch(SOURCE, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (vigilant-oui-build)', 'Accept': 'text/csv,*/*' },
+  });
   if (!res.ok) {
     console.error(`build-oui: fetch failed (HTTP ${res.status})`);
     process.exit(1);

@@ -167,19 +167,25 @@ async function resolveVendor(mac) {
     return { mac: ouiFull(mac, key), oui: key, vendor: c.vendor, source: 'cache' };
   }
 
-  // (3) external API — prefix only. Any failure -> null + cache the miss + source 'none'.
-  const vendor = await fetchVendor(key);
-  _cache.set(key, { vendor, source: 'api', at: Date.now() });
-  return { mac: ouiFull(mac, key), oui: key, vendor, source: vendor === null ? 'none' : 'api' };
+  // (3) external API — prefix only. Cache DEFINITIVE outcomes (a hit, or a genuine 404
+  // not-found) so we never re-hit a rate-limited API for them; do NOT cache TRANSIENT failures
+  // (429/5xx/timeout/offline) so a throttled prefix self-heals on the next render instead of
+  // being stuck blank forever. (This was the partial/inconsistent manufacturer resolution.)
+  const r = await fetchVendor(key);
+  if (!r.transient) _cache.set(key, { vendor: r.vendor, source: 'api', at: Date.now() });
+  return { mac: ouiFull(mac, key), oui: key, vendor: r.vendor, source: r.vendor === null ? 'none' : 'api' };
 }
 
 /**
- * Fetch a vendor for an OUI prefix from the external API. Returns the trimmed vendor string
- * on a 2xx with a non-empty body, or null on ANY error/timeout/404/non-2xx/empty body.
- * NEVER throws. Sends ONLY the prefix.
+ * Fetch a vendor for an OUI prefix from the external API. Returns { vendor, transient }:
+ *   * { vendor:'Acme', transient:false }  — a hit (cache it)
+ *   * { vendor:null,  transient:false }   — a genuine 404 not-found (cache the miss)
+ *   * { vendor:null,  transient:true }    — 429 / 5xx / timeout / offline / no-fetch (DON'T
+ *                                           cache — retry on the next render)
+ * NEVER throws. Sends ONLY the 3-octet prefix.
  */
 async function fetchVendor(prefix) {
-  if (typeof fetch !== 'function') return null; // no global fetch (shouldn't happen on Node 20+)
+  if (typeof fetch !== 'function') return { vendor: null, transient: true };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), OUI_API_TIMEOUT_MS);
   try {
@@ -187,12 +193,14 @@ async function fetchVendor(prefix) {
       signal: controller.signal,
       headers: { accept: 'text/plain' },
     });
-    if (!res || !res.ok) return null; // 404 (unknown OUI) and any non-2xx -> miss
+    if (res && res.status === 404) return { vendor: null, transient: false }; // real not-found → cache
+    if (!res || !res.ok) return { vendor: null, transient: true };            // 429/5xx/etc → retry later
     const body = await res.text();
     const vendor = typeof body === 'string' ? body.trim() : '';
-    return vendor === '' ? null : vendor;
+    // Empty 2xx body is ambiguous — treat as transient so we don't cache a blank.
+    return { vendor: vendor === '' ? null : vendor, transient: vendor === '' };
   } catch (e) {
-    return null; // timeout / abort / network / DNS / offline — all fail safe to null
+    return { vendor: null, transient: true }; // timeout / abort / network / DNS / offline
   } finally {
     clearTimeout(timer);
   }
