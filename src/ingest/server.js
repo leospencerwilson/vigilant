@@ -312,7 +312,26 @@ function createServer({ store, config: cfg }) {
 
 // ── entrypoint ───────────────────────────────────────────────────────
 
+// Process-level safety net. The per-request dispatch in createServer() is wrapped in
+// try/catch, but an error thrown from an ASYNC continuation that escapes that scope (an
+// unawaited store promise, a stream 'finish'/'end' callback) surfaces as an
+// unhandledRejection/uncaughtException — which, on Node ≥15, terminates the process. A
+// single malformed request (observed: a bad job_id → "invalid input syntax for type uuid")
+// must NEVER take the ingest down for the whole estate. Log loudly and keep serving; the
+// source-level guards (isUuid, etc.) are the primary fix — this is defence in depth.
+function installProcessGuards() {
+  process.on('unhandledRejection', (reason) => {
+    log.error('ingest: unhandledRejection (kept alive)', {
+      msg: reason && reason.message ? reason.message : String(reason),
+    });
+  });
+  process.on('uncaughtException', (err) => {
+    log.error('ingest: uncaughtException (kept alive)', { msg: err && err.message ? err.message : String(err) });
+  });
+}
+
 async function startServer() {
+  installProcessGuards();
   // Fail loud if a pg store is configured without a connection string (deferred from
   // config load so that merely requiring this module never crashes mem/test processes).
   if (typeof config.assertUsable === 'function') config.assertUsable();

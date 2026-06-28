@@ -438,6 +438,57 @@ function makePgStore(poolOrConfig) {
     });
   }
 
+  // WiFi config (SSIDs/channels) — FULL-SNAPSHOT replace: clear the device's WLANs then insert
+  // the reported set, so a removed/renamed SSID disappears. Only called when payload.wifi !== null.
+  async function upsertWifiNetworks(deviceId, rowsIn) {
+    const list = Array.isArray(rowsIn) ? rowsIn : [];
+    await tx(async (client) => {
+      await client.query(`DELETE FROM wifi_networks WHERE device_id = $1`, [deviceId]);
+      for (const r of list) {
+        if (!r || !r.interface) continue;
+        await client.query(
+          `INSERT INTO wifi_networks
+             (device_id, interface, driver, band, ssid, passphrase, security,
+              channel, frequency_mhz, width_mhz, disabled, hidden, clients, last_seen_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, now())`,
+          [
+            deviceId,
+            r.interface,
+            nz(r.driver),
+            nz(r.band),
+            nz(r.ssid),
+            nz(r.passphrase),
+            nz(r.security),
+            nz(r.channel),
+            nz(r.frequency_mhz),
+            nz(r.width_mhz),
+            nb(r.disabled),
+            nb(r.hidden),
+            nz(r.clients),
+          ]
+        );
+      }
+    });
+  }
+
+  // Associated WiFi stations — FULL-SNAPSHOT replace of the registration table for the device.
+  // Only called when payload.wifi_clients !== null.
+  async function upsertWirelessClients(deviceId, rowsIn) {
+    const list = Array.isArray(rowsIn) ? rowsIn : [];
+    await tx(async (client) => {
+      await client.query(`DELETE FROM wireless_clients WHERE device_id = $1`, [deviceId]);
+      for (const r of list) {
+        if (!r || !r.interface || !r.mac) continue;
+        await client.query(
+          `INSERT INTO wireless_clients
+             (device_id, interface, mac, signal, tx_ccq, rx_rate, tx_rate, uptime_s, sampled_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())`,
+          [deviceId, r.interface, r.mac, nz(r.signal), nz(r.tx_ccq), nz(r.rx_rate), nz(r.tx_rate), nz(r.uptime_s)]
+        );
+      }
+    });
+  }
+
   // ── history appends ──────────────────────────────────────────────────────
   async function appendMetricsHistory(deviceId, ts, row) {
     const r = row || {};
@@ -529,6 +580,7 @@ function makePgStore(poolOrConfig) {
   // device can retry the fetch within its confirm window. NEVER draft/cancelled/applied/
   // rolled_back/failed.
   async function getConfigJobForFetch(jobId, deviceId) {
+    if (!isUuid(jobId)) return null;
     return one(
       `SELECT j.rsc_text, j.rsc_sha256
          FROM config_jobs j
@@ -695,6 +747,7 @@ function makePgStore(poolOrConfig) {
   }
 
   async function getConfigJob(jobId) {
+    if (!isUuid(jobId)) return null;
     return one(`SELECT * FROM config_jobs WHERE id = $1`, [jobId]);
   }
 
@@ -755,6 +808,7 @@ function makePgStore(poolOrConfig) {
   }
 
   async function getSpeedtestJob(jobId) {
+    if (!isUuid(jobId)) return null;
     return one(`SELECT * FROM speedtest_jobs WHERE id = $1`, [jobId]);
   }
 
@@ -801,14 +855,30 @@ function makePgStore(poolOrConfig) {
     const device = await getDeviceBySerial(serial);
     if (!device) return null;
     const id = device.id;
-    const [state, interfaces, lte, neighbors, macHosts] = await Promise.all([
+    const [state, interfaces, lte, neighbors, macHosts, wifi, wifiClients] = await Promise.all([
       one(`SELECT * FROM device_state WHERE device_id = $1`, [id]),
       rows(`SELECT * FROM interface_state WHERE device_id = $1 ORDER BY name`, [id]),
       one(`SELECT * FROM lte_state WHERE device_id = $1 ORDER BY interface LIMIT 1`, [id]),
       rows(`SELECT * FROM neighbors WHERE device_id = $1 ORDER BY interface, mac`, [id]),
       rows(`SELECT * FROM mac_hosts WHERE device_id = $1 ORDER BY interface, mac`, [id]),
+      rows(`SELECT * FROM wifi_networks WHERE device_id = $1 ORDER BY interface`, [id]),
+      rows(`SELECT * FROM wireless_clients WHERE device_id = $1 ORDER BY interface, signal DESC NULLS LAST`, [id]),
     ]);
-    return { device, state, interfaces, lte, neighbors, mac_hosts: macHosts };
+    // Denormalise the live connected-station count onto each WLAN row (by interface).
+    const wifiWithCounts = (wifi || []).map((w) => ({
+      ...w,
+      clients: (wifiClients || []).filter((c) => c.interface === w.interface).length,
+    }));
+    return {
+      device,
+      state,
+      interfaces,
+      lte,
+      neighbors,
+      mac_hosts: macHosts,
+      wifi: wifiWithCounts,
+      wifi_clients: wifiClients || [],
+    };
   }
 
   // ── history read APIs (dashboard charts) ─────────────────────────────────────
@@ -1131,6 +1201,8 @@ function makePgStore(poolOrConfig) {
     upsertLteState,
     upsertNeighbors,
     upsertMacHosts,
+    upsertWifiNetworks,
+    upsertWirelessClients,
     appendMetricsHistory,
     appendInterfaceHistory,
     appendLteHistory,
@@ -1193,6 +1265,18 @@ function resolvePool(poolOrConfig) {
 // Coerce undefined -> null so parameterised queries get a clean SQL NULL.
 function nz(v) {
   return v === undefined ? null : v;
+}
+
+// RFC-4122 UUID shape. Guard BEFORE binding an externally-supplied id to a `uuid` column:
+// Postgres throws "invalid input syntax for type uuid" on a malformed value, and a device/
+// agent that POSTs a bad job_id (observed: job_id="t" from a /speedtest/result) previously
+// rejected unhandled and crash-looped the whole ingest. Callers treat a non-UUID as "not
+// found" (return null), so the handler 404s instead of the query throwing.
+function isUuid(v) {
+  return (
+    typeof v === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)
+  );
 }
 
 // Coerce to boolean or null (never undefined) for nullable boolean columns.

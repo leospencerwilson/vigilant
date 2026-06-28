@@ -216,6 +216,37 @@ CREATE TABLE IF NOT EXISTS interface_history (
 CREATE INDEX IF NOT EXISTS interface_history_ts_idx ON interface_history (ts);
 
 -- ─────────────────────────── wireless (Yealink / Wi-Fi work) ──────────────
+-- WiFi RADIOS / SSIDs configured on the device. One row per WLAN interface. Populated from
+-- the agent's slow tick. Works for BOTH driver stacks on the Chateau estate:
+--   * AC  → legacy `wireless` package  (/interface/wireless + /interface/wireless/security-profiles)
+--   * AX  → wifiwave2 `wifi` package    (/interface/wifi   + /interface/wifi/security)
+-- `driver` records which stack the row came from. Full snapshot semantics: each report
+-- REPLACES the device's WLAN set, so a removed/renamed SSID disappears.
+-- ⚠️ `passphrase` is the plaintext PSK — sensitive. It is served only on the admin-gated
+-- device-detail API and masked-by-default in the UI (revealed on an explicit click). Never log it.
+CREATE TABLE IF NOT EXISTS wifi_networks (
+    device_id    uuid        NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    interface    text        NOT NULL,
+    driver       text,                           -- 'ac' | 'ax'
+    band         text,                           -- '2ghz' | '5ghz' | free-form from ROS
+    ssid         text,
+    passphrase   text,                           -- ⚠️ plaintext PSK (WPA2/WPA3 pre-shared key)
+    security     text,                           -- 'wpa2-psk' | 'wpa3' | 'open' | profile name
+    channel      text,                           -- operating channel string, e.g. '5180/20/ac'
+    frequency_mhz int,                           -- centre frequency in MHz
+    width_mhz    int,                            -- channel width in MHz
+    disabled     boolean,
+    hidden       boolean,                         -- SSID hidden / not broadcast
+    clients      int,                             -- connected-station count (denormalised for the grid)
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (device_id, interface)
+);
+CREATE INDEX IF NOT EXISTS wifi_networks_device_idx ON wifi_networks (device_id);
+
+-- Currently-ASSOCIATED WiFi stations (the registration table), with signal for the UI bars.
+-- AC  → /interface/wireless/registration-table   AX → /interface/wifi/registration-table.
+-- Full snapshot semantics: each report REPLACES the device's client set, so a station that
+-- has roamed/left disappears immediately (no stale TTL needed).
 CREATE TABLE IF NOT EXISTS wireless_clients (
     device_id   uuid        NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     interface   text        NOT NULL,
@@ -228,6 +259,7 @@ CREATE TABLE IF NOT EXISTS wireless_clients (
     sampled_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (device_id, interface, mac)
 );
+CREATE INDEX IF NOT EXISTS wireless_clients_device_idx ON wireless_clients (device_id);
 
 -- ─────────────────────────── alerts ───────────────────────────
 CREATE TABLE IF NOT EXISTS alert_rules (
@@ -361,7 +393,7 @@ DO $$
 DECLARE t text;
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
-    FOREACH t IN ARRAY ARRAY['device_state','interface_state','lte_state','neighbors','config_jobs','alerts'] LOOP
+    FOREACH t IN ARRAY ARRAY['device_state','interface_state','lte_state','neighbors','config_jobs','alerts','wifi_networks','wireless_clients'] LOOP
       -- Per-table sub-block so one failure (already a member, or no privilege to alter
       -- the publication) never aborts the others or the outer transaction.
       BEGIN

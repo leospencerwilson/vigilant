@@ -106,6 +106,39 @@ const arpSchema = z
   })
   .passthrough();
 
+// One configured WiFi radio / SSID. Works for both driver stacks (AC `wireless`, AX
+// `wifi`); `driver` says which. `passphrase` is the plaintext PSK (sensitive). Numeric
+// channel fields arrive as strings and are coerced in normalize().
+const wifiSchema = z
+  .object({
+    interface: z.string().optional().nullable(),
+    driver: z.string().optional().nullable(),
+    band: z.string().optional().nullable(),
+    ssid: z.string().optional().nullable(),
+    passphrase: z.string().optional().nullable(),
+    security: z.string().optional().nullable(),
+    channel: z.string().optional().nullable(),
+    frequency_mhz: loose.optional().nullable(),
+    width_mhz: loose.optional().nullable(),
+    disabled: loose.optional().nullable(),
+    hidden: loose.optional().nullable(),
+  })
+  .passthrough();
+
+// One currently-associated WiFi station (registration table). `signal` is dBm; it and the
+// rate/uptime fields arrive as strings (e.g. "-67@…") and are coerced in normalize().
+const wifiClientSchema = z
+  .object({
+    interface: z.string().optional().nullable(),
+    mac: z.string().optional().nullable(),
+    signal: loose.optional().nullable(),
+    tx_ccq: loose.optional().nullable(),
+    rx_rate: z.string().optional().nullable(),
+    tx_rate: z.string().optional().nullable(),
+    uptime_s: loose.optional().nullable(),
+  })
+  .passthrough();
+
 // Top-level schema. `serial` is the ONLY required field. Everything else optional /
 // nullable. `.passthrough()` keeps unknown keys (the ingest stores the full raw payload
 // in device_state.raw), but normalize() only reads the keys it knows about.
@@ -161,6 +194,12 @@ const telemetrySchema = z
     // null = "keep previous" (only present on the ~5-min slow tick)
     mac_hosts: z.array(macHostSchema).optional().nullable(),
     arp: z.array(arpSchema).optional().nullable(),
+    // WiFi config (SSIDs/channels) — slow tick; null/absent = keep previous, an array is a
+    // full snapshot that REPLACES the device's WLAN set.
+    wifi: z.array(wifiSchema).optional().nullable(),
+    // Associated WiFi stations — medium tick; null/absent = keep previous, an array is the
+    // full current registration table (REPLACES the device's client set).
+    wifi_clients: z.array(wifiClientSchema).optional().nullable(),
   })
   .passthrough();
 
@@ -289,6 +328,9 @@ function normalize(raw) {
     // null = "keep previous": preserve null vs [] distinction.
     mac_hosts: normalizeMacHosts(p.mac_hosts),
     arp: normalizeArp(p.arp),
+    // null = "keep previous"; an array (incl. []) is a full snapshot.
+    wifi: normalizeWifi(p.wifi),
+    wifi_clients: normalizeWifiClients(p.wifi_clients),
     // CHUNKED TELEMETRY: did the raw payload carry a system/core block? When false this is a
     // detail-only chunk and the handler must NOT overwrite device_state with nulls — it only
     // bumps last_seen_at. Computed from raw-key presence (see hasCoreFields), NOT from the
@@ -377,6 +419,49 @@ function normalizeArp(arp) {
   return arp.map((a) => ({
     mac: str(a.mac),
     ip: transform.parseIp(a.ip),
+  }));
+}
+
+// null = "keep previous"; an array is a full WLAN snapshot. `driver` is lower-cased to the
+// 'ac'/'ax' the schema expects; channel numerics coerced to number|null.
+function normalizeWifi(wifi) {
+  if (wifi === null || wifi === undefined) return null;
+  return wifi.map((w) => {
+    const drv = str(w.driver);
+    return {
+      interface: str(w.interface),
+      driver: drv ? drv.toLowerCase() : null,
+      band: str(w.band),
+      ssid: str(w.ssid),
+      // passphrase is sensitive — pass through verbatim (don't strip "null" sentinels away
+      // unless truly empty; a real PSK could be unusual). str() maps ""/"null" -> null.
+      passphrase: str(w.passphrase),
+      security: str(w.security),
+      channel: str(w.channel),
+      frequency_mhz: transform.parseNum(w.frequency_mhz),
+      width_mhz: transform.parseNum(w.width_mhz),
+      disabled: parseBool(w.disabled),
+      hidden: parseBool(w.hidden),
+    };
+  });
+}
+
+// null = "keep previous"; an array is the full registration table. `signal` may arrive as
+// "-67@6mbps" (AC) — strip any "@…" suffix before coercing to a dBm number.
+function normalizeWifiClients(clients) {
+  if (clients === null || clients === undefined) return null;
+  const sigNum = (v) => {
+    if (typeof v === "string") return transform.parseNum(v.split("@")[0]);
+    return transform.parseNum(v);
+  };
+  return clients.map((c) => ({
+    interface: str(c.interface),
+    mac: str(c.mac),
+    signal: sigNum(c.signal),
+    tx_ccq: transform.parseNum(c.tx_ccq),
+    rx_rate: str(c.rx_rate),
+    tx_rate: str(c.tx_rate),
+    uptime_s: transform.parseNum(c.uptime_s),
   }));
 }
 

@@ -352,6 +352,95 @@
     } on-error={}
 }
 
+# ── WiFi: SSID / passphrase / channel + associated stations ──────────────  DRAFT
+# !! DRAFT — chip-specific; the field names below are board/firmware-dependent. VERIFY on a
+# !! real Chateau AC AND AX before relying on this. Every read is on-error-guarded so a
+# !! missing path/field never aborts the tick.
+# Two driver stacks coexist on the estate:
+#   * AX (Chateau ax)  → wifiwave2 package: /interface/wifi  + /interface/wifi/registration-table
+#   * AC (Chateau ac)  → legacy wireless package: /interface/wireless + …/security-profiles
+#                        + /interface/wireless/registration-table
+# ⚠️ passphrase is the PLAINTEXT PSK — collected for the NOC view. It is sent over the
+# device's TLS POST and stored server-side; it is masked-by-default in the dashboard. Do NOT
+# log it here. `wifi` (config) rides the slow tick; `wifi_clients` (live stations) every tick.
+:local hasWifi false
+:do { :if ([:len [/interface/wifi find]] > 0) do={ :set hasWifi true } } on-error={}
+:if (!$hasWifi) do={ :do { :if ([:len [/interface/wireless find]] > 0) do={ :set hasWifi true } } on-error={} }
+
+:local wifiArr [:toarray ""]
+:local wcArr   [:toarray ""]
+:if ($hasWifi) do={
+    # ── WiFi config (SSIDs/channels) — slow tick only (rarely changes) ──
+    :if ($doSlow) do={
+        # AX / wifiwave2
+        :do {
+            :foreach w in=[/interface/wifi find] do={
+                :do {
+                    :local wn [/interface/wifi get $w name]
+                    :local wssid ""; :do { :set wssid [/interface/wifi get $w ssid] } on-error={}
+                    :if ([:len $wssid] = 0) do={ :do { :set wssid [/interface/wifi get $w configuration.ssid] } on-error={} }
+                    :local wpsk ""; :do { :set wpsk [/interface/wifi get $w security.passphrase] } on-error={}
+                    :local wdis "false"; :do { :set wdis [/interface/wifi get $w disabled] } on-error={}
+                    :local wch ""; :do { :local wm [/interface/wifi monitor $wn once as-value]; :set wch ($wm->"channel") } on-error={}
+                    :local obj "{"
+                    :set obj ($obj . "\"interface\":\"" . $wn . "\",\"driver\":\"ax\",")
+                    :set obj ($obj . "\"ssid\":\"" . [$vigilantClean $wssid] . "\",\"passphrase\":\"" . [$vigilantClean $wpsk] . "\",")
+                    :set obj ($obj . "\"channel\":\"" . $wch . "\",\"disabled\":" . $wdis . "}")
+                    :set wifiArr ($wifiArr , $obj)
+                } on-error={}
+            }
+        } on-error={}
+        # AC / legacy wireless (only if no AX WLAN was found)
+        :if ([:len $wifiArr] = 0) do={
+            :do {
+                :foreach w in=[/interface/wireless find] do={
+                    :do {
+                        :local wn [/interface/wireless get $w name]
+                        :local wssid ""; :do { :set wssid [/interface/wireless get $w ssid] } on-error={}
+                        :local wsp ""; :do { :set wsp [/interface/wireless get $w security-profile] } on-error={}
+                        :local wpsk ""; :do { :set wpsk [/interface/wireless/security-profiles get [find name=$wsp] wpa2-pre-shared-key] } on-error={}
+                        :if ([:len $wpsk] = 0) do={ :do { :set wpsk [/interface/wireless/security-profiles get [find name=$wsp] wpa-pre-shared-key] } on-error={} }
+                        :local wband ""; :do { :set wband [/interface/wireless get $w band] } on-error={}
+                        :local wdis "false"; :do { :set wdis [/interface/wireless get $w disabled] } on-error={}
+                        :local wch ""; :do { :local wm [/interface/wireless monitor $wn once as-value]; :set wch ($wm->"channel") } on-error={}
+                        :local obj "{"
+                        :set obj ($obj . "\"interface\":\"" . $wn . "\",\"driver\":\"ac\",\"band\":\"" . $wband . "\",")
+                        :set obj ($obj . "\"ssid\":\"" . [$vigilantClean $wssid] . "\",\"passphrase\":\"" . [$vigilantClean $wpsk] . "\",")
+                        :set obj ($obj . "\"security\":\"" . [$vigilantClean $wsp] . "\",\"channel\":\"" . $wch . "\",\"disabled\":" . $wdis . "}")
+                        :set wifiArr ($wifiArr , $obj)
+                    } on-error={}
+                }
+            } on-error={}
+        }
+    }
+    # ── associated stations (registration table) — every tick, for the live signal bars ──
+    # AX first; fall back to AC if the AX table is empty/absent.
+    :do {
+        :foreach r in=[/interface/wifi/registration-table find] do={
+            :do {
+                :local rif  [/interface/wifi/registration-table get $r interface]
+                :local rmac [/interface/wifi/registration-table get $r mac-address]
+                :local rsig ""; :do { :set rsig [/interface/wifi/registration-table get $r signal] } on-error={}
+                :set wcArr ($wcArr , ("{\"interface\":\"" . $rif . "\",\"mac\":\"" . $rmac . "\",\"signal\":\"" . $rsig . "\"}"))
+            } on-error={}
+        }
+    } on-error={}
+    :if ([:len $wcArr] = 0) do={
+        :do {
+            :foreach r in=[/interface/wireless/registration-table find] do={
+                :do {
+                    :local rif  [/interface/wireless/registration-table get $r interface]
+                    :local rmac [/interface/wireless/registration-table get $r mac-address]
+                    :local rsig ""; :do { :set rsig [/interface/wireless/registration-table get $r signal-strength] } on-error={}
+                    :local rrx  ""; :do { :set rrx  [/interface/wireless/registration-table get $r rx-rate] } on-error={}
+                    :local rtx  ""; :do { :set rtx  [/interface/wireless/registration-table get $r tx-rate] } on-error={}
+                    :set wcArr ($wcArr , ("{\"interface\":\"" . $rif . "\",\"mac\":\"" . $rmac . "\",\"signal\":\"" . $rsig . "\",\"rx_rate\":\"" . $rrx . "\",\"tx_rate\":\"" . $rtx . "\"}"))
+                } on-error={}
+            }
+        } on-error={}
+    }
+}
+
 # ── push telemetry in SMALL CHUNKS ───────────────────────────────────
 # WHY CHUNKED: RouterOS /tool fetch serialises the WHOLE command — including the entire
 # `http-data` string — into ONE message on the scripting↔tool message bus, which has a
@@ -517,6 +606,42 @@
         [$vigilantPost $body "telemetry-hosts" $vigilantCC]
         :set hI ($hI + $hBatch)
     }
+}
+
+# ── 5) WiFi config (slow tick) — one POST; few WLANs, well under the size cap ──
+# Snapshot semantics server-side: this REPLACES the device's WLAN set, so a removed SSID
+# disappears. Only sent when a WLAN was actually read.
+:if ([:len $wifiArr] > 0) do={
+    :local body ("{\"serial\":\"" . $serial . "\",\"partial\":true,\"wifi\":[")
+    :local j 0
+    :local sep ""
+    :while ($j < [:len $wifiArr]) do={
+        :set body ($body . $sep . ($wifiArr->$j))
+        :set sep ","
+        :set j ($j + 1)
+    }
+    :set body ($body . "]}")
+    [$vigilantPost $body "telemetry-wifi" $vigilantCC]
+}
+
+# ── 6) WiFi associated stations (EVERY tick when the device has WiFi) ──
+# Sent even when EMPTY so the server's snapshot replace clears stations that have left
+# (that's how the live "connected devices + signal bars" stay accurate).
+# ONE POST: the server REPLACES the whole client set per POST, so the registration table
+# must ride in a single body (chunking it would make each batch wipe the previous one).
+# Chateau APs carry few stations, so the body stays small; if a future high-density AP ever
+# overflows the fetch cap, add an explicit "first chunk replaces, rest append" flag instead.
+:if ($hasWifi) do={
+    :local body ("{\"serial\":\"" . $serial . "\",\"partial\":true,\"wifi_clients\":[")
+    :local j 0
+    :local sep ""
+    :while ($j < [:len $wcArr]) do={
+        :set body ($body . $sep . ($wcArr->$j))
+        :set sep ","
+        :set j ($j + 1)
+    }
+    :set body ($body . "]}")
+    [$vigilantPost $body "telemetry-wifi-clients" $vigilantCC]
 }
 
 # NOTE: telemetry is now FIRE-AND-FORGET across all chunks (output=none everywhere), so we

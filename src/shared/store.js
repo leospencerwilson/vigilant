@@ -89,6 +89,13 @@
  * @property {(deviceId: string, rows: Object[]) => Promise<void>} upsertMacHosts
  *   Only called when payload.mac_hosts !== null.
  *
+ * @property {(deviceId: string, rows: Object[]) => Promise<void>} upsertWifiNetworks
+ *   WiFi SSID/channel config. FULL-SNAPSHOT: replaces the device's WLAN set. Only called
+ *   when payload.wifi !== null.
+ * @property {(deviceId: string, rows: Object[]) => Promise<void>} upsertWirelessClients
+ *   Associated WiFi stations (registration table). FULL-SNAPSHOT: replaces the device's
+ *   client set. Only called when payload.wifi_clients !== null.
+ *
  * @property {(deviceId: string, ts: string, row: Object) => Promise<void>} appendMetricsHistory
  * @property {(deviceId: string, ts: string, rows: Object[]) => Promise<void>} appendInterfaceHistory
  * @property {(deviceId: string, ts: string, row: Object) => Promise<void>} appendLteHistory

@@ -68,6 +68,10 @@ function makeMemStore(_config) {
   const neighbors = new Map();
   /** deviceId -> Map<`${interface}|${mac}`, mac_host row> */
   const macHosts = new Map();
+  /** deviceId -> Map<interface, wifi_network row> */
+  const wifiNetworks = new Map();
+  /** deviceId -> Map<`${interface}|${mac}`, wireless_client row> */
+  const wirelessClients = new Map();
 
   /** append-only history */
   const metricsHistory = []; // {device_id, ts, ...}
@@ -274,6 +278,38 @@ function makeMemStore(_config) {
         last_seen_at: stamp,
       });
     }
+  }
+
+  // WiFi config + associated stations use FULL-SNAPSHOT semantics: each report REPLACES the
+  // device's set (a removed SSID / departed station disappears). The handler only calls these
+  // when the payload carried the array (null/absent = keep previous), so a chunk omitting wifi
+  // never wipes it.
+  async function upsertWifiNetworks(deviceId, rows) {
+    if (!Array.isArray(rows)) return;
+    const m = new Map();
+    const stamp = iso();
+    for (const r of rows) {
+      if (!r || r.interface == null) continue;
+      m.set(r.interface, { ...r, device_id: deviceId, interface: r.interface, last_seen_at: stamp });
+    }
+    wifiNetworks.set(deviceId, m);
+  }
+
+  async function upsertWirelessClients(deviceId, rows) {
+    if (!Array.isArray(rows)) return;
+    const m = new Map();
+    const stamp = iso();
+    for (const r of rows) {
+      if (!r || r.interface == null || r.mac == null) continue;
+      m.set(`${r.interface}|${r.mac}`, {
+        ...r,
+        device_id: deviceId,
+        interface: r.interface,
+        mac: r.mac,
+        sampled_at: stamp,
+      });
+    }
+    wirelessClients.set(deviceId, m);
   }
 
   // ── history (append-only) ──────────────────────────────────────────────────
@@ -572,6 +608,17 @@ function makeMemStore(_config) {
     const lteMap = lteState.get(id);
     const nbrMap = neighbors.get(id);
     const macMap = macHosts.get(id);
+    const wifiMap = wifiNetworks.get(id);
+    const wcMap = wirelessClients.get(id);
+    const wifiClients = wcMap ? Array.from(wcMap.values()).map((r) => ({ ...r })) : [];
+    // Denormalise the connected-station count onto each WLAN row (counted by interface) so the
+    // UI/grid can show "N clients" without a second pass.
+    const wifi = wifiMap
+      ? Array.from(wifiMap.values()).map((r) => ({
+          ...r,
+          clients: wifiClients.filter((c) => c.interface === r.interface).length,
+        }))
+      : [];
     return {
       device: { ...d },
       state: state ? { ...state } : null,
@@ -579,6 +626,8 @@ function makeMemStore(_config) {
       lte: lteMap ? Array.from(lteMap.values()).map((r) => ({ ...r })) : [],
       neighbors: nbrMap ? Array.from(nbrMap.values()).map((r) => ({ ...r })) : [],
       mac_hosts: macMap ? Array.from(macMap.values()).map((r) => ({ ...r })) : [],
+      wifi,
+      wifi_clients: wifiClients,
     };
   }
 
@@ -830,6 +879,8 @@ function makeMemStore(_config) {
       lteState,
       neighbors,
       macHosts,
+      wifiNetworks,
+      wirelessClients,
       metricsHistory,
       interfaceHistory,
       lteHistory,
@@ -856,6 +907,8 @@ function makeMemStore(_config) {
     upsertLteState,
     upsertNeighbors,
     upsertMacHosts,
+    upsertWifiNetworks,
+    upsertWirelessClients,
     appendMetricsHistory,
     appendInterfaceHistory,
     appendLteHistory,

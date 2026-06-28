@@ -135,6 +135,26 @@ function makeTelemetry(opts) {
         { interface: 'ether3', identity: 'phone-1', mac: 'AA:BB:CC:00:00:02', address: '10.0.0.12', platform: 'Yealink' },
       ];
 
+  // WiFi: SSIDs/channels are config (slow tick; also tick 1 so a short demo run shows them),
+  // associated stations report every tick so the signal bars move. Explicit overrides win.
+  const wifiSlow = isSlow || tick === 1;
+  const wifi = 'wifi' in o
+    ? o.wifi
+    : wifiSlow
+      ? [
+          { interface: 'wifi1', driver: 'ax', band: '5ghz', ssid: 'Allied-Staff', passphrase: 'pharmacy-wifi-2026', security: 'wpa2-psk', channel: '5180/20/ax', frequency_mhz: 5180, width_mhz: 20, disabled: false, hidden: false },
+          { interface: 'wifi2', driver: 'ax', band: '2ghz', ssid: 'Allied-Guest', passphrase: 'guestpass123', security: 'wpa2-psk', channel: '2412/20/ax', frequency_mhz: 2412, width_mhz: 20, disabled: false, hidden: false },
+        ]
+      : null;
+  const wifiClients = 'wifi_clients' in o
+    ? o.wifi_clients
+    : [
+        // signal arrives as the AC "-NN@rate" form to exercise the parser; it jitters per tick.
+        { interface: 'wifi1', mac: 'AA:BB:CC:00:00:02', signal: `${-55 - (tick % 18)}@6mbps`, rx_rate: '130Mbps', tx_rate: '144Mbps', uptime_s: tick * 10 },
+        { interface: 'wifi1', mac: 'AA:BB:CC:00:00:03', signal: -72, rx_rate: '58Mbps', tx_rate: '65Mbps', uptime_s: tick * 7 },
+        { interface: 'wifi2', mac: 'AA:BB:CC:00:00:04', signal: -83, rx_rate: '24Mbps', tx_rate: '24Mbps', uptime_s: tick * 3 },
+      ];
+
   // uptime advances 10s/tick to look plausible (agent default poll = 10s).
   const uptimeS = tick * 10;
 
@@ -188,6 +208,8 @@ function makeTelemetry(opts) {
     neighbors,
     mac_hosts: macHosts,
     arp,
+    wifi,
+    wifi_clients: wifiClients,
   };
 }
 

@@ -167,6 +167,22 @@
   .ltebars.fair .bar.on{background:var(--warn)}
   .ltebars.poor .bar.on{background:var(--bad)}
   .ltebars .sig{font-family:var(--mono);font-size:12px;color:var(--mut);align-self:center;margin-left:8px}
+  /* ── WiFi card ── */
+  .wifi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-bottom:14px}
+  .wifi-net{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px}
+  .wifi-net .ssid{font-weight:600;font-size:14px}
+  .wifi-net .wmeta{color:var(--mut);font-size:11px;margin-top:4px;display:flex;gap:8px;flex-wrap:wrap}
+  .wifi-net .wmeta .chip{font-family:var(--mono);background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+  .psk{display:flex;align-items:center;gap:8px;margin-top:10px;font-family:var(--mono);font-size:12px}
+  .psk .lab{font-family:var(--sans);color:var(--mut);font-size:10px;text-transform:uppercase;letter-spacing:.05em}
+  .psk .val{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fde68a}
+  .psk button{padding:3px 8px;font-size:11px}
+  /* compact in-cell WiFi signal bars (reuses the LTE tiering colours) */
+  .sigbars{display:inline-flex;align-items:flex-end;gap:2px;height:16px;vertical-align:middle}
+  .sigbars .b{width:4px;border-radius:1px 1px 0 0;background:var(--line)}
+  .sigbars.good .b.on{background:var(--ok)}
+  .sigbars.fair .b.on{background:var(--warn)}
+  .sigbars.poor .b.on{background:var(--bad)}
   /* ── WAN throughput (live) ── */
   .wanspeed{display:flex;gap:14px;flex-wrap:wrap}
   .wanif{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 16px;min-width:210px}
@@ -344,6 +360,18 @@
       <div class="card hidden" id="d-ltebox">
         <div class="between"><h2>LTE / cellular</h2><div class="ltebars" id="d-ltebars"></div></div>
         <div class="ltegrid" id="d-lte"></div>
+      </div>
+    </div>
+
+    <div class="card hidden" id="d-wificard" style="margin-top:18px">
+      <div class="between"><h2>WiFi <span class="hint">· SSID · channel · connected clients</span></h2><span class="hint" id="d-wificount"></span></div>
+      <div class="wifi-grid" id="d-wifinets"></div>
+      <div class="scroll">
+        <table class="fixed">
+          <colgroup><col style="width:18%"><col style="width:22%"><col style="width:22%"><col style="width:12%"><col style="width:12%"><col style="width:14%"></colgroup>
+          <thead><tr><th>SSID</th><th>MAC</th><th>Manufacturer</th><th>RX</th><th>TX</th><th>Signal</th></tr></thead>
+          <tbody id="d-wifclients"><tr><td colspan="6" class="empty">No clients connected.</td></tr></tbody>
+        </table>
       </div>
     </div>
 
@@ -1043,8 +1071,92 @@ function renderDevice(d){
     $('#d-wanpeak').textContent = '';
   }
 
+  // ── WiFi (SSID/PSK/channel + connected clients with signal bars) ──
+  renderWifi(d);
+
   // ── topology map (LLDP/CDP neighbours around this device) ──
   renderTopology(dev, nbrs);
+}
+
+// Map WiFi RSSI (dBm) → 0..4 compact bars + quality tier. WiFi rule of thumb: ≥-60 great,
+// -67 good, -74 ok, -82 weak, below ≈ unusable.
+function wifiBars(dbm){
+  let n=0, tier='poor';
+  if (dbm != null && isFinite(dbm)){
+    if (dbm >= -60){ n=4; tier='good'; }
+    else if (dbm >= -67){ n=3; tier='good'; }
+    else if (dbm >= -74){ n=2; tier='fair'; }
+    else if (dbm >= -82){ n=1; tier='poor'; }
+    else { n=0; tier='poor'; }
+  }
+  let b='';
+  for (let i=1;i<=4;i++) b += '<span class="b'+(i<=n?' on':'')+'" style="height:'+(4+i*3)+'px"></span>';
+  return '<span class="sigbars '+tier+'" title="'+(dbm!=null?dbm+' dBm':'no signal')+'">'+b+'</span>';
+}
+
+// WiFi card: one tile per SSID (name, band/channel/security/client-count, masked PSK with a
+// Reveal toggle), then a table of currently-associated stations with signal bars. The PSK is
+// admin-gated by the same token as the rest of the dashboard; masked by default, revealed on
+// an explicit click. Hidden entirely when the device reports no WiFi.
+function renderWifi(d){
+  const wifi = Array.isArray(d.wifi) ? d.wifi : [];
+  const clients = Array.isArray(d.wifi_clients) ? d.wifi_clients : [];
+  const card = $('#d-wificard');
+  if (!card) return;
+  if (!wifi.length && !clients.length){ card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  $('#d-wificount').textContent =
+    (wifi.length ? wifi.length+' SSID'+(wifi.length>1?'s':'') : '')
+    + (wifi.length && clients.length ? ' · ' : '')
+    + (clients.length ? clients.length+' client'+(clients.length>1?'s':'') : '');
+
+  // ── networks ──
+  $('#d-wifinets').innerHTML = wifi.length ? wifi.map((w,idx)=>{
+    const drv = (w.driver||'').toUpperCase();
+    const chan = w.channel || (w.frequency_mhz!=null ? (w.frequency_mhz+(w.width_mhz!=null?('/'+w.width_mhz):'')+' MHz') : '');
+    const chips = [w.band, chan, w.security, drv, (w.disabled===true?'disabled':null),
+                   (w.clients!=null?(w.clients+' client'+(w.clients===1?'':'s')):null)]
+      .filter(Boolean).map(x=>'<span class="chip">'+esc(x)+'</span>').join('');
+    const hasPsk = w.passphrase!=null && w.passphrase!=='';
+    return '<div class="wifi-net">'
+      + '<div class="ssid">'+dash(w.ssid)+(w.hidden===true?' <span class="hint">(hidden)</span>':'')+'</div>'
+      + '<div class="wmeta">'+(chips||'<span class="muted">—</span>')+'</div>'
+      + '<div class="psk"><span class="lab">PSK</span>'
+      +   '<span class="val" data-psk="'+esc(w.passphrase||'')+'">'+(hasPsk?'••••••••':'—')+'</span>'
+      +   (hasPsk?'<button class="ghost psk-toggle">Reveal</button><button class="ghost psk-copy">Copy</button>':'')
+      + '</div></div>';
+  }).join('') : '<div class="hint">No SSIDs reported.</div>';
+
+  // reveal / copy (PSK stays in the DOM data-attr; revealed only on click)
+  $$('#d-wifinets .psk-toggle').forEach(b => b.onclick = () => {
+    const val = b.parentElement.querySelector('.val');
+    if (b.textContent === 'Reveal'){ val.textContent = val.dataset.psk||''; b.textContent='Hide'; }
+    else { val.textContent='••••••••'; b.textContent='Reveal'; }
+  });
+  $$('#d-wifinets .psk-copy').forEach(b => b.onclick = () => {
+    const psk = b.parentElement.querySelector('.val').dataset.psk||'';
+    navigator.clipboard.writeText(psk).then(()=>{ b.textContent='Copied'; setTimeout(()=>b.textContent='Copy',1200); });
+  });
+
+  // ── clients (with signal bars) ──
+  const ssidByIf = {};
+  wifi.forEach(w => { if (w.interface) ssidByIf[w.interface] = w.ssid || w.interface; });
+  $('#d-wifclients').innerHTML = clients.length ? clients.map((c,idx)=>
+    '<tr>'
+    + '<td title="'+esc(c.interface||'')+'">'+dash(ssidByIf[c.interface]||c.interface)+'</td>'
+    + '<td title="'+esc(c.mac||'')+'">'+dash(c.mac)+'</td>'
+    + '<td class="wcli-vendor" data-idx="'+idx+'">—</td>'
+    + '<td>'+dash(c.rx_rate)+'</td>'
+    + '<td>'+dash(c.tx_rate)+'</td>'
+    + '<td>'+wifiBars(c.signal!=null?+c.signal:null)+(c.signal!=null?' <span class="hint">'+esc(c.signal)+' dBm</span>':'')+'</td>'
+    + '</tr>'
+  ).join('') : '<tr><td colspan="6" class="empty">No clients connected.</td></tr>';
+  if (clients.length){
+    $$('#d-wifclients .wcli-vendor').forEach(cell=>{
+      const c = clients[+cell.dataset.idx];
+      if (c && c.mac) fillVendorCell(cell, c.mac); else cell.textContent = '—';
+    });
+  }
 }
 
 // Map RSRP (dBm) → 0..5 bars + quality tier. LTE rule of thumb: ≥-80 excellent, -90 good,

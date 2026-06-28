@@ -185,6 +185,97 @@ test("POST /telemetry twice: bps derived, neighbors + mac_hosts stored, response
   }
 });
 
+test("POST /telemetry: wifi config + clients stored, signal parsed, snapshot replace on next tick", async () => {
+  const config = makeConfig();
+  const store = makeMemStore();
+  const SERIAL = "WIFI0AX001";
+  const TOKEN = "wifi-bearer-xyz";
+  await seedDevice(store, { serial: SERIAL, token: TOKEN, tokenHash: transform.sha256Hex(TOKEN) });
+  const server = createServer({ store, config });
+  const port = await listen(server);
+  try {
+    // Tick 1: two SSIDs + three associated stations (one signal in AC "-NN@rate" form).
+    const p1 = makeTelemetry({
+      serial: SERIAL,
+      wifi: [
+        { interface: "wifi1", driver: "AX", band: "5ghz", ssid: "Allied-Staff", passphrase: "s3cret-psk",
+          security: "wpa2-psk", channel: "5180/20/ax", frequency_mhz: "5180", width_mhz: "20", disabled: false, hidden: false },
+        { interface: "wifi2", driver: "ax", band: "2ghz", ssid: "Allied-Guest", passphrase: "guestpass", security: "wpa2-psk" },
+      ],
+      wifi_clients: [
+        { interface: "wifi1", mac: "AA:BB:CC:00:00:02", signal: "-57@6mbps", rx_rate: "130Mbps", tx_rate: "144Mbps" },
+        { interface: "wifi1", mac: "AA:BB:CC:00:00:03", signal: -72 },
+        { interface: "wifi2", mac: "AA:BB:CC:00:00:04", signal: -83 },
+      ],
+    });
+    const r1 = await request(port, { method: "POST", path: "/telemetry", token: TOKEN, body: p1 });
+    assert.equal(r1.status, 200);
+
+    let detail = await store.getDeviceDetail(SERIAL);
+    assert.equal(detail.wifi.length, 2, "two SSIDs stored");
+    const staff = detail.wifi.find((w) => w.ssid === "Allied-Staff");
+    assert.ok(staff, "staff SSID present");
+    assert.equal(staff.driver, "ax", "driver lower-cased");
+    assert.equal(staff.passphrase, "s3cret-psk", "plaintext PSK stored for the masked-reveal UI");
+    assert.equal(staff.frequency_mhz, 5180, "channel numerics coerced to number");
+    assert.equal(staff.clients, 2, "denormalised client count (wifi1 has 2 stations)");
+
+    assert.equal(detail.wifi_clients.length, 3, "three stations stored");
+    const c1 = detail.wifi_clients.find((c) => transform.normaliseMac(c.mac) === "AA:BB:CC:00:00:02");
+    assert.ok(c1, "station stored");
+    assert.equal(c1.signal, -57, "signal '-57@6mbps' parsed to dBm number");
+
+    // Tick 2: one station has left wifi1 -> full-snapshot replace must drop it.
+    const p2 = makeTelemetry({
+      serial: SERIAL,
+      wifi: null, // keep previous config
+      wifi_clients: [
+        { interface: "wifi1", mac: "AA:BB:CC:00:00:02", signal: -60 },
+      ],
+    });
+    const r2 = await request(port, { method: "POST", path: "/telemetry", token: TOKEN, body: p2 });
+    assert.equal(r2.status, 200);
+    detail = await store.getDeviceDetail(SERIAL);
+    assert.equal(detail.wifi.length, 2, "wifi config kept (payload.wifi was null)");
+    assert.equal(detail.wifi_clients.length, 1, "departed stations removed by snapshot replace");
+    assert.equal(detail.wifi_clients[0].signal, -60, "remaining station's signal updated");
+    const staff2 = detail.wifi.find((w) => w.ssid === "Allied-Staff");
+    assert.equal(staff2.clients, 1, "client count reflects the new snapshot");
+  } finally {
+    await close(server);
+  }
+});
+
+test("POST /speedtest/result with a malformed job_id -> 404, and the ingest keeps serving", async () => {
+  // Regression: a device POSTing job_id="t" hit `WHERE id = $1` on a uuid column. In pg that
+  // throws "invalid input syntax for type uuid"; unhandled, it crash-looped the whole ingest.
+  // The store now treats a non-UUID id as "not found" -> the handler 404s, and the process
+  // survives. (Mem store can't reproduce the pg throw, so this locks the handler contract +
+  // proves the server stays up to serve the next request.)
+  const config = makeConfig();
+  const store = makeMemStore();
+  const SERIAL = "ST-BADID";
+  const TOKEN = "st-bearer";
+  await seedDevice(store, { serial: SERIAL, token: TOKEN, tokenHash: transform.sha256Hex(TOKEN) });
+  const server = createServer({ store, config });
+  const port = await listen(server);
+  try {
+    const bad = await request(port, {
+      method: "POST", path: "/speedtest/result", token: TOKEN,
+      body: { job_id: "t", status: "done" },
+    });
+    assert.equal(bad.status, 404, "malformed job_id is not found, not a crash");
+
+    // Server still alive: a normal telemetry POST right after succeeds.
+    const ok = await request(port, {
+      method: "POST", path: "/telemetry", token: TOKEN, body: makeTelemetry({ serial: SERIAL }),
+    });
+    assert.equal(ok.status, 200, "ingest still serving after the bad request");
+  } finally {
+    await close(server);
+  }
+});
+
 test("POST /telemetry without a valid bearer -> 401", async () => {
   const config = makeConfig();
   const store = makeMemStore();

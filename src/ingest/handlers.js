@@ -287,6 +287,16 @@ async function telemetryIngest(ctx) {
   await store.upsertNeighbors(device.id, payload.neighbors || []);
   if (macHostRows !== null) await store.upsertMacHosts(device.id, macHostRows);
 
+  // WiFi config + associated stations. null = "keep previous" (a chunk that omitted them);
+  // an array (incl. []) is a full snapshot that REPLACES the device's set. Guarded so a store
+  // predating these methods still loads.
+  if (payload.wifi != null && typeof store.upsertWifiNetworks === 'function') {
+    await store.upsertWifiNetworks(device.id, payload.wifi);
+  }
+  if (payload.wifi_clients != null && typeof store.upsertWirelessClients === 'function') {
+    await store.upsertWirelessClients(device.id, payload.wifi_clients);
+  }
+
   // Metrics history is a snapshot of the system block — only meaningful for a CORE chunk.
   // Skip it for a detail chunk so we never append an all-null metrics row that would dilute
   // the history series and the downsample/rollup averages.
