@@ -926,12 +926,15 @@
             # http-method=post: `upload=yes` already POSTs the file, and on several ROS builds the
             # two together error ("post needs http-data"). Capture the REAL error so a failure is
             # diagnosable in the log rather than a silent ul=false.
+            # NB: NO `output=none` here — RouterOS rejects it on an upload ("'output' option can
+            # only be used for download"), which is exactly what made the upload throw (ul=false).
+            # `upload=yes` already POSTs the file; we just don't capture a response body.
             :if (($dlok) && ([:len $uurl] > 0)) do={
                 :local uerr ""
                 :onerror perr in={
                     /tool fetch url=$uurl mode=https check-certificate=$vigilantCC \
                         http-header-field=("Authorization: Bearer " . $vigilantToken) \
-                        src-path="vigilant-speedtest.bin" upload=yes output=none
+                        src-path="vigilant-speedtest.bin" upload=yes
                     :set ulok true
                 } do={ :set uerr $perr }
                 :if ([:len $uerr] > 0) do={ :log warning ("vigilant-agent: speedtest upload failed: " . $uerr) }
