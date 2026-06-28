@@ -942,10 +942,15 @@
             :do { /file remove [find name="vigilant-speedtest.bin"] } on-error={}
             :local sst "done"
             :if (!$dlok) do={ :set sst "failed" }
+            # Tell the server WHY there's no upload figure so the dashboard can label it rather
+            # than show a blank. Many RouterOS builds only support [s]ftp upload via /tool fetch,
+            # so an HTTP active-upload test isn't possible — download-only is expected there.
+            :local rlog ""
+            :if (($dlok) && (!$ulok)) do={ :set rlog "download measured; HTTP upload not supported on this RouterOS build" }
             :do {
                 /tool fetch url=("$vigilantUrl/speedtest/result") http-method=post mode=https \
                     check-certificate=$vigilantCC http-header-field=("Authorization: Bearer " . $vigilantToken) \
-                    http-data=("{\"job_id\":\"" . $sjid . "\",\"status\":\"" . $sst . "\"}") output=none
+                    http-data=("{\"job_id\":\"" . $sjid . "\",\"status\":\"" . $sst . "\",\"result_log\":\"" . $rlog . "\"}") output=none
             } on-error={}
             :log info ("vigilant-agent: speedtest " . $sjid . " " . $sst . " (dl=" . $dlok . " ul=" . $ulok . ")")
         }

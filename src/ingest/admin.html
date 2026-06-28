@@ -1023,8 +1023,15 @@ async function refreshSpeedtests(){
     data = await r.json();
   }catch(e){ return; }
   const jobs = (data && data.jobs) || [];
+  // Upload cell: a measured value, else "n/a" for a finished test (RouterOS HTTP upload isn't
+  // supported on many builds → download-only), else "—" while pending/running.
+  const upCell = (j) => {
+    if (j.up_bps != null) return humanBps(j.up_bps);
+    if (j.status === 'done') return '<span class="muted" title="'+esc(j.result_log||'HTTP upload not supported on this RouterOS build — download only')+'">n/a</span>';
+    return '—';
+  };
   const last = jobs.find(j => j.status==='done' && (j.down_bps!=null || j.up_bps!=null));
-  $('#d-speedlatest').textContent = last ? ('last  ↓ '+humanBps(last.down_bps)+'   ↑ '+humanBps(last.up_bps)) : '';
+  $('#d-speedlatest').textContent = last ? ('last  ↓ '+humanBps(last.down_bps)+'   ↑ '+(last.up_bps!=null?humanBps(last.up_bps):'n/a')) : '';
   const tb = $('#speed-jobs');
   if (!jobs.length){ tb.innerHTML = '<tr><td colspan="5" class="empty">No tests yet.</td></tr>'; return; }
   tb.innerHTML = jobs.map(j =>
@@ -1032,7 +1039,7 @@ async function refreshSpeedtests(){
     + '<td>'+(j.created_at?ago(j.created_at):'—')+'</td>'
     + '<td>'+pill(j.status)+'</td>'
     + '<td>'+(j.down_bps!=null?humanBps(j.down_bps):'—')+'</td>'
-    + '<td>'+(j.up_bps!=null?humanBps(j.up_bps):'—')+'</td>'
+    + '<td>'+upCell(j)+'</td>'
     + '<td title="'+esc(j.requested_by||'')+'">'+dash(j.requested_by)+'</td>'
     + '</tr>'
   ).join('');
