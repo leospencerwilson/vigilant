@@ -4,23 +4,47 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="robots" content="noindex" />
-<title>Vigilant — fleet dashboard</title>
+<title>VIGILANT · fleet telemetry</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
 <style>
   :root{
-    --bg:#0b0f14; --panel:#121821; --panel2:#0e141d; --line:#1f2a37;
-    --fg:#e6edf3; --mut:#8b9aa9; --acc:#3b82f6; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444;
-    --vpn:#a855f7; --lan:#38bdf8; --wan:#22c55e; --bridge:#eab308; --unused:#64748b; --disabled:#475569;
-    --rx:#3b82f6; --tx:#f59e0b;
-    --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-    --sans:Inter,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --bg:#05070e; --bg2:#0a0f1c; --panel:#0e1626; --panel2:#0b1220; --line:rgba(125,170,235,.13);
+    --fg:#e9f1fc; --mut:#7e93b2; --acc:#34e3ff; --acc2:#8b6cff; --ok:#2ee6a0; --warn:#ffb53d; --bad:#ff5d76;
+    --vpn:#a855f7; --lan:#34e3ff; --wan:#2ee6a0; --bridge:#ffb53d; --unused:#64748b; --disabled:#475569;
+    --rx:#34e3ff; --tx:#ffb53d;
+    --glow:0 0 22px rgba(52,227,255,.35);
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:"IBM Plex Sans",system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --display:"Chakra Petch","IBM Plex Sans",system-ui,sans-serif;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.5}
-  header{display:flex;align-items:center;gap:12px;padding:14px 22px;border-bottom:1px solid var(--line);background:var(--panel2);position:sticky;top:0;z-index:5}
-  header .dot{width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok)}
-  header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.2px}
-  header .sub{color:var(--mut);font-size:12px}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased}
+  /* atmosphere: layered radial glows + faint HUD grid that fades toward the edges */
+  body::before{content:"";position:fixed;inset:0;z-index:-2;background:
+    radial-gradient(900px 620px at 12% -8%, rgba(52,227,255,.12), transparent 60%),
+    radial-gradient(820px 600px at 102% -2%, rgba(139,108,255,.11), transparent 55%),
+    radial-gradient(760px 760px at 50% 124%, rgba(46,230,160,.06), transparent 60%),
+    var(--bg)}
+  body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.55;
+    background-image:linear-gradient(rgba(125,170,235,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(125,170,235,.05) 1px,transparent 1px);
+    background-size:46px 46px;-webkit-mask-image:radial-gradient(circle at 50% 26%,#000 0%,transparent 82%);mask-image:radial-gradient(circle at 50% 26%,#000 0%,transparent 82%)}
+  header{display:flex;align-items:center;gap:14px;padding:16px 26px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(10,16,28,.92),rgba(10,16,28,.62));backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);position:sticky;top:0;z-index:5}
+  header::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;background:linear-gradient(90deg,transparent,var(--acc),transparent);opacity:.6}
+  header .dot{width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 12px var(--ok),0 0 4px var(--ok);animation:pulse 2.4s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  header h1{font-family:var(--display);font-size:19px;margin:0;font-weight:700;letter-spacing:.2em;text-transform:uppercase;background:linear-gradient(90deg,#ffffff,var(--acc));-webkit-background-clip:text;background-clip:text;color:transparent}
+  header .sub{color:var(--mut);font-size:11px;letter-spacing:.09em;text-transform:uppercase}
   header .spacer{flex:1}
+  /* build badge (GitHub commit) — bottom left */
+  .buildbadge{position:fixed;left:14px;bottom:14px;z-index:50;display:inline-flex;align-items:center;gap:8px;
+    font-family:var(--mono);font-size:11px;letter-spacing:.07em;color:var(--mut);text-decoration:none;
+    background:linear-gradient(180deg,rgba(14,22,38,.82),rgba(10,16,28,.7));border:1px solid var(--line);
+    border-radius:99px;padding:6px 13px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);box-shadow:0 8px 24px -10px rgba(0,0,0,.6);transition:border-color .15s,box-shadow .15s,transform .1s}
+  .buildbadge:hover{border-color:var(--acc);box-shadow:var(--glow);transform:translateY(-1px)}
+  .buildbadge .bdot{width:7px;height:7px;border-radius:50%;background:var(--acc);box-shadow:0 0 10px var(--acc);animation:pulse 2.4s ease-in-out infinite}
+  .buildbadge b{color:var(--fg);font-weight:600}
   .tokbar{display:flex;gap:8px;align-items:center}
   .tokbar input{width:260px}
   main{max-width:1500px;margin:0 auto;padding:20px 22px}
@@ -204,9 +228,44 @@
   #d-topo text{font-family:var(--mono);font-size:10px;fill:var(--fg)}
   #d-topo .edge{stroke:#1f2a37;stroke-width:1.5}
   #d-topo .elbl{fill:#8b9aa9;font-size:9px}
+
+  /* ══════════════ futuristic command-center overrides ══════════════ */
+  h1,h2,h3{font-family:var(--display)}
+  .card{background:linear-gradient(180deg,rgba(16,24,40,.66),rgba(11,18,32,.58));backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border:1px solid var(--line);border-radius:16px;box-shadow:inset 0 1px 0 rgba(255,255,255,.03),0 18px 40px -26px rgba(0,0,0,.8);position:relative}
+  .card>h2,.card .between h2{letter-spacing:.14em}
+  .between h2,.card h2{color:var(--mut)}
+  .tile{background:linear-gradient(180deg,rgba(18,27,45,.72),rgba(12,19,33,.6));border:1px solid var(--line);border-radius:14px;position:relative;overflow:hidden}
+  .tile::before{content:"";position:absolute;left:0;top:0;width:100%;height:2px;background:linear-gradient(90deg,var(--acc),transparent)}
+  .tile.flag::before{background:linear-gradient(90deg,var(--warn),transparent)}
+  .tile .lab{font-family:var(--mono);letter-spacing:.1em}
+  .tile .val{font-family:var(--display);text-shadow:0 0 20px rgba(52,227,255,.22)}
+  .devcard{background:linear-gradient(180deg,rgba(16,24,40,.72),rgba(11,18,32,.6));border:1px solid var(--line);border-radius:14px;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:border-color .14s,transform .1s,box-shadow .14s}
+  .devcard:hover{border-color:var(--acc);transform:translateY(-2px);box-shadow:var(--glow),0 16px 34px -20px #000}
+  .devcard .nm{font-family:var(--display);letter-spacing:.03em}
+  button.primary{background:linear-gradient(180deg,var(--acc),#15a6c6);color:#04121a;box-shadow:0 0 20px rgba(52,227,255,.3);text-transform:uppercase;letter-spacing:.06em;font-family:var(--display)}
+  button.primary:hover:not(:disabled){filter:brightness(1.08)}
+  button.ghost{background:rgba(255,255,255,.02);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+  button.ghost:hover{border-color:var(--acc);box-shadow:0 0 12px rgba(52,227,255,.22)}
+  input,select,textarea{background:rgba(7,12,22,.7);border-radius:10px}
+  input:focus,select:focus,textarea:focus{box-shadow:0 0 0 3px rgba(52,227,255,.16)}
+  .pill{font-family:var(--mono);letter-spacing:.04em}
+  .pill.online{box-shadow:0 0 12px rgba(46,230,160,.22)}
+  table th{font-family:var(--mono);letter-spacing:.08em}
+  .dash-head h2{font-family:var(--display);letter-spacing:.04em;text-transform:uppercase}
+  /* WiFi card accents */
+  #d-wificard .wifi-net{background:linear-gradient(180deg,rgba(18,27,45,.72),rgba(12,19,33,.55))}
+  #d-wificard .wifi-net .ssid{font-family:var(--display);letter-spacing:.03em}
+  .sigbars.good .b.on{box-shadow:0 0 7px rgba(46,230,160,.6)}
+  .ltebars .bar{box-shadow:0 0 6px rgba(0,0,0,.3)}
+  ::selection{background:rgba(52,227,255,.3);color:#fff}
+  *{scrollbar-width:thin;scrollbar-color:rgba(52,227,255,.35) transparent}
+  *::-webkit-scrollbar{width:10px;height:10px}
+  *::-webkit-scrollbar-track{background:transparent}
+  *::-webkit-scrollbar-thumb{background:linear-gradient(180deg,rgba(52,227,255,.45),rgba(139,108,255,.4));border-radius:99px;border:2px solid transparent;background-clip:content-box}
 </style>
 </head>
 <body>
+<a class="buildbadge" id="buildbadge" href="https://github.com/leospencerwilson/vigilant/commit/40d2d3f" target="_blank" rel="noopener" title="GitHub build · commit 40d2d3f"><span class="bdot"></span>BUILD&nbsp;<b>40d2d3f</b></a>
 <header>
   <span class="dot" id="health" title="ingest health"></span>
   <div><h1>Vigilant</h1><div class="sub">MikroTik fleet telemetry · vigilant.internal</div></div>
@@ -1103,12 +1162,15 @@ function renderWifi(d){
   const clients = Array.isArray(d.wifi_clients) ? d.wifi_clients : [];
   const card = $('#d-wificard');
   if (!card) return;
-  if (!wifi.length && !clients.length){ card.classList.add('hidden'); return; }
+  // Always show the WiFi card — an empty state is more useful than a missing panel (it tells
+  // you WiFi telemetry hasn't arrived yet vs. the device genuinely having none).
   card.classList.remove('hidden');
   $('#d-wificount').textContent =
-    (wifi.length ? wifi.length+' SSID'+(wifi.length>1?'s':'') : '')
-    + (wifi.length && clients.length ? ' · ' : '')
-    + (clients.length ? clients.length+' client'+(clients.length>1?'s':'') : '');
+    (wifi.length || clients.length)
+      ? ((wifi.length ? wifi.length+' SSID'+(wifi.length>1?'s':'') : '')
+         + (wifi.length && clients.length ? ' · ' : '')
+         + (clients.length ? clients.length+' client'+(clients.length>1?'s':'') : ''))
+      : 'awaiting telemetry';
 
   // ── networks ──
   $('#d-wifinets').innerHTML = wifi.length ? wifi.map((w,idx)=>{
@@ -1125,7 +1187,7 @@ function renderWifi(d){
       +   '<span class="val" data-psk="'+esc(w.passphrase||'')+'">'+(hasPsk?'••••••••':'—')+'</span>'
       +   (hasPsk?'<button class="ghost psk-toggle">Reveal</button><button class="ghost psk-copy">Copy</button>':'')
       + '</div></div>';
-  }).join('') : '<div class="hint">No SSIDs reported.</div>';
+  }).join('') : '<div class="empty">No WiFi telemetry yet — this device has no WLANs, or the agent hasn\'t reported WiFi on this build.</div>';
 
   // reveal / copy (PSK stays in the DOM data-attr; revealed only on click)
   $$('#d-wifinets .psk-toggle').forEach(b => b.onclick = () => {

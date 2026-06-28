@@ -102,8 +102,14 @@ function adminUi(ctx) {
         '<h1>Vigilant</h1><p>Admin UI asset missing; API is up. Use POST /enroll directly.</p>';
     }
   }
+  // Stamp the real build SHA into the bottom-left badge when the platform provides it
+  // (Coolify/CI set one of these), so the badge tracks what's actually deployed. Falls back
+  // to the literal short SHA baked into admin.html. Replaces the 7-char default everywhere it
+  // appears (badge text + the GitHub commit link).
+  const sha = (process.env.BUILD_SHA || process.env.SOURCE_COMMIT || process.env.COMMIT_SHA || '').trim();
+  const html = sha ? _adminHtml.split('40d2d3f').join(sha.slice(0, 7)) : _adminHtml;
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-  res.end(_adminHtml);
+  res.end(html);
 }
 
 // ── POST /telemetry ──────────────────────────────────────────────────
