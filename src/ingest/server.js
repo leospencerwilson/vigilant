@@ -226,6 +226,13 @@ function createServer({ store, config: cfg }) {
         return handlers.adminMigrate(ctx);
       }
 
+      // POST /realtime/config — admin-gated. Mints a short-lived Supabase `authenticated` JWT
+      // (+ URL/anon key) so the dashboard can subscribe to Realtime. 501 if not configured.
+      if (method === 'POST' && pathname === '/realtime/config') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.realtimeConfig(ctx);
+      }
+
       // GET /devices/:serial/history?window=1h (admin) — dashboard chart series.
       // Matched BEFORE /devices/:serial so the trailing /history segment is routed here
       // and not swallowed (the bare-serial regex anchors on a no-slash segment, but keep

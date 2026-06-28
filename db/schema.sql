@@ -399,7 +399,10 @@ DO $$
 DECLARE t text;
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
-    FOREACH t IN ARRAY ARRAY['device_state','interface_state','lte_state','neighbors','config_jobs','alerts','wifi_networks','wireless_clients'] LOOP
+    -- NB: wifi_networks is intentionally NOT published — it holds the plaintext PSK, which
+    -- must never be broadcast over Realtime. Frontends read WiFi config via select (the PSK
+    -- column is withheld by a column-level grant) and the PSK itself via the admin REST path.
+    FOREACH t IN ARRAY ARRAY['device_state','interface_state','lte_state','neighbors','config_jobs','alerts','wireless_clients'] LOOP
       -- Per-table sub-block so one failure (already a member, or no privilege to alter
       -- the publication) never aborts the others or the outer transaction.
       BEGIN
@@ -414,6 +417,46 @@ BEGIN
       END;
     END LOOP;
   END IF;
+END $$;
+
+-- ─────────────── Row-Level Security + grants for frontend reads ───────────────
+-- Live/read frontends read these tables directly (select + Realtime) as the Supabase
+-- `authenticated` role — the admin dashboard via a short-lived JWT the ingest mints after
+-- checking the admin token (POST /realtime/config), and Watchman via the logged-in user's
+-- Supabase session. The public `anon` role is granted NOTHING: a leaked anon key on its own
+-- cannot read any device data.
+-- ⚠️ wifi_networks.passphrase (plaintext PSK) is withheld via a COLUMN-level grant, and the
+-- table is kept OUT of the Realtime publication (above) — the PSK only ever travels the
+-- admin-gated REST path, never a select* or a broadcast.
+-- Wrapped so a non-Supabase database (no `authenticated` role — e.g. a bare test pg) doesn't
+-- abort the migration; it just logs and skips.
+DO $$
+DECLARE t text;
+BEGIN
+  EXECUTE 'GRANT USAGE ON SCHEMA vigilant TO authenticated';
+
+  FOREACH t IN ARRAY ARRAY[
+    'devices','device_state','interface_state','lte_state','neighbors','mac_hosts',
+    'wireless_clients','config_jobs','alerts','metrics_history','interface_history',
+    'lte_history','speedtest_jobs'
+  ] LOOP
+    EXECUTE format('ALTER TABLE vigilant.%I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('GRANT SELECT ON vigilant.%I TO authenticated', t);
+    -- Drop+recreate so re-running migrate is idempotent.
+    EXECUTE format('DROP POLICY IF EXISTS %I ON vigilant.%I', t || '_sel_authed', t);
+    EXECUTE format('CREATE POLICY %I ON vigilant.%I FOR SELECT TO authenticated USING (true)', t || '_sel_authed', t);
+  END LOOP;
+
+  -- wifi_networks: RLS + column-level SELECT that OMITS passphrase (and the raw comment).
+  EXECUTE 'ALTER TABLE vigilant.wifi_networks ENABLE ROW LEVEL SECURITY';
+  EXECUTE 'GRANT SELECT (device_id, interface, driver, band, ssid, security, channel, frequency_mhz, width_mhz, disabled, hidden, clients, last_seen_at) ON vigilant.wifi_networks TO authenticated';
+  EXECUTE 'DROP POLICY IF EXISTS wifi_networks_sel_authed ON vigilant.wifi_networks';
+  EXECUTE 'CREATE POLICY wifi_networks_sel_authed ON vigilant.wifi_networks FOR SELECT TO authenticated USING (true)';
+
+  -- v_fleet view (RLS lives on the underlying tables; the view just needs a grant).
+  EXECUTE 'GRANT SELECT ON vigilant.v_fleet TO authenticated';
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'vigilant: RLS/grants step skipped (%) — apply manually on the Supabase DB if needed', SQLERRM;
 END $$;
 
 COMMIT;

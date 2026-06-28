@@ -112,6 +112,49 @@ function adminUi(ctx) {
   res.end(html);
 }
 
+// ── POST /realtime/config (admin) ────────────────────────────────────
+// The dashboard is gated by ENROLL_TOKEN, not a Supabase session — so to use Supabase
+// Realtime it asks here (after the server has already verified the admin token) for the bits
+// it needs: the Supabase URL, the anon key, and a SHORT-LIVED `authenticated` JWT the ingest
+// mints by signing with SUPABASE_JWT_SECRET. RLS then lets that token read; anon gets nothing.
+// 501 when Realtime isn't configured (no URL/anon/secret) → the dashboard stays on polling.
+function b64url(buf) {
+  return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// Mint an HS256 JWT { role:'authenticated', aud:'authenticated', sub, iat, exp } — the minimal
+// claim set PostgREST/Realtime need to apply the `authenticated` RLS policies. ttlS default 1h.
+function mintSupabaseJwt(secret, ttlS) {
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const payload = {
+    role: 'authenticated',
+    aud: 'authenticated',
+    sub: crypto.randomUUID(),
+    iat: now,
+    exp: now + (ttlS || 3600),
+  };
+  const signingInput = b64url(JSON.stringify(header)) + '.' + b64url(JSON.stringify(payload));
+  const sig = b64url(crypto.createHmac('sha256', secret).update(signingInput).digest());
+  return { token: signingInput + '.' + sig, expiresAt: payload.exp };
+}
+
+async function realtimeConfig(ctx) {
+  const { res, config } = ctx;
+  if (!config.supabaseUrl || !config.supabaseAnonKey || !config.supabaseJwtSecret) {
+    return json(res, 501, { ok: false, error: 'realtime not configured' });
+  }
+  const minted = mintSupabaseJwt(config.supabaseJwtSecret, 3600);
+  return json(res, 200, {
+    ok: true,
+    url: config.supabaseUrl,
+    anonKey: config.supabaseAnonKey,
+    token: minted.token,
+    expiresAt: minted.expiresAt,
+    schema: 'vigilant',
+  });
+}
+
 // ── POST /telemetry ──────────────────────────────────────────────────
 // Implements the 11-step algorithm from the contract verbatim.
 async function telemetryIngest(ctx) {
@@ -934,6 +977,7 @@ module.exports = {
   healthz,
   adminUi,
   adminMigrate,
+  realtimeConfig,
   telemetry: telemetryIngest,
   agentScript,
   configPending,

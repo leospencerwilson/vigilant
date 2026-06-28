@@ -143,11 +143,13 @@ vigilant.removeChannel(channel);
 ```
 Same pattern for `lte_state`, `neighbors`, `config_jobs`, `alerts`.
 
-> **RLS / grants required.** These tables are in a non-`public` schema. The role Watchman's
-> users authenticate as needs `SELECT` grants + RLS policies on `v_fleet`, `devices`, and the
-> six Realtime tables — without them both queries *and* subscriptions silently return nothing.
-> If a subscription is silent, also confirm the table is in the `supabase_realtime`
-> publication (re-run `npm run migrate`).
+> **RLS / grants — apply `docs/VIGILANT-RLS.sql`** (postgres superuser; also in `db/schema.sql`).
+> It grants the `authenticated` role `SELECT` + RLS policies on `v_fleet`, `devices`, and the
+> live tables, so a logged-in user reads/subscribes while `anon` gets nothing. Without it both
+> queries *and* subscriptions silently return nothing. If a subscription is silent, also confirm
+> the table is in the `supabase_realtime` publication (re-run `npm run migrate`).
+> ⚠️ **PSK:** `wifi_networks` is **not** Realtime-published and its `passphrase` is withheld by a
+> column grant — read SSID/channel via Supabase, fetch the PSK only via the proxy (`GET /devices/:serial`).
 
 ### 3.4 Recommended wiring
 | View | Initial fetch | Live source |

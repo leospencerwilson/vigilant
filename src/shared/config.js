@@ -53,6 +53,14 @@ const config = Object.freeze({
   neighborTtlS: num(process.env.NEIGHBOR_TTL_S, 86400),
   storeKind,
   enableNightlySnapshot: bool(process.env.ENABLE_NIGHTLY_SNAPSHOT, false),
+  // Supabase Realtime for the dashboard. The admin page is gated by ENROLL_TOKEN (not a
+  // Supabase session), so the ingest mints a short-lived `authenticated` JWT (signed with the
+  // Supabase JWT secret) after validating the admin token — the browser uses that + the anon
+  // key to subscribe. RLS (db/schema.sql) lets `authenticated` read; `anon` gets nothing.
+  // All optional: if unset, the dashboard silently stays on its (now in-place) polling path.
+  supabaseUrl: process.env.SUPABASE_URL || "",
+  supabaseAnonKey: process.env.SUPABASE_ANON_KEY || "",
+  supabaseJwtSecret: process.env.SUPABASE_JWT_SECRET || "",
   // Opt-in early validation for entrypoints (server/worker startup); no-op for tests.
   assertUsable,
 });

@@ -501,9 +501,9 @@ function authHeaders(){ return { 'Authorization':'Bearer '+tok(), 'Content-Type'
 $('#admintok').value = sessionStorage.getItem('vigilant_admin') || '';
 $('#admintok').addEventListener('input', () => {
   sessionStorage.setItem('vigilant_admin', $('#admintok').value.trim());
-  if (tok()) loadFleet();
+  if (tok()){ loadFleet(); initRealtime(); }
 });
-$('#savetok').onclick = () => { sessionStorage.setItem('vigilant_admin', $('#admintok').value.trim()); setMsg(tok() ? 'Token set — fleet loaded.' : 'Enter a token first.', tok() ? 'ok' : 'err'); loadFleet(); };
+$('#savetok').onclick = () => { sessionStorage.setItem('vigilant_admin', $('#admintok').value.trim()); setMsg(tok() ? 'Token set — fleet loaded.' : 'Enter a token first.', tok() ? 'ok' : 'err'); loadFleet(); if (tok()) initRealtime(); };
 
 $$('[data-copy]').forEach(b => b.onclick = () => {
   const el = $('#'+b.dataset.copy); navigator.clipboard.writeText(el.textContent).then(()=>{ b.textContent='Copied'; setTimeout(()=>b.textContent='Copy',1200); });
@@ -858,9 +858,11 @@ $('#refresh').onclick = loadFleet;
 
 // ════════════════════ device dashboard ════════════════════
 let curSerial = null;
+let curDeviceId = null;   // uuid of the open device (set in renderDevice) — matches Realtime rows
 let curWindow = '1h';
 let liveTimer = null, histTimer = null;
 let wanNames = [];   // WAN interface names for the current device (set in renderDevice, used for peak)
+let rtLive = false;  // true once a Supabase Realtime channel is subscribed → poll becomes a slow heartbeat
 
 function stopDeviceTimers(){
   if (liveTimer) clearInterval(liveTimer); liveTimer = null;
@@ -868,8 +870,10 @@ function stopDeviceTimers(){
 }
 function startDeviceTimers(){
   stopDeviceTimers();
-  liveTimer = setInterval(refreshDevice, 2000);   // live values every 2s (agent posts ~1s)
-  histTimer = setInterval(refreshHistory, 5000);  // charts every 5s
+  // With Realtime live, polling becomes a slow safety-net heartbeat (pushes drive updates);
+  // without it, the in-place poller runs at its normal cadence.
+  liveTimer = setInterval(refreshDevice, rtLive ? 15000 : 2000);
+  histTimer = setInterval(refreshHistory, rtLive ? 15000 : 5000);
 }
 
 function showFleet(){
@@ -899,6 +903,67 @@ document.addEventListener('visibilitychange', () => {
   if (curSerial){ refreshDevice(); refreshHistory(); startDeviceTimers(); }
   else { loadFleet(); }
 });
+
+// ════════════════════ Supabase Realtime (optional, push-driven) ════════════════════
+// When the ingest is Realtime-configured, the dashboard subscribes to the live tables and lets
+// PUSHES drive refreshes (debounced) instead of polling every 2s — far lighter on the VM and
+// instant. The page is ENROLL_TOKEN-gated, not a Supabase session, so we ask /realtime/config
+// for a short-lived `authenticated` JWT the ingest mints (RLS lets it read; anon gets nothing).
+// All best-effort: any failure (not configured, CDN blocked, RLS off) silently leaves the
+// (already in-place) poller running.
+let _rt = { client: null, channel: null, inFlight: false, refreshTimer: null };
+function _debounce(fn, ms){ let t=null; return () => { if(t) clearTimeout(t); t=setTimeout(fn, ms); }; }
+const _rtDeviceRefresh = _debounce(() => { if (curSerial) refreshDevice(); }, 250);
+const _rtFleetRefresh  = _debounce(() => { if (!curSerial) loadFleet(); }, 400);
+
+async function fetchRealtimeConfig(){
+  const r = await fetch('/realtime/config', { method:'POST', headers:authHeaders() });
+  if (r.status === 501){ _rt.off = true; return null; }  // not configured → stop trying this load
+  if (!r.ok) return null;                                 // 401 (bad/missing token) → may retry
+  return r.json();
+}
+
+function onRealtimeRow(payload){
+  const row = payload && (payload.new || payload.old) || {};
+  const table = payload && payload.table;
+  if (curSerial){
+    // Only refresh the open device when the change concerns IT (or its alerts/wifi).
+    if (!curDeviceId || row.device_id === curDeviceId || table === 'alerts') _rtDeviceRefresh();
+  } else {
+    _rtFleetRefresh();                     // grid view: any device_state/alert change
+  }
+}
+
+async function initRealtime(){
+  if (_rt.client || _rt.inFlight || _rt.off || !tok()) return;   // up / in progress / disabled / no token
+  _rt.inFlight = true;
+  try {
+    let cfg;
+    try { cfg = await fetchRealtimeConfig(); } catch (e) { return; }
+    if (!cfg || !cfg.url || !cfg.anonKey || !cfg.token) return;   // not configured → stay polling
+    let createClient;
+    try {
+      ({ createClient } = await import('https://esm.sh/@supabase/supabase-js@2'));
+    } catch (e) { return; }                  // CDN blocked / offline → stay polling
+    const supabase = createClient(cfg.url, cfg.anonKey, { db:{ schema: cfg.schema || 'vigilant' } });
+    supabase.realtime.setAuth(cfg.token);
+    _rt.client = supabase;
+    _rt.channel = supabase.channel('vigilant-dashboard')
+      .on('postgres_changes', { event:'*', schema:'vigilant', table:'device_state' }, onRealtimeRow)
+      .on('postgres_changes', { event:'*', schema:'vigilant', table:'interface_state' }, onRealtimeRow)
+      .on('postgres_changes', { event:'*', schema:'vigilant', table:'alerts' }, onRealtimeRow)
+      .subscribe((status) => {
+        const live = status === 'SUBSCRIBED';
+        if (live !== rtLive){ rtLive = live; if (curSerial) startDeviceTimers(); }
+      });
+    // Re-mint the JWT before it expires (~1h) and re-auth the socket.
+    if (_rt.refreshTimer) clearInterval(_rt.refreshTimer);
+    _rt.refreshTimer = setInterval(async () => {
+      try { const c = await fetchRealtimeConfig(); if (c && c.token) supabase.realtime.setAuth(c.token); } catch(e){}
+    }, 50*60*1000);
+  } catch (e) { /* leave poller running */ }
+  finally { _rt.inFlight = false; }
+}
 
 $$('.win').forEach(b => b.onclick = () => {
   $$('.win').forEach(x => x.classList.remove('on'));
@@ -994,6 +1059,7 @@ $('#speed-run').onclick = runSpeedtest;
 
 function renderDevice(d){
   const dev = d.device || {};
+  curDeviceId = dev.id || null;   // so Realtime rows (keyed by device_id) match the open device
   const st = d.state || {};
   const ifaces = d.interfaces || [];
   const nbrs = d.neighbors || [];
@@ -1568,9 +1634,10 @@ $('#cfg-rsc').addEventListener('input', updateCfgSha);
 
 // ── liveness dot + initial load ──
 fetch('/healthz').then(r=>{ $('#health').style.background = r.ok ? 'var(--ok)' : 'var(--bad)'; }).catch(()=>{ $('#health').style.background='var(--bad)'; });
-if (tok()) loadFleet();
-// Refresh the fleet list periodically only while it's the visible view.
-setInterval(()=>{ if (!curSerial) loadFleet(); }, 5000);
+if (tok()){ loadFleet(); initRealtime(); }
+// Fleet-list heartbeat (cheap: loadFleet diff-skips unchanged grids). With Realtime live,
+// pushes drive updates so this is just a slow safety net.
+setInterval(()=>{ if (!curSerial) loadFleet(); }, rtLive ? 20000 : 5000);
 // Re-flow charts on resize (debounced) so the SVG viewBox tracks the container width.
 let rzT=null;
 window.addEventListener('resize', ()=>{ if(rzT)clearTimeout(rzT); rzT=setTimeout(()=>{ if(curSerial) refreshHistory(); }, 250); });

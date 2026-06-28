@@ -146,10 +146,17 @@ const portChannel = vigilant
 Same pattern for `lte_state`, `neighbors`, `config_jobs`, `alerts` — swap `table`, and add
 `filter: \`device_id=eq.${deviceId}\`` where you want a single device's rows.
 
-> **RLS / grants:** these tables are in a non-`public` schema served to authenticated
-> Watchman users. The Realtime-published tables need RLS / grants for the role Watchman's
-> Supabase auth uses. The ingest writes via its own scoped `pg` role and does not use the
-> frontend keys.
+> **RLS / grants — now provided.** Apply **`docs/VIGILANT-RLS.sql`** (also embedded in
+> `db/schema.sql`) once as the postgres superuser. It grants the Supabase **`authenticated`**
+> role `SELECT` + adds RLS `SELECT` policies on `v_fleet`, `devices`, and the live tables —
+> so a logged-in Watchman user (anon key + their user JWT) can read and subscribe, while the
+> public **`anon`** role gets **nothing**. The ingest still writes via its own scoped `pg` role.
+>
+> ⚠️ **WiFi passphrase:** `wifi_networks.passphrase` is withheld by a column-level grant and
+> the table is **not** in the Realtime publication — so a `select('*')` won't return the PSK
+> and it's never broadcast. Read SSID/channel/clients via Supabase as normal; fetch the **PSK
+> only through the Vercel proxy** (`GET /devices/:serial`, admin-gated) when a user reveals it.
+> For multi-tenant scoping, see the per-customer policy note at the bottom of `VIGILANT-RLS.sql`.
 
 ### 4c. React hook — first paint + live, in one place
 

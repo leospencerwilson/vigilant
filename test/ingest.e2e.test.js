@@ -277,6 +277,49 @@ test("POST /speedtest/result with a malformed job_id -> 404, and the ingest keep
   }
 });
 
+test("POST /realtime/config: 501 unconfigured; admin-gated; mints a verifiable authenticated JWT", async () => {
+  const crypto = require("node:crypto");
+  // ── unconfigured → 501 (dashboard stays on polling) ──
+  delete process.env.SUPABASE_URL; delete process.env.SUPABASE_ANON_KEY; delete process.env.SUPABASE_JWT_SECRET;
+  {
+    const server = createServer({ store: makeMemStore(), config: makeConfig() });
+    const port = await listen(server);
+    try {
+      const r = await request(port, { method: "POST", path: "/realtime/config", token: ENROLL_TOKEN });
+      assert.equal(r.status, 501, "501 when Supabase isn't configured");
+    } finally { await close(server); }
+  }
+  // ── configured → mints a short-lived authenticated JWT ──
+  process.env.SUPABASE_URL = "https://sb.example";
+  process.env.SUPABASE_ANON_KEY = "anon-123";
+  process.env.SUPABASE_JWT_SECRET = "super-secret-jwt";
+  try {
+    const server = createServer({ store: makeMemStore(), config: makeConfig() });
+    const port = await listen(server);
+    try {
+      const unauth = await request(port, { method: "POST", path: "/realtime/config" });
+      assert.equal(unauth.status, 401, "admin-gated (no token)");
+
+      const r = await request(port, { method: "POST", path: "/realtime/config", token: ENROLL_TOKEN });
+      assert.equal(r.status, 200);
+      assert.equal(r.body.url, "https://sb.example");
+      assert.equal(r.body.anonKey, "anon-123");
+      assert.equal(r.body.schema, "vigilant");
+
+      const parts = String(r.body.token).split(".");
+      assert.equal(parts.length, 3, "JWT has header.payload.signature");
+      const expSig = crypto.createHmac("sha256", "super-secret-jwt").update(parts[0] + "." + parts[1])
+        .digest("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      assert.equal(parts[2], expSig, "HS256 signature verifies with the secret");
+      const payload = JSON.parse(Buffer.from(parts[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString());
+      assert.equal(payload.role, "authenticated", "role claim drives RLS");
+      assert.ok(payload.exp > Math.floor(Date.now() / 1000), "not already expired");
+    } finally { await close(server); }
+  } finally {
+    delete process.env.SUPABASE_URL; delete process.env.SUPABASE_ANON_KEY; delete process.env.SUPABASE_JWT_SECRET;
+  }
+});
+
 test("POST /telemetry without a valid bearer -> 401", async () => {
   const config = makeConfig();
   const store = makeMemStore();
