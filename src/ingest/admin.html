@@ -183,7 +183,7 @@
   .ltegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px}
   .lte-cell{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px}
   .lte-cell .lab{font-size:10px;text-transform:uppercase;color:var(--mut);letter-spacing:.05em}
-  .lte-cell .v{font-family:var(--mono);font-size:14px;margin-top:3px}
+  .lte-cell .v{font-family:var(--mono);font-size:14px;margin-top:3px;overflow-wrap:anywhere;word-break:break-all;line-height:1.35}
   /* ── LTE signal bars ── */
   .ltebars{display:flex;align-items:flex-end;gap:3px;height:28px}
   .ltebars .bar{width:7px;border-radius:2px 2px 0 0;background:var(--line)}
@@ -224,7 +224,10 @@
   .availbar .seg.down{background:rgba(239,68,68,.55)}
   .availbar .seg.none{background:var(--line)}
   /* ── topology map ── */
-  #d-topo{width:100%;height:320px;display:block}
+  #d-topo{width:100%;height:460px;display:block;cursor:grab;touch-action:none;user-select:none}
+  #d-topo:active{cursor:grabbing}
+  #d-topo .ihub{fill:#0b1220;stroke:var(--mut);stroke-width:1.5}
+  #d-topo .ihublbl{fill:var(--fg);font-family:var(--mono);font-size:10px}
   #d-topo text{font-family:var(--mono);font-size:10px;fill:var(--fg)}
   #d-topo .edge{stroke:#1f2a37;stroke-width:1.5}
   #d-topo .elbl{fill:#8b9aa9;font-size:9px}
@@ -551,8 +554,9 @@ function dash(v, suffix){ return (v==null||v==='') ? '—' : (esc(v)+(suffix||''
 //   * guard against overlapping polls on the slow VM (_busy),
 //   * pause polling when the tab is hidden (visibilitychange).
 let _sec = {};                                  // section key -> last signature (reset per view)
+let _topoView = { k:1, x:0, y:0 };              // topology pan/zoom transform (persists across ticks)
 function secChanged(key, sig){ if (_sec[key] === sig) return false; _sec[key] = sig; return true; }
-function resetSections(){ _sec = {}; }
+function resetSections(){ _sec = {}; _topoView = { k:1, x:0, y:0 }; }
 const _busy = { dev:false, hist:false, fleet:false };
 
 // ════════════════════ OUI -> vendor (manufacturer) lookup ════════════════════
@@ -1397,34 +1401,97 @@ function renderLteBars(rsrp){
 
 // Radial topology: this device in the centre, one node per LLDP/CDP neighbour around it,
 // edges labelled with the local interface. Pure SVG, redrawn each device refresh.
+// Colour a neighbour node by its advertised platform (best-effort identity cue).
+function topoColor(platform){
+  const p = String(platform||'').toLowerCase();
+  if (p.includes('mikrotik')) return 'var(--acc)';
+  if (p.includes('yealink')) return 'var(--vpn)';
+  if (p.includes('cisco') || p.includes('hp') || p.includes('aruba') || p.includes('ubiquiti')) return 'var(--lan)';
+  return 'var(--mut)';
+}
+
+// Topology: this device in the centre, one HUB per local interface, neighbours clustered
+// around their interface hub (so you can see WHICH PORT each device hangs off — not just a flat
+// ring). Pan with drag, zoom with the wheel, double-click to reset. Pan/zoom state persists in
+// _topoView across the (guarded) re-renders.
 function renderTopology(dev, nbrs){
   const svg = $('#d-topo'); if (!svg) return;
   while (svg.firstChild) svg.removeChild(svg.firstChild);
-  const W = svg.clientWidth || 800, H = 320;
+  const W = svg.clientWidth || 900, H = 460;
   svg.setAttribute('viewBox', '0 0 '+W+' '+H);
-  $('#d-topocount').textContent = nbrs.length ? (nbrs.length + ' neighbour' + (nbrs.length>1?'s':'')) : '';
+  $('#d-topocount').textContent = nbrs.length
+    ? (nbrs.length + ' neighbour' + (nbrs.length>1?'s':'') + '  ·  scroll = zoom · drag = pan · dbl-click = reset')
+    : '';
   if (!nbrs.length){
     const t = svgEl('text', { x:W/2, y:H/2, 'text-anchor':'middle', fill:'#8b9aa9' });
     t.textContent = 'No LLDP/CDP neighbours seen.'; svg.appendChild(t); return;
   }
-  const cx = W/2, cy = H/2, R = Math.min(W, H)/2 - 56, n = nbrs.length;
-  nbrs.forEach((nb,i)=>{
-    const ang = (i/n)*2*Math.PI - Math.PI/2;
-    const nx = cx + R*Math.cos(ang), ny = cy + R*Math.sin(ang);
-    svg.appendChild(svgEl('line', { class:'edge', x1:cx, y1:cy, x2:nx, y2:ny }));
-    const il = svgEl('text', { class:'elbl', x:(cx+nx)/2, y:(cy+ny)/2 - 2, 'text-anchor':'middle' });
-    il.textContent = nb.interface || ''; svg.appendChild(il);
-    svg.appendChild(svgEl('circle', { cx:nx, cy:ny, r:24, fill:'#0e141d', stroke:'#1f2a37', 'stroke-width':1.5 }));
-    const lbl = String(nb.identity || nb.address || nb.mac || '?');
-    const t = svgEl('text', { x:nx, y:ny+3, 'text-anchor':'middle' }); t.textContent = lbl.slice(0,13);
-    const title = svgEl('title', {}); title.textContent = (nb.identity||'') + (nb.mac?(' · '+nb.mac):'') + (nb.platform?(' · '+nb.platform):'');
-    t.appendChild(title); svg.appendChild(t);
-    if (nb.platform){ const p = svgEl('text', { class:'elbl', x:nx, y:ny+15, 'text-anchor':'middle' }); p.textContent = String(nb.platform).slice(0,16); svg.appendChild(p); }
+
+  // All drawn content lives in this group; pan/zoom just sets its transform.
+  const g = svgEl('g', {}); svg.appendChild(g);
+  const applyT = () => g.setAttribute('transform', `translate(${_topoView.x} ${_topoView.y}) scale(${_topoView.k})`);
+
+  // Group neighbours by the local interface they were seen on.
+  const byIf = new Map();
+  for (const nb of nbrs){ const k = nb.interface || '?'; if (!byIf.has(k)) byIf.set(k, []); byIf.get(k).push(nb); }
+  const ifs = [...byIf.keys()];
+  const cx = W/2, cy = H/2;
+  const R1 = Math.min(W, H)/2 - 120;   // interface-hub ring radius
+
+  ifs.forEach((ifn, ii) => {
+    const a = (ii/ifs.length)*2*Math.PI - Math.PI/2;
+    const hx = cx + R1*Math.cos(a), hy = cy + R1*Math.sin(a);
+    g.appendChild(svgEl('line', { class:'edge', x1:cx, y1:cy, x2:hx, y2:hy, 'stroke-width':1.5 }));
+
+    const members = byIf.get(ifn);
+    const R2 = Math.max(46, 18 + members.length*7);   // cluster radius grows with member count
+    members.forEach((nb, mi) => {
+      const a2 = (mi/members.length)*2*Math.PI - Math.PI/2;
+      const nx = hx + R2*Math.cos(a2), ny = hy + R2*Math.sin(a2);
+      g.appendChild(svgEl('line', { class:'edge', x1:hx, y1:hy, x2:nx, y2:ny }));
+      const col = topoColor(nb.platform);
+      g.appendChild(svgEl('circle', { cx:nx, cy:ny, r:22, fill:'#0e141d', stroke:col, 'stroke-width':1.8 }));
+      const lbl = String(nb.identity || nb.address || nb.mac || '?');
+      const t = svgEl('text', { x:nx, y:ny+3, 'text-anchor':'middle', fill:'var(--fg)' });
+      t.textContent = lbl.length>14 ? lbl.slice(0,13)+'…' : lbl;
+      const title = svgEl('title', {});
+      title.textContent = (nb.identity||'(no identity)') + (nb.mac?(' · '+nb.mac):'') + (nb.platform?(' · '+nb.platform):'') + (nb.interface?(' · '+nb.interface):'');
+      t.appendChild(title); g.appendChild(t);
+      if (nb.platform){ const p = svgEl('text', { class:'elbl', x:nx, y:ny+15, 'text-anchor':'middle' }); p.textContent = String(nb.platform).slice(0,16); g.appendChild(p); }
+    });
+
+    // Interface hub on top of its cluster edges.
+    g.appendChild(svgEl('circle', { class:'ihub', cx:hx, cy:hy, r:16 }));
+    const hl = svgEl('text', { class:'ihublbl', x:hx, y:hy+3, 'text-anchor':'middle' });
+    hl.textContent = (ifn.length>10 ? ifn.slice(0,9)+'…' : ifn);
+    const ht = svgEl('title', {}); ht.textContent = ifn + ' — ' + members.length + ' device' + (members.length>1?'s':''); hl.appendChild(ht);
+    g.appendChild(hl);
   });
-  // centre node last so it sits on top of the edge ends
-  svg.appendChild(svgEl('circle', { cx:cx, cy:cy, r:32, fill:'#13243a', stroke:'#3b82f6', 'stroke-width':2 }));
-  const c = svgEl('text', { x:cx, y:cy+4, 'text-anchor':'middle' });
-  c.textContent = String(dev.site_name || dev.identity || dev.serial || 'this').slice(0,15); svg.appendChild(c);
+
+  // Centre node (this device) last so it sits on top.
+  g.appendChild(svgEl('circle', { cx:cx, cy:cy, r:34, fill:'#13243a', stroke:'var(--acc)', 'stroke-width':2 }));
+  const c = svgEl('text', { x:cx, y:cy+4, 'text-anchor':'middle', fill:'var(--fg)' });
+  c.textContent = String(dev.site_name || dev.identity || dev.serial || 'this').slice(0,16);
+  g.appendChild(c);
+
+  applyT();
+
+  // ── interactions (property handlers → reassigned each render, no listener leak) ──
+  const toViewBox = (e) => { const r = svg.getBoundingClientRect(); return { mx:(e.clientX-r.left)*(W/(r.width||W)), my:(e.clientY-r.top)*(H/(r.height||H)), sx:W/(r.width||W), sy:H/(r.height||H) }; };
+  let dragging = false, lastX = 0, lastY = 0;
+  svg.onwheel = (e) => {
+    e.preventDefault();
+    const { mx, my } = toViewBox(e);
+    const k2 = Math.max(0.3, Math.min(6, _topoView.k * (e.deltaY < 0 ? 1.15 : 1/1.15)));
+    _topoView.x = mx - (mx - _topoView.x) * (k2/_topoView.k);
+    _topoView.y = my - (my - _topoView.y) * (k2/_topoView.k);
+    _topoView.k = k2; applyT();
+  };
+  svg.onmousedown = (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; };
+  svg.onmousemove = (e) => { if (!dragging) return; const { sx, sy } = toViewBox(e); _topoView.x += (e.clientX-lastX)*sx; _topoView.y += (e.clientY-lastY)*sy; lastX = e.clientX; lastY = e.clientY; applyT(); };
+  svg.onmouseup = () => { dragging = false; };
+  svg.onmouseleave = () => { dragging = false; };
+  svg.ondblclick = () => { _topoView = { k:1, x:0, y:0 }; applyT(); };
 }
 
 async function refreshHistory(){

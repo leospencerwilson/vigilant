@@ -898,7 +898,10 @@ async function speedtestUp(ctx) {
   req.on('end', () => {
     const secs = t0 !== null ? Number(process.hrtime.bigint() - t0) / 1e9 : 0;
     const bps = secs > 0 ? Math.round((bytes * 8) / secs) : null;
-    Promise.resolve(store.recordSpeedtestResult(jobId, { up_bps: bps, status: 'done', result_log: 'down+up measured' })).catch(() => {});
+    // Distinguish "upload measured" from "request arrived but carried no body" (the agent's
+    // file upload didn't attach data) so a blank up_bps is explainable rather than silent.
+    const log = bytes > 0 ? 'down+up measured' : 'upload: no body received from device';
+    Promise.resolve(store.recordSpeedtestResult(jobId, { up_bps: bps, status: 'done', result_log: log })).catch(() => {});
     json(res, 200, { ok: true, bytes });
   });
   req.on('error', () => { try { json(res, 400, { ok: false, error: 'upload error' }); } catch (e) { /* sent */ } });

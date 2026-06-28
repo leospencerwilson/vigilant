@@ -189,9 +189,11 @@ function createServer({ store, config: cfg }) {
         ctx.device = device;
         return handlers.speedtestDown(ctx);
       }
-      // POST /speedtest/up — streamed upload; do NOT pre-buffer the body, the handler
-      // consumes the stream itself so it can TIME the transfer.
-      if (method === 'POST' && pathname === '/speedtest/up') {
+      // POST|PUT /speedtest/up — streamed upload; do NOT pre-buffer the body, the handler
+      // consumes the stream itself so it can TIME the transfer. We accept PUT as well as POST
+      // because RouterOS `/tool fetch upload=yes` issues an HTTP PUT on several builds — a
+      // POST-only route 404s that, so the body never arrives and up_bps stays empty.
+      if ((method === 'POST' || method === 'PUT') && pathname === '/speedtest/up') {
         const device = await authDevice(req, store);
         if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = device;
