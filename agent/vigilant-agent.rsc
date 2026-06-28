@@ -911,25 +911,30 @@
             :local dlok false
             :local ulok false
             :do { /file remove [find name="vigilant-speedtest.bin"] } on-error={}
-            # DOWNLOAD leg → temp file (server times the send).
+            # DOWNLOAD leg → temp file (the server times its own SEND → down_bps, so this works
+            # even if the file save is imperfect). dlok is set from the FILE actually landing,
+            # not from fetch not-throwing — otherwise we'd try to upload a missing file.
             :if ([:len $durl] > 0) do={
                 :do {
                     /tool fetch url=$durl http-method=get mode=https check-certificate=$vigilantCC \
                         http-header-field=("Authorization: Bearer " . $vigilantToken) \
                         dst-path="vigilant-speedtest.bin"
-                    :set dlok true
-                } on-error={ :set dlok true }
+                } on-error={}
             }
-            # UPLOAD leg → POST the file back (server times the receive). HTTP file upload via
-            # /tool fetch is best-effort across ROS builds; on failure we still report 'done'
-            # because the download leg already gave us a measurement.
+            :if ([:len [/file find name="vigilant-speedtest.bin"]] > 0) do={ :set dlok true }
+            # UPLOAD leg → POST the file back (server times its RECEIVE → up_bps). Do NOT set
+            # http-method=post: `upload=yes` already POSTs the file, and on several ROS builds the
+            # two together error ("post needs http-data"). Capture the REAL error so a failure is
+            # diagnosable in the log rather than a silent ul=false.
             :if (($dlok) && ([:len $uurl] > 0)) do={
-                :do {
-                    /tool fetch url=$uurl http-method=post mode=https check-certificate=$vigilantCC \
+                :local uerr ""
+                :onerror perr in={
+                    /tool fetch url=$uurl mode=https check-certificate=$vigilantCC \
                         http-header-field=("Authorization: Bearer " . $vigilantToken) \
                         src-path="vigilant-speedtest.bin" upload=yes output=none
                     :set ulok true
-                } on-error={ :set ulok false }
+                } do={ :set uerr $perr }
+                :if ([:len $uerr] > 0) do={ :log warning ("vigilant-agent: speedtest upload failed: " . $uerr) }
             }
             :do { /file remove [find name="vigilant-speedtest.bin"] } on-error={}
             :local sst "done"
