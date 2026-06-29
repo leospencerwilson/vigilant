@@ -41,26 +41,13 @@ async function sendEmail({ apiKey, from, to, subject, text }) {
   );
 }
 
-// Send a Microsoft Teams message via an incoming webhook (legacy MessageCard — widely
-// supported by the classic "Incoming Webhook" connector). `themeColor` tints the card.
-async function sendTeams({ webhook, title, text, themeColor }) {
+// POST a FLAT JSON payload to a Teams notifier (a Power Automate "When an HTTP request is
+// received" flow). Deliberately flat — single-level object, all string values, NO nested
+// objects/arrays — so the flow's request schema maps each field straight into the Teams
+// message / Adaptive Card. `payload` is the flat object (see the schema in the notify docs).
+async function sendTeams({ webhook, payload }) {
   if (!webhook) return { ok: false, skipped: true };
-  const card = {
-    '@type': 'MessageCard',
-    '@context': 'https://schema.org/extensions',
-    themeColor: themeColor || '0078D7',
-    summary: title || 'Vigilant alert',
-    title: title || 'Vigilant alert',
-    text: text || '',
-  };
-  return post(webhook, { 'content-type': 'application/json' }, JSON.stringify(card));
-}
-
-// Map alert severity → a Teams card colour.
-function severityColor(sev) {
-  if (sev === 'critical') return 'D13438';
-  if (sev === 'warning') return 'F2A900';
-  return '0078D7';
+  return post(webhook, { 'content-type': 'application/json' }, JSON.stringify(payload));
 }
 
 // Dispatch one alert transition to whichever channels the rule configured.
@@ -95,13 +82,22 @@ async function dispatchAlert(t, { config, logger } = {}) {
     if (!results.email.ok && !results.email.skipped) lg.warn('notify: email send failed', { rule: rule.name, status: results.email.status });
   }
   if (rule.notify_teams_webhook) {
-    results.teams = await sendTeams({
-      webhook: rule.notify_teams_webhook, title: subject,
-      text: text.replace(/\n/g, '  \n'), themeColor: severityColor(rule.severity),
-    });
+    // FLAT payload for the Power Automate flow — no nested objects/arrays.
+    const payload = {
+      title: subject,
+      severity: String(rule.severity || 'warning'),
+      state: t.kind,                                   // 'open' | 'clear'
+      rule: rule.name || 'alert',
+      site: where,
+      serial: t.serial || '',
+      detail: t.detail || '',
+      value: t.value == null ? '' : String(t.value),
+      timestamp: new Date().toISOString(),
+    };
+    results.teams = await sendTeams({ webhook: rule.notify_teams_webhook, payload });
     if (!results.teams.ok && !results.teams.skipped) lg.warn('notify: teams send failed', { rule: rule.name, status: results.teams.status });
   }
   return { sent: true, results };
 }
 
-module.exports = { sendEmail, sendTeams, dispatchAlert, severityColor };
+module.exports = { sendEmail, sendTeams, dispatchAlert };

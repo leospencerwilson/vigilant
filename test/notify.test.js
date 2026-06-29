@@ -40,8 +40,11 @@ test("dispatchAlert(open): sends BOTH email (Resend) and Teams", async () => {
     assert.match(eb.subject, /Allied X/);
     assert.ok(teams, "Teams POSTed to the webhook");
     const tb = JSON.parse(teams.opts.body);
-    assert.equal(tb["@type"], "MessageCard");
-    assert.match(tb.text, /cpu_load > 90/);
+    assert.equal(tb.state, "open");
+    assert.equal(tb.severity, "critical");
+    assert.equal(tb.rule, "CPU high");
+    assert.match(tb.detail, /cpu_load > 90/);
+    assert.ok(Object.values(tb).every((v) => v === null || typeof v !== "object"), "payload is FLAT (no nested objects/arrays)");
   });
 });
 

@@ -1028,6 +1028,43 @@ function makePgStore(poolOrConfig) {
   // Evaluate each enabled rule against current device_state and open/clear alerts.
   // The threshold decision itself is transform.evaluateAlert (pure, unit-tested); this
   // method only does the store reads/writes around it.
+  // ── alert-rule CRUD (operator-facing; backs the Rules UI) ──────────────────────
+  async function listAlertRules() {
+    return rows(`SELECT * FROM alert_rules ORDER BY id`, []);
+  }
+  // Shared param vector for insert/update (full-object semantics — the form sends every field).
+  function ruleParams(f) {
+    return [
+      f.name, f.metric, f.comparator || '>=', nz(f.threshold),
+      f.for_seconds != null ? f.for_seconds : 0, f.severity || 'warning',
+      nz(f.scope_tag), f.enabled !== false,
+      nz(f.notify_email), nz(f.notify_teams_webhook), f.notify_on || 'both', nz(f.neighbor_platform),
+    ];
+  }
+  async function createAlertRule(f) {
+    return one(
+      `INSERT INTO alert_rules
+         (name,metric,comparator,threshold,for_seconds,severity,scope_tag,enabled,
+          notify_email,notify_teams_webhook,notify_on,neighbor_platform)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+      ruleParams(f)
+    );
+  }
+  async function updateAlertRule(id, f) {
+    return one(
+      `UPDATE alert_rules SET
+         name=$2, metric=$3, comparator=$4, threshold=$5, for_seconds=$6, severity=$7,
+         scope_tag=$8, enabled=$9, notify_email=$10, notify_teams_webhook=$11,
+         notify_on=$12, neighbor_platform=$13
+       WHERE id=$1 RETURNING *`,
+      [id, ...ruleParams(f)]
+    );
+  }
+  async function deleteAlertRule(id) {
+    const r = await q(`DELETE FROM alert_rules WHERE id=$1`, [id]);
+    return (r.rowCount || 0) > 0;
+  }
+
   async function evaluateAndApplyAlerts(rulesIn) {
     const rules = Array.isArray(rulesIn) ? rulesIn : await getActiveAlertRules();
     let opened = 0;
@@ -1275,6 +1312,10 @@ function makePgStore(poolOrConfig) {
     getDeviceHistory,
     markStaleDevices,
     getActiveAlertRules,
+    listAlertRules,
+    createAlertRule,
+    updateAlertRule,
+    deleteAlertRule,
     evaluateAndApplyAlerts,
     downsampleHistory,
     pruneHistory,

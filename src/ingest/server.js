@@ -116,7 +116,7 @@ function applyCors(req, res, cfg) {
   }
   res.setHeader('Access-Control-Allow-Origin', value);
   res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'authorization, content-type');
   res.setHeader('Access-Control-Max-Age', '600');
 }
@@ -268,6 +268,29 @@ function createServer({ store, config: cfg }) {
       if (method === 'POST' && pathname === '/realtime/config') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         return handlers.realtimeConfig(ctx);
+      }
+
+      // ── alert-rule CRUD (admin) — backs the Rules UI ──
+      if (method === 'GET' && pathname === '/alert-rules') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.alertRulesList(ctx);
+      }
+      if (method === 'POST' && pathname === '/alert-rules') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return handlers.alertRuleCreate(ctx);
+      }
+      const mRule = /^\/alert-rules\/([^/]+)$/.exec(pathname);
+      if (mRule && (method === 'PUT' || method === 'PATCH')) {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mRule[1]) };
+        ctx.body = await readBody(req);
+        return handlers.alertRuleUpdate(ctx);
+      }
+      if (mRule && method === 'DELETE') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mRule[1]) };
+        return handlers.alertRuleDelete(ctx);
       }
 
       // GET /devices/:serial/history?window=1h (admin) — dashboard chart series.

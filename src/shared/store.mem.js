@@ -718,6 +718,43 @@ function makeMemStore(_config) {
     return alertRules.filter((r) => r.enabled !== false).map((r) => ({ ...r }));
   }
 
+  // ── alert-rule CRUD (operator-facing; backs the Rules UI) ──
+  async function listAlertRules() {
+    return alertRules.map((r) => ({ ...r }));
+  }
+  async function createAlertRule(f) {
+    return _test.addAlertRule(f || {});
+  }
+  function buildRuleRow(id, u) {
+    return {
+      id,
+      name: u.name || `rule-${id}`,
+      metric: u.metric,
+      comparator: u.comparator || '>=',
+      threshold: u.threshold != null ? u.threshold : null,
+      for_seconds: u.for_seconds != null ? u.for_seconds : 0,
+      severity: u.severity || 'warning',
+      scope_tag: u.scope_tag != null ? u.scope_tag : null,
+      enabled: u.enabled !== false,
+      notify_email: u.notify_email != null ? u.notify_email : null,
+      notify_teams_webhook: u.notify_teams_webhook != null ? u.notify_teams_webhook : null,
+      notify_on: u.notify_on != null ? u.notify_on : 'both',
+      neighbor_platform: u.neighbor_platform != null ? u.neighbor_platform : null,
+    };
+  }
+  async function updateAlertRule(id, f) {
+    const i = alertRules.findIndex((x) => String(x.id) === String(id));
+    if (i < 0) return null;
+    alertRules[i] = buildRuleRow(alertRules[i].id, f || {});
+    return { ...alertRules[i] };
+  }
+  async function deleteAlertRule(id) {
+    const i = alertRules.findIndex((x) => String(x.id) === String(id));
+    if (i < 0) return false;
+    alertRules.splice(i, 1);
+    return true;
+  }
+
   /**
    * Evaluate each active rule against current device_state and open/clear alerts.
    * The threshold decision lives in transform.evaluateAlert — required lazily so this
@@ -961,6 +998,10 @@ function makeMemStore(_config) {
     getDeviceHistory,
     markStaleDevices,
     getActiveAlertRules,
+    listAlertRules,
+    createAlertRule,
+    updateAlertRule,
+    deleteAlertRule,
     evaluateAndApplyAlerts,
     downsampleHistory,
     pruneHistory,

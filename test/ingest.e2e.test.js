@@ -361,6 +361,41 @@ test("CORS + scoped FIELD_ENROLL_TOKEN: preflight OK; field key enrols + reads (
   }
 });
 
+test("alert-rule CRUD (admin): create → list → update → delete, with validation + auth", async () => {
+  const server = createServer({ store: makeMemStore(), config: makeConfig() });
+  const port = await listen(server);
+  try {
+    const c = await request(port, { method: "POST", path: "/alert-rules", token: ENROLL_TOKEN,
+      body: { name: "CPU high", metric: "cpu_load", comparator: ">", threshold: 90, severity: "critical", notify_email: "noc@wcn", notify_teams_webhook: "https://teams/x", notify_on: "both" } });
+    assert.equal(c.status, 201);
+    const id = c.body.rule.id;
+    assert.ok(id, "create returns the new rule id");
+    assert.equal(c.body.rule.notify_email, "noc@wcn");
+
+    const l = await request(port, { method: "GET", path: "/alert-rules", token: ENROLL_TOKEN });
+    assert.equal(l.status, 200);
+    assert.ok(l.body.rules.some((r) => r.id === id), "rule appears in the list");
+
+    const u = await request(port, { method: "PUT", path: `/alert-rules/${id}`, token: ENROLL_TOKEN,
+      body: { name: "CPU high", metric: "cpu_load", comparator: ">", threshold: 80, severity: "warning", notify_on: "open" } });
+    assert.equal(u.status, 200);
+    assert.equal(u.body.rule.threshold, 80, "update applied");
+    assert.equal(u.body.rule.notify_on, "open");
+
+    const bad = await request(port, { method: "POST", path: "/alert-rules", token: ENROLL_TOKEN, body: { metric: "cpu_load" } });
+    assert.equal(bad.status, 400, "name required");
+    const noauth = await request(port, { method: "GET", path: "/alert-rules" });
+    assert.equal(noauth.status, 401, "admin-gated");
+
+    const d = await request(port, { method: "DELETE", path: `/alert-rules/${id}`, token: ENROLL_TOKEN });
+    assert.equal(d.status, 200);
+    const d2 = await request(port, { method: "DELETE", path: `/alert-rules/${id}`, token: ENROLL_TOKEN });
+    assert.equal(d2.status, 404, "second delete is not-found");
+  } finally {
+    await close(server);
+  }
+});
+
 test("POST /telemetry without a valid bearer -> 401", async () => {
   const config = makeConfig();
   const store = makeMemStore();

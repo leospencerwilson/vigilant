@@ -604,6 +604,54 @@ async function enroll(ctx) {
   return json(res, 200, { token, serial, install, bootstrap: install });
 }
 
+// ── alert-rule CRUD (admin) — backs the Rules UI ─────────────────────
+const ALERT_COMPARATORS = new Set(['>', '>=', '<', '<=', '==', 'offline']);
+const NOTIFY_ON = new Set(['open', 'clear', 'both']);
+
+function parseRuleBody(body) {
+  try { return JSON.parse(body || ''); } catch (e) { return null; }
+}
+function validateRule(r) {
+  if (!r || typeof r.name !== 'string' || !r.name.trim()) return 'name required';
+  if (typeof r.metric !== 'string' || !r.metric.trim()) return 'metric required';
+  if (r.comparator != null && !ALERT_COMPARATORS.has(r.comparator)) return 'invalid comparator';
+  if (r.notify_on != null && !NOTIFY_ON.has(r.notify_on)) return 'invalid notify_on';
+  return null;
+}
+
+async function alertRulesList(ctx) {
+  const { res, store } = ctx;
+  const rules = typeof store.listAlertRules === 'function' ? await store.listAlertRules() : [];
+  return json(res, 200, { ok: true, rules: rules || [] });
+}
+async function alertRuleCreate(ctx) {
+  const { res, store, body } = ctx;
+  if (typeof store.createAlertRule !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const r = parseRuleBody(body);
+  if (!r) return json(res, 400, { ok: false, error: 'bad json' });
+  const err = validateRule(r);
+  if (err) return json(res, 400, { ok: false, error: err });
+  const created = await store.createAlertRule(r);
+  return json(res, 201, { ok: true, rule: created });
+}
+async function alertRuleUpdate(ctx) {
+  const { res, store, body, params } = ctx;
+  if (typeof store.updateAlertRule !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const r = parseRuleBody(body);
+  if (!r) return json(res, 400, { ok: false, error: 'bad json' });
+  const err = validateRule(r);
+  if (err) return json(res, 400, { ok: false, error: err });
+  const updated = await store.updateAlertRule(params.id, r);
+  if (!updated) return json(res, 404, { ok: false, error: 'not found' });
+  return json(res, 200, { ok: true, rule: updated });
+}
+async function alertRuleDelete(ctx) {
+  const { res, store, params } = ctx;
+  if (typeof store.deleteAlertRule !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const ok = await store.deleteAlertRule(params.id);
+  return ok ? json(res, 200, { ok: true }) : json(res, 404, { ok: false, error: 'not found' });
+}
+
 // ── GET /fleet (admin) ───────────────────────────────────────────────
 async function fleet(ctx) {
   const { res, store } = ctx;
@@ -998,6 +1046,10 @@ module.exports = {
   adminUi,
   adminMigrate,
   realtimeConfig,
+  alertRulesList,
+  alertRuleCreate,
+  alertRuleUpdate,
+  alertRuleDelete,
   telemetry: telemetryIngest,
   agentScript,
   configPending,
