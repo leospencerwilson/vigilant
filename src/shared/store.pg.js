@@ -452,7 +452,13 @@ function makePgStore(poolOrConfig) {
           `INSERT INTO wifi_networks
              (device_id, interface, driver, band, ssid, passphrase, security,
               channel, frequency_mhz, width_mhz, disabled, hidden, clients, last_seen_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, now())`,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, now())
+           ON CONFLICT (device_id, interface) DO UPDATE SET
+             driver=EXCLUDED.driver, band=EXCLUDED.band, ssid=EXCLUDED.ssid,
+             passphrase=EXCLUDED.passphrase, security=EXCLUDED.security, channel=EXCLUDED.channel,
+             frequency_mhz=EXCLUDED.frequency_mhz, width_mhz=EXCLUDED.width_mhz,
+             disabled=EXCLUDED.disabled, hidden=EXCLUDED.hidden, clients=EXCLUDED.clients,
+             last_seen_at=now()`,
           [
             deviceId,
             r.interface,
@@ -484,7 +490,10 @@ function makePgStore(poolOrConfig) {
         await client.query(
           `INSERT INTO wireless_clients
              (device_id, interface, mac, signal, tx_ccq, rx_rate, tx_rate, uptime_s, sampled_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())`,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
+           ON CONFLICT (device_id, interface, mac) DO UPDATE SET
+             signal=EXCLUDED.signal, tx_ccq=EXCLUDED.tx_ccq, rx_rate=EXCLUDED.rx_rate,
+             tx_rate=EXCLUDED.tx_rate, uptime_s=EXCLUDED.uptime_s, sampled_at=now()`,
           [deviceId, r.interface, r.mac, nz(r.signal), nz(r.tx_ccq), nz(r.rx_rate), nz(r.tx_rate), nz(r.uptime_s)]
         );
       }
