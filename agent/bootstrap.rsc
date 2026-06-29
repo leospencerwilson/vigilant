@@ -86,10 +86,14 @@
         :if ($sz < 2000) do={
             :log warning ("vigilant-bootstrap: downloaded agent too small (" . $sz . " bytes) - keeping existing agent")
         } else={
+            # 3) Back up the CURRENT working agent so a bad update can be ROLLED BACK — a box
+            #    must never be left with an agent that errors every second (= no telemetry).
+            :local prev ""
+            :do { :set prev [/system script get [find name="vigilant-agent"] source] } on-error={}
             :if ([:len [/system script find name="vigilant-agent"]] > 0) do={
                 /system script remove [find name="vigilant-agent"]
             }
-            # 3) Install — capture a PARSE error (e.g. truncation / size limit) with its reason.
+            # 4) Install — capture a PARSE error (e.g. truncation / size limit) with its reason.
             :local aerr ""
             :onerror e2 in={
                 /system script add name=vigilant-agent dont-require-permissions=no \
@@ -97,13 +101,22 @@
             } do={ :set aerr $e2 }
             :if ([:len $aerr] > 0) do={
                 :log error ("vigilant-bootstrap: agent install failed: " . $aerr)
+                :if ([:len $prev] > 0) do={
+                    /system script add name=vigilant-agent dont-require-permissions=no source=$prev
+                    :log warning "vigilant-bootstrap: rolled back to previous agent"
+                }
             } else={
-                # 4) Test-run ONCE so a RUNTIME error is logged HERE with its reason — instead of
-                #    the cryptic per-second "executing script from scheduler failed".
+                # 5) Test-run ONCE. A runtime error means the new agent is bad → ROLL BACK to the
+                #    backed-up one, so the box keeps a working agent instead of failing per-second.
                 :local rerr ""
                 :onerror e3 in={ /system script run vigilant-agent } do={ :set rerr $e3 }
                 :if ([:len $rerr] > 0) do={
                     :log error ("vigilant-bootstrap: agent first-run error: " . $rerr)
+                    :if ([:len $prev] > 0) do={
+                        /system script remove [find name="vigilant-agent"]
+                        /system script add name=vigilant-agent dont-require-permissions=no source=$prev
+                        :log warning "vigilant-bootstrap: rolled back to previous agent (telemetry kept alive)"
+                    }
                 } else={
                     :log info "vigilant-bootstrap: agent updated; first run OK"
                 }
