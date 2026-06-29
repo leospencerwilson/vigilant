@@ -68,19 +68,47 @@
     :local cc "yes-without-crl"
     :if ($vigilantTlsCheck = "no") do={ :set cc "no" }
     :local serial [/system routerboard get serial-number]
-    :do {
+    # 1) Fetch the current agent to a temp file — capture the REAL error if the fetch fails.
+    :local ferr ""
+    :onerror e in={
         /tool fetch http-method=get \
             url=("$vigilantUrl/agent/script?serial=" . $serial) \
             http-header-field=("Authorization: Bearer " . $vigilantToken) \
             mode=https check-certificate=$cc dst-path="vigilant-agent.rsc"
+    } do={ :set ferr $e }
+    :if ([:len $ferr] > 0) do={
+        :log warning ("vigilant-bootstrap: fetch failed: " . $ferr . " (check TLS/token/URL)")
+    } else={
         :delay 2s
-        :if ([:len [/system script find name="vigilant-agent"]] > 0) do={
-            /system script remove [find name="vigilant-agent"]
+        # 2) Sanity-check the body. A truncated/empty download must NOT replace a working agent.
+        :local sz 0
+        :do { :set sz [/file get [find name="vigilant-agent.rsc"] size] } on-error={}
+        :if ($sz < 2000) do={
+            :log warning ("vigilant-bootstrap: downloaded agent too small (" . $sz . " bytes) - keeping existing agent")
+        } else={
+            :if ([:len [/system script find name="vigilant-agent"]] > 0) do={
+                /system script remove [find name="vigilant-agent"]
+            }
+            # 3) Install — capture a PARSE error (e.g. truncation / size limit) with its reason.
+            :local aerr ""
+            :onerror e2 in={
+                /system script add name=vigilant-agent dont-require-permissions=no \
+                    source=[/file get [find name="vigilant-agent.rsc"] contents]
+            } do={ :set aerr $e2 }
+            :if ([:len $aerr] > 0) do={
+                :log error ("vigilant-bootstrap: agent install failed: " . $aerr)
+            } else={
+                # 4) Test-run ONCE so a RUNTIME error is logged HERE with its reason — instead of
+                #    the cryptic per-second "executing script from scheduler failed".
+                :local rerr ""
+                :onerror e3 in={ /system script run vigilant-agent } do={ :set rerr $e3 }
+                :if ([:len $rerr] > 0) do={
+                    :log error ("vigilant-bootstrap: agent first-run error: " . $rerr)
+                } else={
+                    :log info "vigilant-bootstrap: agent updated; first run OK"
+                }
+            }
         }
-        /system script add name=vigilant-agent dont-require-permissions=no \
-            source=[/file get [find name="vigilant-agent.rsc"] contents]
-    } on-error={
-        :log warning "vigilant-bootstrap: agent self-update failed (check TLS/token/URL)"
     }
 }
 /system scheduler remove [find name="vigilant-bootstrap"]

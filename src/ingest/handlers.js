@@ -446,7 +446,24 @@ async function agentScript(ctx) {
     }
   }
   if (scriptText == null) return json(res, 404, { ok: false, error: 'no agent script' });
-  return text(res, 200, scriptText, { 'content-type': 'text/plain' });
+  return text(res, 200, minifyAgentScript(scriptText), { 'content-type': 'text/plain' });
+}
+
+// Strip full-line comments and blank lines before serving the agent. The source carries heavy
+// documentation (~half its bytes); RouterOS re-parses the whole agent every tick, and very
+// large `/system script` sources are slower (and closer to platform limits) to install. We
+// only drop lines that are blank or whose first non-space char is `#` (a RouterOS line
+// comment) — never code lines (those never start with `#`, even ones with a trailing inline
+// comment), so behaviour is unchanged. A one-line marker is prepended for provenance.
+function minifyAgentScript(src) {
+  if (typeof src !== 'string') return src;
+  const out = [];
+  for (const line of src.split('\n')) {
+    const t = line.trim();
+    if (t === '' || t.charAt(0) === '#') continue;
+    out.push(line);
+  }
+  return '# vigilant-agent (comments stripped on serve)\n' + out.join('\n') + '\n';
 }
 
 // ── GET /config/pending?serial= ──────────────────────────────────────
