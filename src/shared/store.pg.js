@@ -1018,7 +1018,7 @@ function makePgStore(poolOrConfig) {
   async function getActiveAlertRules() {
     return rows(
       `SELECT id, name, metric, comparator, threshold, for_seconds, severity, scope_tag, enabled,
-              notify_email, notify_teams_webhook, notify_on
+              notify_email, notify_teams_webhook, notify_on, neighbor_platform
          FROM alert_rules
         WHERE enabled = true`,
       []
@@ -1036,6 +1036,46 @@ function makePgStore(poolOrConfig) {
 
     for (const rule of rules) {
       if (rule.enabled === false) continue;
+
+      // ── neighbour-drop (e.g. a Yealink phone) — own evaluation path against the neighbors
+      // table. A neighbour matching neighbor_platform that hasn't been seen for > threshold
+      // seconds (but is still within the prune TTL, so it's "known but gone") counts as down.
+      if (rule.metric === 'neighbor_down') {
+        const thr = rule.threshold != null ? Math.round(Number(rule.threshold)) : 300;
+        const devs = await rows(
+          `SELECT d.id AS device_id, d.serial AS serial, d.site_name AS site_name
+             FROM devices d WHERE ($1::text IS NULL OR $1 = ANY (d.tags))`,
+          [rule.scope_tag || null]
+        );
+        for (const d of devs) {
+          const dropped = await rows(
+            `SELECT identity, mac::text AS mac FROM neighbors
+              WHERE device_id = $1
+                AND ($2::text IS NULL OR platform ILIKE '%' || $2 || '%')
+                AND last_seen_at < now() - make_interval(secs => $3)
+              ORDER BY last_seen_at ASC`,
+            [d.device_id, rule.neighbor_platform || null, thr]
+          );
+          const firing = dropped.length > 0;
+          const names = dropped.map((n) => n.identity || n.mac).slice(0, 5).join(', ');
+          const detail = `${rule.name}: ${dropped.length} ${rule.neighbor_platform || 'neighbour'}(s) not seen >${thr}s${names ? ' — ' + names : ''}`;
+          const openRow = await one(
+            `SELECT id FROM alerts WHERE device_id = $1 AND rule_id = $2 AND state = 'open' ORDER BY opened_at DESC LIMIT 1`,
+            [d.device_id, rule.id]
+          );
+          if (firing && !openRow) {
+            await q(`INSERT INTO alerts (device_id, rule_id, severity, state, detail, opened_at) VALUES ($1,$2,$3,'open',$4, now())`,
+              [d.device_id, rule.id, rule.severity || 'warning', detail]);
+            opened += 1;
+            transitions.push({ kind: 'open', device_id: d.device_id, serial: d.serial, site_name: d.site_name, detail, value: dropped.length, rule });
+          } else if (!firing && openRow) {
+            const r = await q(`UPDATE alerts SET state='cleared', cleared_at=now() WHERE device_id=$1 AND rule_id=$2 AND state='open'`, [d.device_id, rule.id]);
+            cleared += r.rowCount || 0;
+            if (r.rowCount) transitions.push({ kind: 'clear', device_id: d.device_id, serial: d.serial, site_name: d.site_name, detail, value: 0, rule });
+          }
+        }
+        continue; // handled — skip the device_state path for this rule
+      }
 
       // Candidate devices: all, or only those carrying scope_tag. Pull the metric value
       // (status for 'offline', else the matching device_state column) for each.

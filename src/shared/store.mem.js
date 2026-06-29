@@ -740,12 +740,31 @@ function makeMemStore(_config) {
         if (rule.enabled === false) continue;
         if (rule.scope_tag && !tags.includes(rule.scope_tag)) continue;
 
-        const value = rule.metric === 'offline' ? s.status : s[rule.metric];
-        const firing = evaluateAlert(rule, value);
+        let value;
+        let firing;
+        let detail;
+        if (rule.metric === 'neighbor_down') {
+          // A matching neighbour (e.g. Yealink) not seen for > threshold seconds = dropped.
+          const thr = rule.threshold != null ? Math.round(Number(rule.threshold)) : 300;
+          const nm = neighbors.get(deviceId);
+          const dropped = nm
+            ? Array.from(nm.values()).filter((n) => {
+                if (rule.neighbor_platform && !String(n.platform || '').toLowerCase().includes(String(rule.neighbor_platform).toLowerCase())) return false;
+                return ageSeconds(n.last_seen_at, Date.now()) > thr;
+              })
+            : [];
+          firing = dropped.length > 0;
+          value = dropped.length;
+          const names = dropped.map((n) => n.identity || n.mac).slice(0, 5).join(', ');
+          detail = `${rule.name ? rule.name + ': ' : ''}${dropped.length} ${rule.neighbor_platform || 'neighbour'}(s) not seen >${thr}s${names ? ' — ' + names : ''}`;
+        } else {
+          value = rule.metric === 'offline' ? s.status : s[rule.metric];
+          firing = evaluateAlert(rule, value);
+          detail = `${rule.name ? rule.name + ': ' : ''}${rule.metric} ${rule.comparator} ${rule.threshold != null ? rule.threshold : ''} (value=${value == null ? 'null' : value})`.trim();
+        }
         const open = alerts.find(
           (a) => a.device_id === deviceId && a.rule_id === rule.id && a.state === 'open'
         );
-        const detail = `${rule.name ? rule.name + ': ' : ''}${rule.metric} ${rule.comparator} ${rule.threshold != null ? rule.threshold : ''} (value=${value == null ? 'null' : value})`.trim();
 
         if (firing && !open) {
           alerts.push({
@@ -864,6 +883,7 @@ function makeMemStore(_config) {
         notify_email: rule.notify_email != null ? rule.notify_email : null,
         notify_teams_webhook: rule.notify_teams_webhook != null ? rule.notify_teams_webhook : null,
         notify_on: rule.notify_on != null ? rule.notify_on : 'both',
+        neighbor_platform: rule.neighbor_platform != null ? rule.neighbor_platform : null,
       };
       alertRules.push(row);
       return { ...row };

@@ -283,12 +283,17 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     notify_email         text,                  -- comma-separated recipients (via Resend)
     notify_teams_webhook text,                  -- MS Teams incoming-webhook URL
     notify_on            text NOT NULL DEFAULT 'both'   -- 'open' | 'clear' | 'both'
-                         CHECK (notify_on IN ('open','clear','both'))
+                         CHECK (notify_on IN ('open','clear','both')),
+    -- For metric='neighbor_down' (a device/phone behind a router dropping off LLDP/CDP/MNDP):
+    -- optional case-insensitive substring the neighbour's platform must match (e.g. 'Yealink');
+    -- null = any neighbour. `threshold` is the seconds-not-seen that counts as "dropped".
+    neighbor_platform    text
 );
--- Existing deployments: add the notification columns idempotently.
+-- Existing deployments: add the new columns idempotently.
 ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS notify_email         text;
 ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS notify_teams_webhook text;
 ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS notify_on            text NOT NULL DEFAULT 'both';
+ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS neighbor_platform    text;
 
 CREATE TABLE IF NOT EXISTS alerts (
     id          bigserial   PRIMARY KEY,
