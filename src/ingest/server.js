@@ -94,6 +94,33 @@ function authAdmin(req, cfg) {
   return timingSafeEqual(tok, cfg.enrollToken);
 }
 
+// Field-app auth for the wc_field install wizard: the master admin token OR the SCOPED
+// FIELD_ENROLL_TOKEN. Used only for enrol + single-device read so the browser app can carry
+// the scoped key instead of the estate master token.
+function authField(req, cfg) {
+  if (authAdmin(req, cfg)) return true;
+  const tok = bearer(req);
+  if (!tok || !cfg.fieldEnrollToken) return false;
+  return timingSafeEqual(tok, cfg.fieldEnrollToken);
+}
+
+// CORS so browser frontends (wc_field) can call the API directly. Auth is a Bearer token (no
+// cookies), so echoing the Origin — or '*' — is safe. Lock down via CORS_ALLOW_ORIGINS.
+function applyCors(req, res, cfg) {
+  const allow = cfg.corsAllowOrigins || '*';
+  let value = '*';
+  if (allow !== '*') {
+    const origin = req.headers['origin'] || '';
+    const list = String(allow).split(',').map((s) => s.trim()).filter(Boolean);
+    value = list.includes(origin) ? origin : list[0] || '*';
+  }
+  res.setHeader('Access-Control-Allow-Origin', value);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'authorization, content-type');
+  res.setHeader('Access-Control-Max-Age', '600');
+}
+
 // ── server ───────────────────────────────────────────────────────────
 
 /**
@@ -112,6 +139,14 @@ function createServer({ store, config: cfg }) {
     const method = req.method || 'GET';
     const pathname = url.pathname;
     const query = url.searchParams;
+
+    // CORS for browser frontends (set before any response). Answer the preflight here so a
+    // POST /enroll with Authorization + JSON body from wc_field isn't blocked.
+    applyCors(req, res, cfg);
+    if (method === 'OPTIONS') {
+      res.writeHead(204);
+      return res.end();
+    }
 
     // Base context shared with every handler. Body/device/params filled per route.
     const ctx = { req, res, store, config: cfg, log, query, body: '', device: null, params: {} };
@@ -209,9 +244,9 @@ function createServer({ store, config: cfg }) {
       }
 
       // ── admin routes ─────────────────────────────────────────────
-      // POST /enroll
+      // POST /enroll — master OR scoped field token (so wc_field can enrol with the scoped key).
       if (method === 'POST' && pathname === '/enroll') {
-        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
         return handlers.enroll(ctx);
       }
@@ -284,10 +319,10 @@ function createServer({ store, config: cfg }) {
         return method === 'GET' ? handlers.speedtestList(ctx) : handlers.speedtestCreate(ctx);
       }
 
-      // GET /devices/:serial
+      // GET /devices/:serial — master OR scoped field token (wc_field's "wait until online" step).
       const mDev = /^\/devices\/([^/]+)$/.exec(pathname);
       if (method === 'GET' && mDev) {
-        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { serial: decodeURIComponent(mDev[1]) };
         return handlers.deviceDetail(ctx);
       }

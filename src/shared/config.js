@@ -43,6 +43,14 @@ const config = Object.freeze({
   databaseUrl,
   port: num(process.env.PORT, 9100),
   enrollToken: process.env.ENROLL_TOKEN || "",
+  // Scoped key for browser frontends (wc_field) — authorises ONLY enrol + single-device read,
+  // never bulk fleet reads or config-push. Lets the field app carry a key WITHOUT the estate
+  // master token. Leave unset to disable. A leaked field key can at most create device rows /
+  // read a device's detail.
+  fieldEnrollToken: process.env.FIELD_ENROLL_TOKEN || "",
+  // CORS allow-list for browser callers. '*' (default) echoes any origin (safe here: auth is a
+  // bearer token, not cookies). Set a comma-separated list to lock it to the wc_field origin(s).
+  corsAllowOrigins: process.env.CORS_ALLOW_ORIGINS || "*",
   agentScriptPath: process.env.AGENT_SCRIPT_PATH || "./agent/vigilant-agent.rsc",
   publicBaseUrl: process.env.PUBLIC_BASE_URL || "https://vigilant.western-communication.com",
   fastPollS: num(process.env.FAST_POLL_S, 3),

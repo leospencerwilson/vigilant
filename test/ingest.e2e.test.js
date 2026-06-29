@@ -54,7 +54,7 @@ function request(port, { method, path, token, body }) {
         } catch {
           parsed = buf;
         }
-        resolve({ status: res.statusCode, body: parsed });
+        resolve({ status: res.statusCode, body: parsed, headers: res.headers });
       });
     });
     req.on("error", reject);
@@ -317,6 +317,39 @@ test("POST /realtime/config: 501 unconfigured; admin-gated; mints a verifiable a
     } finally { await close(server); }
   } finally {
     delete process.env.SUPABASE_URL; delete process.env.SUPABASE_ANON_KEY; delete process.env.SUPABASE_JWT_SECRET;
+  }
+});
+
+test("CORS + scoped FIELD_ENROLL_TOKEN: preflight OK; field key enrols + reads one device but not the fleet", async () => {
+  process.env.FIELD_ENROLL_TOKEN = "field-key-xyz";
+  let server;
+  try {
+    server = createServer({ store: makeMemStore(), config: makeConfig() });
+    const port = await listen(server);
+
+    // CORS preflight must be answered (else the browser blocks the real call).
+    const pre = await request(port, { method: "OPTIONS", path: "/enroll" });
+    assert.equal(pre.status, 204, "preflight 204");
+    assert.ok(pre.headers["access-control-allow-origin"], "CORS allow-origin header present");
+
+    // The scoped field key can enrol…
+    const en = await request(port, {
+      method: "POST", path: "/enroll", token: "field-key-xyz",
+      body: { serial: "FLD-1", site_name: "Field Test" },
+    });
+    assert.equal(en.status, 200, "field key enrols");
+    assert.ok(en.body.token && en.body.install, "enrol returns token + install block");
+
+    // …and read that one device (verify step)…
+    const dev = await request(port, { method: "GET", path: "/devices/FLD-1", token: "field-key-xyz" });
+    assert.equal(dev.status, 200, "field key reads single device");
+
+    // …but NOT the bulk fleet (master-only — contains the rest of the estate).
+    const fleet = await request(port, { method: "GET", path: "/fleet", token: "field-key-xyz" });
+    assert.equal(fleet.status, 401, "field key rejected on /fleet");
+  } finally {
+    if (server) await close(server);
+    delete process.env.FIELD_ENROLL_TOKEN;
   }
 });
 
