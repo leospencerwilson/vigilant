@@ -391,6 +391,12 @@ test("alert-rule CRUD (admin): create → list → update → delete, with valid
     assert.equal(d.status, 200);
     const d2 = await request(port, { method: "DELETE", path: `/alert-rules/${id}`, token: ENROLL_TOKEN });
     assert.equal(d2.status, 404, "second delete is not-found");
+
+    // test endpoint: needs auth + at least one channel.
+    const tNoAuth = await request(port, { method: "POST", path: "/alert-rules/test", body: {} });
+    assert.equal(tNoAuth.status, 401, "test endpoint admin-gated");
+    const tNoChan = await request(port, { method: "POST", path: "/alert-rules/test", token: ENROLL_TOKEN, body: { name: "x" } });
+    assert.equal(tNoChan.status, 400, "test needs a channel");
   } finally {
     await close(server);
   }

@@ -275,6 +275,11 @@ function createServer({ store, config: cfg }) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         return handlers.alertRulesList(ctx);
       }
+      if (method === 'POST' && pathname === '/alert-rules/test') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return handlers.alertRuleTest(ctx);
+      }
       if (method === 'POST' && pathname === '/alert-rules') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);

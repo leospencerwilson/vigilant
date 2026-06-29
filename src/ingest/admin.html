@@ -273,6 +273,7 @@
   <span class="dot" id="health" title="ingest health"></span>
   <div><h1>Vigilant</h1><div class="sub">MikroTik fleet telemetry · vigilant.internal</div></div>
   <div class="spacer"></div>
+  <button class="ghost" id="rulesBtn" style="margin-right:10px">⚙ Alert rules</button>
   <div class="tokbar">
     <input id="admintok" type="password" placeholder="Admin token (ENROLL_TOKEN)" autocomplete="off" />
     <button class="ghost" id="savetok">Use token</button>
@@ -484,6 +485,81 @@
           </div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════ ALERT RULES ══════════════════ -->
+  <div id="rulesView" class="hidden">
+    <div style="margin-bottom:16px"><button class="ghost" id="rulesBack">← Back to fleet</button></div>
+    <div class="cfg-grid">
+      <section class="card">
+        <h2 id="rule-formtitle">New alert rule</h2>
+        <input type="hidden" id="r-id" />
+        <label>Name</label>
+        <input id="r-name" placeholder="e.g. CPU high — Allied" autocomplete="off" />
+        <div class="row">
+          <div>
+            <label>Metric</label>
+            <select id="r-metric">
+              <option value="cpu_load">cpu_load (%)</option>
+              <option value="temperature">temperature (°C)</option>
+              <option value="free_memory">free_memory (bytes)</option>
+              <option value="ppp_sessions">ppp_sessions</option>
+              <option value="dhcp_leases">dhcp_leases</option>
+              <option value="conn_count">conn_count</option>
+              <option value="lte_signal">lte_signal (dBm)</option>
+              <option value="netwatch_down">netwatch_down</option>
+              <option value="offline">offline (device down)</option>
+              <option value="neighbor_down">neighbor_down (e.g. Yealink)</option>
+            </select>
+          </div>
+          <div>
+            <label>Comparator</label>
+            <select id="r-comparator">
+              <option value="&gt;">&gt;</option><option value="&gt;=">&gt;=</option>
+              <option value="&lt;">&lt;</option><option value="&lt;=">&lt;=</option>
+              <option value="==">==</option><option value="offline">offline</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <div><label>Threshold <span class="hint" id="r-thresh-hint"></span></label><input id="r-threshold" type="number" step="any" placeholder="e.g. 90" /></div>
+          <div><label>For (s) sustained</label><input id="r-forsec" type="number" min="0" step="1" value="0" /></div>
+        </div>
+        <div class="row">
+          <div><label>Severity</label><select id="r-severity"><option value="info">info</option><option value="warning" selected>warning</option><option value="critical">critical</option></select></div>
+          <div><label>Scope tag <span class="hint">— blank = all devices</span></label><input id="r-scope" placeholder="e.g. allied" autocomplete="off" /></div>
+        </div>
+        <div id="r-neigh-wrap" class="hidden">
+          <label>Neighbour platform match <span class="hint">— e.g. Yealink (blank = any)</span></label>
+          <input id="r-neighplat" placeholder="Yealink" autocomplete="off" />
+        </div>
+        <div class="step"><span>Notifications</span><span></span></div>
+        <label>Email recipients <span class="hint">— comma-separated (via Resend)</span></label>
+        <input id="r-email" placeholder="noc@western-communication.co.uk, ops@…" autocomplete="off" />
+        <label>Teams webhook URL <span class="hint">— Power Automate HTTP trigger</span></label>
+        <input id="r-teams" placeholder="https://…/triggers/manual/paths/invoke?…&amp;sig=…" autocomplete="off" />
+        <div class="row">
+          <div><label>Notify on</label><select id="r-notifyon"><option value="both" selected>open &amp; clear</option><option value="open">open only</option><option value="clear">clear only</option></select></div>
+          <div><label style="display:flex;align-items:center;gap:7px;margin-top:28px"><input type="checkbox" id="r-enabled" checked style="width:auto;margin:0" />Enabled</label></div>
+        </div>
+        <div class="row">
+          <button class="primary" id="r-save" style="margin-top:14px">Save rule</button>
+          <button class="ghost" id="r-test" style="margin-top:14px">Send test</button>
+          <button class="ghost" id="r-new" style="margin-top:14px">New / clear</button>
+        </div>
+        <div class="msg" id="r-msg"></div>
+      </section>
+      <section class="card">
+        <div class="between"><h2>Rules</h2><button class="ghost" id="r-refresh">Refresh</button></div>
+        <div class="scroll" style="max-height:520px">
+          <table class="fixed">
+            <colgroup><col style="width:26%"><col style="width:22%"><col style="width:14%"><col style="width:14%"><col style="width:24%"></colgroup>
+            <thead><tr><th>Name</th><th>Condition</th><th>Notify</th><th>State</th><th>Actions</th></tr></thead>
+            <tbody id="r-rules"><tr><td colspan="5" class="empty">Enter the admin token to load rules.</td></tr></tbody>
+          </table>
+        </div>
+      </section>
     </div>
   </div>
 </main>
@@ -885,6 +961,7 @@ function showFleet(){
   stopDeviceTimers();
   resetSections();
   $('#devView').classList.add('hidden');
+  $('#rulesView').classList.add('hidden');
   $('#fleetView').classList.remove('hidden');
   loadFleet();
 }
@@ -1705,6 +1782,121 @@ async function cancelJob(id){
 $('#cfg-create').onclick = createDraft;
 $('#cfg-refresh').onclick = refreshConfigJobs;
 $('#cfg-rsc').addEventListener('input', updateCfgSha);
+
+// ════════════════════ alert rules ════════════════════
+let _rules = {};
+function showRules(){
+  stopDeviceTimers(); curSerial = null;
+  $('#fleetView').classList.add('hidden');
+  $('#devView').classList.add('hidden');
+  $('#rulesView').classList.remove('hidden');
+  loadRules();
+}
+function syncRuleForm(){
+  const m = $('#r-metric').value;
+  $('#r-neigh-wrap').classList.toggle('hidden', m !== 'neighbor_down');
+  $('#r-thresh-hint').textContent = m === 'neighbor_down' ? '(seconds not seen)' : (m === 'offline' ? '(n/a)' : '');
+}
+function clearRuleForm(){
+  $('#r-id').value=''; $('#r-name').value=''; $('#r-metric').value='cpu_load';
+  $('#r-comparator').value='>'; $('#r-threshold').value=''; $('#r-forsec').value='0';
+  $('#r-severity').value='warning'; $('#r-scope').value=''; $('#r-neighplat').value='';
+  $('#r-email').value=''; $('#r-teams').value=''; $('#r-notifyon').value='both'; $('#r-enabled').checked=true;
+  $('#rule-formtitle').textContent='New alert rule'; ruleMsg('',''); syncRuleForm();
+}
+function ruleMsg(t, cls){ const m=$('#r-msg'); m.textContent=t; m.className='msg '+(cls||''); }
+function ruleFormData(){
+  const num = v => (v==='' || v==null ? null : Number(v));
+  return {
+    name: $('#r-name').value.trim(), metric: $('#r-metric').value, comparator: $('#r-comparator').value,
+    threshold: num($('#r-threshold').value), for_seconds: num($('#r-forsec').value)||0,
+    severity: $('#r-severity').value, scope_tag: $('#r-scope').value.trim()||null,
+    neighbor_platform: $('#r-neighplat').value.trim()||null,
+    notify_email: $('#r-email').value.trim()||null, notify_teams_webhook: $('#r-teams').value.trim()||null,
+    notify_on: $('#r-notifyon').value, enabled: $('#r-enabled').checked,
+  };
+}
+async function loadRules(){
+  if(!tok()){ $('#r-rules').innerHTML='<tr><td colspan="5" class="empty">Enter the admin token (top right).</td></tr>'; return; }
+  try{
+    const r = await fetch('/alert-rules', { headers:authHeaders() });
+    if(r.status===401){ $('#r-rules').innerHTML='<tr><td colspan="5" class="empty">Enter the admin token (top right).</td></tr>'; return; }
+    if(!r.ok) return;
+    const rules = (await r.json()).rules || [];
+    _rules = {};
+    if(!rules.length){ $('#r-rules').innerHTML='<tr><td colspan="5" class="empty">No rules yet — create one on the left.</td></tr>'; return; }
+    $('#r-rules').innerHTML = rules.map(rl=>{
+      _rules[rl.id]=rl;
+      const cond = rl.metric==='neighbor_down' ? ((rl.neighbor_platform||'neighbour')+' down >'+(rl.threshold!=null?rl.threshold:300)+'s')
+        : rl.metric==='offline' ? 'offline'
+        : (rl.metric+' '+rl.comparator+' '+(rl.threshold!=null?rl.threshold:''));
+      const sevCls = rl.severity==='critical'?'wan':rl.severity==='warning'?'bridge-member':'lan';
+      const chans = [rl.notify_email?'✉':'', rl.notify_teams_webhook?'Teams':''].filter(Boolean).join(' ');
+      return '<tr>'
+        +'<td title="'+esc(rl.name)+'">'+esc(rl.name)+'</td>'
+        +'<td title="'+esc(cond)+'"><span class="rtag '+sevCls+'">'+esc(rl.severity)+'</span> '+esc(cond)+'</td>'
+        +'<td>'+(chans||'—')+'</td>'
+        +'<td>'+(rl.enabled?'<span class="pill online">on</span>':'<span class="pill offline">off</span>')+'</td>'
+        +'<td class="cfg-act"><button class="ghost" data-edit="'+esc(rl.id)+'">Edit</button><button class="ghost" data-test="'+esc(rl.id)+'">Test</button><button class="ghost" data-del="'+esc(rl.id)+'">Delete</button></td>'
+        +'</tr>';
+    }).join('');
+    $$('#r-rules [data-edit]').forEach(b=>b.onclick=()=>editRule(_rules[b.dataset.edit]));
+    $$('#r-rules [data-test]').forEach(b=>b.onclick=()=>testRuleId(b.dataset.test, b));
+    $$('#r-rules [data-del]').forEach(b=>b.onclick=()=>deleteRule(b.dataset.del));
+  }catch(e){}
+}
+function editRule(rl){
+  if(!rl) return;
+  $('#r-id').value=rl.id; $('#r-name').value=rl.name||''; $('#r-metric').value=rl.metric||'cpu_load';
+  $('#r-comparator').value=rl.comparator||'>'; $('#r-threshold').value=rl.threshold!=null?rl.threshold:'';
+  $('#r-forsec').value=rl.for_seconds!=null?rl.for_seconds:0; $('#r-severity').value=rl.severity||'warning';
+  $('#r-scope').value=rl.scope_tag||''; $('#r-neighplat').value=rl.neighbor_platform||'';
+  $('#r-email').value=rl.notify_email||''; $('#r-teams').value=rl.notify_teams_webhook||'';
+  $('#r-notifyon').value=rl.notify_on||'both'; $('#r-enabled').checked=rl.enabled!==false;
+  $('#rule-formtitle').textContent='Edit rule #'+rl.id; ruleMsg('',''); syncRuleForm();
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+async function saveRule(){
+  if(!tok()){ ruleMsg('Set the admin token (top right).','err'); return; }
+  const data = ruleFormData();
+  if(!data.name){ ruleMsg('Name is required.','err'); return; }
+  const id = $('#r-id').value;
+  try{
+    const r = await fetch('/alert-rules'+(id?'/'+encodeURIComponent(id):''), { method:id?'PUT':'POST', headers:authHeaders(), body:JSON.stringify(data) });
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok){ ruleMsg('Save failed: '+(j.error||('HTTP '+r.status)),'err'); return; }
+    ruleMsg(id?'Rule updated.':'Rule created.','ok'); clearRuleForm(); loadRules();
+  }catch(e){ ruleMsg('Network error.','err'); }
+}
+async function deleteRule(id){
+  if(!confirm('Delete this rule?')) return;
+  try{ const r=await fetch('/alert-rules/'+encodeURIComponent(id),{method:'DELETE',headers:authHeaders()}); if(r.ok) loadRules(); }catch(e){}
+}
+async function testNotify(body, btn){
+  if(!tok()){ ruleMsg('Set the admin token (top right).','err'); return; }
+  if(!body.notify_email && !body.notify_teams_webhook){ ruleMsg('Add an email and/or Teams webhook to test.','err'); return; }
+  let o; if(btn){ o=btn.textContent; btn.disabled=true; btn.textContent='…'; }
+  try{
+    const r = await fetch('/alert-rules/test',{ method:'POST', headers:authHeaders(), body:JSON.stringify(body) });
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok){ ruleMsg('Test failed: '+(j.error||('HTTP '+r.status)),'err'); return; }
+    const res=j.results||{}; const parts=[];
+    if(res.email) parts.push('email '+(res.email.ok?'✓':'✗'+(res.email.status?' '+res.email.status:'')));
+    if(res.teams) parts.push('Teams '+(res.teams.ok?'✓':'✗'+(res.teams.status?' '+res.teams.status:'')));
+    const allOk = parts.length && parts.every(p=>p.includes('✓'));
+    ruleMsg('Test sent — '+(parts.join(' · ')||'no channels'), allOk?'ok':'err');
+  }catch(e){ ruleMsg('Network error.','err'); }
+  finally{ if(btn){ btn.disabled=false; btn.textContent=o||'Test'; } }
+}
+function testRuleId(id, btn){ const rl=_rules[id]; if(rl) testNotify({name:rl.name,severity:rl.severity,notify_email:rl.notify_email,notify_teams_webhook:rl.notify_teams_webhook}, btn); }
+$('#rulesBtn').onclick = showRules;
+$('#rulesBack').onclick = showFleet;
+$('#r-refresh').onclick = loadRules;
+$('#r-new').onclick = clearRuleForm;
+$('#r-save').onclick = saveRule;
+$('#r-test').onclick = () => { const d=ruleFormData(); testNotify({name:d.name,severity:d.severity,notify_email:d.notify_email,notify_teams_webhook:d.notify_teams_webhook}); };
+$('#r-metric').addEventListener('change', syncRuleForm);
+syncRuleForm();
 
 // ── liveness dot + initial load ──
 fetch('/healthz').then(r=>{ $('#health').style.background = r.ok ? 'var(--ok)' : 'var(--bad)'; }).catch(()=>{ $('#health').style.background='var(--bad)'; });

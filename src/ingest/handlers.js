@@ -17,6 +17,7 @@ const crypto = require('node:crypto');
 
 const transform = require('../shared/transform');
 const telemetry = require('../shared/telemetry');
+const notify = require('../worker/notify');
 const oui = require('../shared/oui');
 
 // Statuses a DEVICE may legitimately report via POST /config/result. A subset of the
@@ -652,6 +653,34 @@ async function alertRuleDelete(ctx) {
   return ok ? json(res, 200, { ok: true }) : json(res, 404, { ok: false, error: 'not found' });
 }
 
+// POST /alert-rules/test — fire a TEST notification through the channels in the body (the
+// Rules form's current values), so an operator can verify email/Teams BEFORE saving. Returns
+// per-channel results so the UI can show a ✓/✗ against each. Sends regardless of notify_on.
+async function alertRuleTest(ctx) {
+  const { res, config, body } = ctx;
+  const r = parseRuleBody(body);
+  if (!r) return json(res, 400, { ok: false, error: 'bad json' });
+  if (!r.notify_email && !r.notify_teams_webhook) {
+    return json(res, 400, { ok: false, error: 'set an email and/or Teams webhook to test' });
+  }
+  const transition = {
+    kind: 'open',
+    site_name: '(test)',
+    serial: '(test)',
+    value: 'test',
+    detail: 'Test notification from Vigilant — this channel is wired correctly.',
+    rule: {
+      name: (r.name && r.name.trim()) || 'Test rule',
+      severity: r.severity || 'info',
+      notify_email: r.notify_email || null,
+      notify_teams_webhook: r.notify_teams_webhook || null,
+      notify_on: 'both',
+    },
+  };
+  const out = await notify.dispatchAlert(transition, { config, logger: ctx.log });
+  return json(res, 200, { ok: true, results: (out && out.results) || {} });
+}
+
 // ── GET /fleet (admin) ───────────────────────────────────────────────
 async function fleet(ctx) {
   const { res, store } = ctx;
@@ -1050,6 +1079,7 @@ module.exports = {
   alertRuleCreate,
   alertRuleUpdate,
   alertRuleDelete,
+  alertRuleTest,
   telemetry: telemetryIngest,
   agentScript,
   configPending,
