@@ -320,7 +320,7 @@ test("POST /realtime/config: 501 unconfigured; admin-gated; mints a verifiable a
   }
 });
 
-test("CORS + scoped FIELD_ENROLL_TOKEN: preflight OK; field key enrols + reads one device but not the fleet", async () => {
+test("CORS + scoped FIELD_ENROLL_TOKEN: preflight OK; field key enrols + reads (fleet/device/history) but not mutations", async () => {
   process.env.FIELD_ENROLL_TOKEN = "field-key-xyz";
   let server;
   try {
@@ -344,9 +344,17 @@ test("CORS + scoped FIELD_ENROLL_TOKEN: preflight OK; field key enrols + reads o
     const dev = await request(port, { method: "GET", path: "/devices/FLD-1", token: "field-key-xyz" });
     assert.equal(dev.status, 200, "field key reads single device");
 
-    // …but NOT the bulk fleet (master-only — contains the rest of the estate).
+    // …and the read-only fleet/history (wc_field stats views)…
     const fleet = await request(port, { method: "GET", path: "/fleet", token: "field-key-xyz" });
-    assert.equal(fleet.status, 401, "field key rejected on /fleet");
+    assert.equal(fleet.status, 200, "field key may read the fleet (read-only)");
+    const hist = await request(port, { method: "GET", path: "/devices/FLD-1/history?window=1h", token: "field-key-xyz" });
+    assert.equal(hist.status, 200, "field key may read history");
+
+    // …but NOT mutation / admin routes (config-push is master-only).
+    const cfgJobs = await request(port, { method: "GET", path: "/devices/FLD-1/config-jobs", token: "field-key-xyz" });
+    assert.equal(cfgJobs.status, 401, "field key rejected on config-jobs (master-only)");
+    const migrate = await request(port, { method: "POST", path: "/admin/migrate", token: "field-key-xyz" });
+    assert.equal(migrate.status, 401, "field key rejected on /admin/migrate (master-only)");
   } finally {
     if (server) await close(server);
     delete process.env.FIELD_ENROLL_TOKEN;

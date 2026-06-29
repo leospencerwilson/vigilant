@@ -251,9 +251,9 @@ function createServer({ store, config: cfg }) {
         return handlers.enroll(ctx);
       }
 
-      // GET /fleet
+      // GET /fleet — master OR scoped field token (read-only device list for wc_field).
       if (method === 'GET' && pathname === '/fleet') {
-        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         return handlers.fleet(ctx);
       }
 
@@ -276,7 +276,7 @@ function createServer({ store, config: cfg }) {
       // this first for clarity + defence in depth).
       const mHist = /^\/devices\/([^/]+)\/history$/.exec(pathname);
       if (method === 'GET' && mHist) {
-        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { serial: decodeURIComponent(mHist[1]) };
         return handlers.deviceHistory(ctx);
       }
@@ -335,7 +335,7 @@ function createServer({ store, config: cfg }) {
       // still match; ctx.params decodeURIComponent's it and the handler normalises.
       const mOui = /^\/oui\/([0-9a-fA-F:.%\-]{1,64})$/.exec(pathname);
       if (method === 'GET' && mOui) {
-        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { mac: decodeURIComponent(mOui[1]) };
         return handlers.ouiLookup(ctx);
       }
