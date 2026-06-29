@@ -722,6 +722,17 @@ function makeMemStore(_config) {
   async function listAlertRules() {
     return alertRules.map((r) => ({ ...r }));
   }
+  async function listAlerts(limit) {
+    const n = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+    return [...alerts]
+      .sort((a, b) => new Date(b.opened_at) - new Date(a.opened_at))
+      .slice(0, n)
+      .map((a) => {
+        const d = devices.get(a.device_id) || {};
+        const r = alertRules.find((x) => x.id === a.rule_id) || {};
+        return { ...a, serial: d.serial, site_name: d.site_name, identity: d.identity, rule_name: r.name, rule_metric: r.metric };
+      });
+  }
   async function createAlertRule(f) {
     return _test.addAlertRule(f || {});
   }
@@ -999,6 +1010,7 @@ function makeMemStore(_config) {
     markStaleDevices,
     getActiveAlertRules,
     listAlertRules,
+    listAlerts,
     createAlertRule,
     updateAlertRule,
     deleteAlertRule,

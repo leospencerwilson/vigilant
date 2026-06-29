@@ -561,6 +561,16 @@
         </div>
       </section>
     </div>
+    <section class="card" style="margin-top:16px">
+      <div class="between"><h2>Recent alert history <span class="hint">— when a rule was hit</span></h2><button class="ghost" id="h-refresh">Refresh</button></div>
+      <div class="scroll" style="max-height:380px">
+        <table class="fixed">
+          <colgroup><col style="width:14%"><col style="width:26%"><col style="width:22%"><col style="width:12%"><col style="width:13%"><col style="width:13%"></colgroup>
+          <thead><tr><th>State</th><th>Device</th><th>Rule</th><th>Severity</th><th>Down at</th><th>Back up</th></tr></thead>
+          <tbody id="h-rows"><tr><td colspan="6" class="empty">Enter the admin token to load history.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
   </div>
 </main>
 
@@ -1007,6 +1017,8 @@ async function fetchRealtimeConfig(){
 function onRealtimeRow(payload){
   const row = payload && (payload.new || payload.old) || {};
   const table = payload && payload.table;
+  // Live-refresh the rule history when an alert opens/clears while the Rules view is open.
+  if (table === 'alerts' && !$('#rulesView').classList.contains('hidden')) loadHistory();
   if (curSerial){
     // Only refresh the open device when the change concerns IT (or its alerts/wifi).
     if (!curDeviceId || row.device_id === curDeviceId || table === 'alerts') _rtDeviceRefresh();
@@ -1791,6 +1803,7 @@ function showRules(){
   $('#devView').classList.add('hidden');
   $('#rulesView').classList.remove('hidden');
   loadRules();
+  loadHistory();
 }
 function syncRuleForm(){
   const m = $('#r-metric').value;
@@ -1892,7 +1905,35 @@ function testRuleId(id, btn){ const rl=_rules[id]; if(rl) testNotify({name:rl.na
 $('#rulesBtn').onclick = showRules;
 $('#rulesBack').onclick = showFleet;
 $('#r-refresh').onclick = loadRules;
+$('#h-refresh').onclick = loadHistory;
 $('#r-new').onclick = clearRuleForm;
+
+// Recent alert history — every rule hit (open) + recovery (cleared), newest first.
+async function loadHistory(){
+  if(!tok()){ $('#h-rows').innerHTML='<tr><td colspan="6" class="empty">Enter the admin token (top right).</td></tr>'; return; }
+  try{
+    const r = await fetch('/alerts?limit=150', { headers:authHeaders() });
+    if(r.status===401){ $('#h-rows').innerHTML='<tr><td colspan="6" class="empty">Enter the admin token (top right).</td></tr>'; return; }
+    if(!r.ok) return;
+    const alerts = (await r.json()).alerts || [];
+    if(!alerts.length){ $('#h-rows').innerHTML='<tr><td colspan="6" class="empty">No alerts have fired yet.</td></tr>'; return; }
+    const t = x => x ? new Date(x).toLocaleString() : '—';
+    $('#h-rows').innerHTML = alerts.map(a=>{
+      const dev = a.site_name || a.identity || a.serial || '—';
+      const sevCls = a.severity==='critical'?'wan':a.severity==='warning'?'bridge-member':'lan';
+      const open = a.state==='open';
+      const stateLbl = open ? '<span class="pill offline">● down</span>' : (a.state==='cleared' ? '<span class="pill online">✓ back up</span>' : esc(a.state));
+      return '<tr>'
+        +'<td>'+stateLbl+'</td>'
+        +'<td title="'+esc(dev)+'">'+esc(dev)+'</td>'
+        +'<td title="'+esc(a.rule_name||'')+'">'+esc(a.rule_name||a.rule_metric||'—')+'</td>'
+        +'<td><span class="rtag '+sevCls+'">'+esc(a.severity)+'</span></td>'
+        +'<td>'+t(a.opened_at)+'</td>'
+        +'<td>'+t(a.cleared_at)+'</td>'
+        +'</tr>';
+    }).join('');
+  }catch(e){}
+}
 $('#r-save').onclick = saveRule;
 $('#r-test').onclick = () => { const d=ruleFormData(); testNotify({name:d.name,severity:d.severity,notify_email:d.notify_email,notify_teams_webhook:d.notify_teams_webhook}); };
 $('#r-metric').addEventListener('change', syncRuleForm);

@@ -625,6 +625,13 @@ async function alertRulesList(ctx) {
   const rules = typeof store.listAlertRules === 'function' ? await store.listAlertRules() : [];
   return json(res, 200, { ok: true, rules: rules || [] });
 }
+// GET /alerts — recent alert history (every rule hit, open + cleared), newest first.
+async function alertHistory(ctx) {
+  const { res, store, query } = ctx;
+  const limit = query && typeof query.get === 'function' ? query.get('limit') : undefined;
+  const alerts = typeof store.listAlerts === 'function' ? await store.listAlerts(limit) : [];
+  return json(res, 200, { ok: true, alerts: alerts || [] });
+}
 async function alertRuleCreate(ctx) {
   const { res, store, body } = ctx;
   if (typeof store.createAlertRule !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
@@ -1076,6 +1083,7 @@ module.exports = {
   adminMigrate,
   realtimeConfig,
   alertRulesList,
+  alertHistory,
   alertRuleCreate,
   alertRuleUpdate,
   alertRuleDelete,

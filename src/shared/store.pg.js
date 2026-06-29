@@ -1064,6 +1064,21 @@ function makePgStore(poolOrConfig) {
     const r = await q(`DELETE FROM alert_rules WHERE id=$1`, [id]);
     return (r.rowCount || 0) > 0;
   }
+  // Alert history (rule hits) — newest first, with device + rule names for the UI.
+  async function listAlerts(limit) {
+    const n = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+    return rows(
+      `SELECT a.id, a.severity, a.state, a.detail, a.opened_at, a.cleared_at, a.acked_at, a.acked_by,
+              d.serial, d.site_name, d.identity,
+              r.name AS rule_name, r.metric AS rule_metric
+         FROM alerts a
+         JOIN devices d ON d.id = a.device_id
+         LEFT JOIN alert_rules r ON r.id = a.rule_id
+        ORDER BY a.opened_at DESC
+        LIMIT $1`,
+      [n]
+    );
+  }
 
   async function evaluateAndApplyAlerts(rulesIn) {
     const rules = Array.isArray(rulesIn) ? rulesIn : await getActiveAlertRules();
@@ -1313,6 +1328,7 @@ function makePgStore(poolOrConfig) {
     markStaleDevices,
     getActiveAlertRules,
     listAlertRules,
+    listAlerts,
     createAlertRule,
     updateAlertRule,
     deleteAlertRule,

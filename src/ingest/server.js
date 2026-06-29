@@ -275,6 +275,11 @@ function createServer({ store, config: cfg }) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         return handlers.alertRulesList(ctx);
       }
+      // GET /alerts (admin) — recent alert history (rule hits) for the Rules history view.
+      if (method === 'GET' && pathname === '/alerts') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.alertHistory(ctx);
+      }
       if (method === 'POST' && pathname === '/alert-rules/test') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
