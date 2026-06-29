@@ -8,48 +8,29 @@
 //
 // The output ({ "AC:CF:23": "Yealink Inc.", … }) is loaded by src/shared/oui.js and gives
 // the ingest OFFLINE, near-complete vendor coverage — so MAC→vendor no longer depends on the
-// rate-limited public api.macvendors.com (which is why coverage was ~5%). If this never runs,
-// oui.js falls back to the small hand-curated SEED (no crash).
+// rate-limited public api.macvendors.com. If this never runs, oui.js falls back to the small
+// hand-curated SEED (no crash).
 //
-// Source: the IEEE "MA-L" registry CSV (one assignment per /24 OUI block). Columns:
-//   Registry,Assignment,Organization Name,Organization Address
-// Assignment is bare 6-hex (e.g. "AccF23"); Organization Name is quoted and may contain
-// commas and ""-escaped quotes — so we parse fields rather than naive comma-splitting.
+// Source: the IEEE registry TEXT file (oui.txt). Each assignment has a line like:
+//     00-22-72   (hex)		American Micro-Fuel Device Corp.
+// We parse exactly those "(hex)" lines: 3 hyphen-separated octets, "(hex)", then the vendor.
 
 const fs = require('node:fs');
 const path = require('node:path');
 
-const SOURCE = process.env.OUI_CSV_URL || 'https://standards-oui.ieee.org/oui/oui.csv';
+const SOURCE = process.env.OUI_URL || 'https://standards-oui.ieee.org/oui/oui.txt';
 
-// Parse one CSV line: return [registry, assignment, organizationName] or null.
+// Match a "(hex)" assignment line → [ouiKey, vendor], or null. Separator between fields is
+// whitespace (spaces then tabs); vendor is the trailing free text.
+const HEX_LINE = /^\s*([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})\s+\(hex\)\s+(.+?)\s*$/;
+
 function parseLine(line) {
-  const c1 = line.indexOf(',');
-  if (c1 < 0) return null;
-  const c2 = line.indexOf(',', c1 + 1);
-  if (c2 < 0) return null;
-  const registry = line.slice(0, c1).trim();
-  const assignment = line.slice(c1 + 1, c2).trim();
-  const rest = line.slice(c2 + 1);
-  let name;
-  if (rest[0] === '"') {
-    // Quoted field: consume until an unescaped closing quote ("" is a literal quote).
-    let buf = '';
-    let j = 1;
-    while (j < rest.length) {
-      const ch = rest[j];
-      if (ch === '"') {
-        if (rest[j + 1] === '"') { buf += '"'; j += 2; continue; }
-        break;
-      }
-      buf += ch;
-      j += 1;
-    }
-    name = buf;
-  } else {
-    const c3 = rest.indexOf(',');
-    name = c3 < 0 ? rest : rest.slice(0, c3);
-  }
-  return [registry, assignment, name.trim()];
+  const m = HEX_LINE.exec(line);
+  if (!m) return null;
+  const key = (m[1] + ':' + m[2] + ':' + m[3]).toUpperCase();
+  const vendor = m[4].trim();
+  if (!vendor) return null;
+  return [key, vendor];
 }
 
 async function main() {
@@ -60,33 +41,26 @@ async function main() {
   process.stdout.write(`build-oui: fetching ${SOURCE} …\n`);
   // IEEE returns 403 to requests without a browser-ish User-Agent — set one explicitly.
   const res = await fetch(SOURCE, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (vigilant-oui-build)', 'Accept': 'text/csv,*/*' },
+    headers: { 'User-Agent': 'Mozilla/5.0 (vigilant-oui-build)', Accept: 'text/plain,*/*' },
   });
   if (!res.ok) {
     console.error(`build-oui: fetch failed (HTTP ${res.status})`);
     process.exit(1);
   }
-  const csv = await res.text();
-  const lines = csv.split(/\r?\n/);
+  const txt = await res.text();
 
   const out = {};
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line) continue;
+  for (const line of txt.split(/\r?\n/)) {
     const parsed = parseLine(line);
     if (!parsed) continue;
-    const [, assignment, name] = parsed;
-    if (!/^[0-9A-Fa-f]{6}$/.test(assignment) || !name) continue;
-    const hex = assignment.toUpperCase();
-    const key = hex.slice(0, 2) + ':' + hex.slice(2, 4) + ':' + hex.slice(4, 6);
-    out[key] = name;
+    out[parsed[0]] = parsed[1]; // last write wins (entries are unique anyway)
   }
 
   const count = Object.keys(out).length;
   // Sanity gate: the real registry has ~35k assignments. A tiny count means the format moved
   // and our parse is wrong — fail rather than ship a near-empty DB that looks "fixed".
   if (count < 10000) {
-    console.error(`build-oui: parsed only ${count} OUIs — aborting (CSV format changed?)`);
+    console.error(`build-oui: parsed only ${count} OUIs — aborting (oui.txt format changed?)`);
     process.exit(1);
   }
 
