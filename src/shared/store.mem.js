@@ -781,6 +781,33 @@ function makeMemStore(_config) {
     const transitions = []; // open/clear events for the worker to notify on
     const ruleList = Array.isArray(rules) ? rules : [];
 
+    // Anti-flap (honours rule.for_seconds): a firing condition parks as 'pending' until it has
+    // held for for_seconds, then promotes to 'open' (notify); if it stops firing while pending
+    // it's dropped (no alarm, no flap). for_seconds=0 → open immediately. Returns a transition.
+    function applyAlertState(deviceId, rule, firing, detail, dev, value) {
+      const forS = rule.for_seconds != null ? Math.max(0, Math.round(Number(rule.for_seconds))) : 0;
+      const cur = alerts.find(
+        (a) => a.device_id === deviceId && a.rule_id === rule.id && (a.state === 'open' || a.state === 'pending')
+      );
+      if (firing) {
+        if (!cur) {
+          const state = forS <= 0 ? 'open' : 'pending';
+          alerts.push({ id: ++alertSeq, device_id: deviceId, rule_id: rule.id, severity: rule.severity || 'warning', state, detail, opened_at: iso(), cleared_at: null });
+          if (state === 'open') { opened += 1; return { kind: 'open', device_id: deviceId, serial: dev.serial, site_name: dev.site_name, detail, value, rule }; }
+          return null;
+        }
+        if (cur.state === 'pending' && ageSeconds(cur.opened_at, Date.now()) >= forS) {
+          cur.state = 'open'; cur.opened_at = iso(); cur.detail = detail; opened += 1;
+          return { kind: 'open', device_id: deviceId, serial: dev.serial, site_name: dev.site_name, detail, value, rule };
+        }
+        return null;
+      }
+      if (!cur) return null;
+      if (cur.state === 'pending') { const i = alerts.indexOf(cur); if (i >= 0) alerts.splice(i, 1); return null; }
+      cur.state = 'cleared'; cur.cleared_at = iso(); cleared += 1;
+      return { kind: 'clear', device_id: deviceId, serial: dev.serial, site_name: dev.site_name, detail, value, rule };
+    }
+
     for (const [deviceId, s] of deviceState) {
       const tags = deviceTags(deviceId);
       const dev = devices.get(deviceId) || {};
@@ -810,24 +837,8 @@ function makeMemStore(_config) {
           firing = evaluateAlert(rule, value);
           detail = `${rule.name ? rule.name + ': ' : ''}${rule.metric} ${rule.comparator} ${rule.threshold != null ? rule.threshold : ''} (value=${value == null ? 'null' : value})`.trim();
         }
-        const open = alerts.find(
-          (a) => a.device_id === deviceId && a.rule_id === rule.id && a.state === 'open'
-        );
-
-        if (firing && !open) {
-          alerts.push({
-            id: ++alertSeq, device_id: deviceId, rule_id: rule.id,
-            severity: rule.severity || 'warning', state: 'open',
-            detail, opened_at: iso(), cleared_at: null,
-          });
-          opened += 1;
-          transitions.push({ kind: 'open', device_id: deviceId, serial: dev.serial, site_name: dev.site_name, detail, value, rule });
-        } else if (!firing && open) {
-          open.state = 'cleared';
-          open.cleared_at = iso();
-          cleared += 1;
-          transitions.push({ kind: 'clear', device_id: deviceId, serial: dev.serial, site_name: dev.site_name, detail, value, rule });
-        }
+        const tr = applyAlertState(deviceId, rule, firing, detail, dev, value);
+        if (tr) transitions.push(tr);
       }
     }
     return { opened, cleared, transitions };

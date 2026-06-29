@@ -60,6 +60,40 @@ test("neighbor_down: a Yealink not seen for > threshold opens an alert; reappear
   assert.ok(res.transitions.some((x) => x.kind === "clear"));
 });
 
+test("for_seconds: a transient breach never alarms (anti-flap); a sustained one opens once", async () => {
+  const store = makeMemStore();
+  await seedDevice(store, { serial: "FS-1", token: "t" });
+  const dev = await store.getDeviceBySerial("FS-1");
+  store._test.addAlertRule({ name: "CPU sustained", metric: "cpu_load", comparator: ">", threshold: 90, for_seconds: 300 });
+  const rules = await store.getActiveAlertRules();
+
+  // Breach now → parks as PENDING, not open, no notification.
+  await store.upsertDeviceState(dev.id, { status: "online", cpu_load: 95 });
+  let res = await store.evaluateAndApplyAlerts(rules);
+  assert.equal(res.opened, 0, "first breach is pending, not open");
+  assert.equal(res.transitions.length, 0, "no notification for a pending alert");
+
+  // Breach clears before for_seconds → pending dropped, still nothing. THIS is the anti-flap:
+  // a value bouncing around the threshold never produces open/clear churn.
+  await store.upsertDeviceState(dev.id, { status: "online", cpu_load: 10 });
+  res = await store.evaluateAndApplyAlerts(rules);
+  assert.equal(res.opened, 0);
+  assert.equal(res.cleared, 0);
+  assert.equal(res.transitions.length, 0, "transient blip never alarms → no flap");
+
+  // Sustained: breach again (→ pending), backdate firing-since past for_seconds, re-eval → opens once.
+  await store.upsertDeviceState(dev.id, { status: "online", cpu_load: 95 });
+  await store.evaluateAndApplyAlerts(rules); // creates pending
+  for (const a of store._test._tables.alerts) if (a.state === "pending") a.opened_at = new Date(Date.now() - 600 * 1000).toISOString();
+  res = await store.evaluateAndApplyAlerts(rules);
+  assert.equal(res.opened, 1, "sustained breach opens after for_seconds");
+  assert.ok(res.transitions.some((t) => t.kind === "open"), "open transition emitted once");
+
+  // Still breaching → no duplicate open.
+  res = await store.evaluateAndApplyAlerts(rules);
+  assert.equal(res.opened, 0, "no re-open while already open");
+});
+
 test("neighbor_down: platform filter ignores non-matching neighbours", async () => {
   const { store, deviceId } = await setup();
   await store.upsertNeighbors(deviceId, [

@@ -300,14 +300,20 @@ CREATE TABLE IF NOT EXISTS alerts (
     device_id   uuid        NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     rule_id     bigint      REFERENCES alert_rules(id),
     severity    text        NOT NULL,
-    state       text        NOT NULL DEFAULT 'open' CHECK (state IN ('open','acked','cleared')),
+    -- 'pending' = condition firing but not yet held for the rule's for_seconds (anti-flap; not
+    -- counted as open, not notified). Promotes to 'open' once sustained; reset to gone if it
+    -- stops firing first.
+    state       text        NOT NULL DEFAULT 'open' CHECK (state IN ('open','acked','cleared','pending')),
     detail      text,
-    opened_at   timestamptz NOT NULL DEFAULT now(),
+    opened_at   timestamptz NOT NULL DEFAULT now(),  -- while pending, this is the firing-since time
     acked_at    timestamptz,
     acked_by    text,
     cleared_at  timestamptz
 );
 CREATE INDEX IF NOT EXISTS alerts_open_idx ON alerts (device_id, state) WHERE state = 'open';
+-- Existing deployments: widen the state CHECK to allow 'pending'.
+ALTER TABLE alerts DROP CONSTRAINT IF EXISTS alerts_state_check;
+ALTER TABLE alerts ADD CONSTRAINT alerts_state_check CHECK (state IN ('open','acked','cleared','pending'));
 
 -- ─────────────────────────── config push ───────────────────────────
 CREATE TABLE IF NOT EXISTS config_jobs (

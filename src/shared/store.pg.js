@@ -1086,6 +1086,44 @@ function makePgStore(poolOrConfig) {
     let cleared = 0;
     const transitions = []; // open/clear events for the worker to notify on
 
+    // Anti-flap state machine (honours rule.for_seconds, Prometheus-style `for:`): a firing
+    // condition first parks as 'pending' (not counted, not notified); it only promotes to
+    // 'open' (and emits an open transition) once it's been firing for for_seconds. If it stops
+    // firing while pending, the pending row is dropped — so a transient blip never alarms and
+    // never flaps. for_seconds=0 → opens immediately (legacy behaviour). Returns a transition
+    // to notify on (open/clear) or null.
+    async function applyAlertState(deviceId, rule, firing, detail, serial, siteName, value) {
+      const forS = rule.for_seconds != null ? Math.max(0, Math.round(Number(rule.for_seconds))) : 0;
+      const cur = await one(
+        `SELECT id, state, (now() - opened_at) >= make_interval(secs => $3) AS due
+           FROM alerts
+          WHERE device_id = $1 AND rule_id = $2 AND state IN ('open','pending')
+          ORDER BY opened_at DESC LIMIT 1`,
+        [deviceId, rule.id, forS]
+      );
+      if (firing) {
+        if (!cur) {
+          const state = forS <= 0 ? 'open' : 'pending';
+          await q(`INSERT INTO alerts (device_id, rule_id, severity, state, detail, opened_at) VALUES ($1,$2,$3,$4,$5, now())`,
+            [deviceId, rule.id, rule.severity || 'warning', state, detail]);
+          if (state === 'open') { opened += 1; return { kind: 'open', device_id: deviceId, serial, site_name: siteName, detail, value, rule }; }
+          return null; // pending — not yet alarmed
+        }
+        if (cur.state === 'pending' && cur.due) {
+          await q(`UPDATE alerts SET state='open', opened_at=now(), detail=$2 WHERE id=$1`, [cur.id, detail]);
+          opened += 1;
+          return { kind: 'open', device_id: deviceId, serial, site_name: siteName, detail, value, rule };
+        }
+        return null; // pending-not-yet-due, or already open
+      }
+      // not firing
+      if (!cur) return null;
+      if (cur.state === 'pending') { await q(`DELETE FROM alerts WHERE id=$1`, [cur.id]); return null; }
+      await q(`UPDATE alerts SET state='cleared', cleared_at=now() WHERE id=$1`, [cur.id]);
+      cleared += 1;
+      return { kind: 'clear', device_id: deviceId, serial, site_name: siteName, detail, value, rule };
+    }
+
     for (const rule of rules) {
       if (rule.enabled === false) continue;
 
@@ -1111,20 +1149,8 @@ function makePgStore(poolOrConfig) {
           const firing = dropped.length > 0;
           const names = dropped.map((n) => n.identity || n.mac).slice(0, 5).join(', ');
           const detail = `${rule.name}: ${dropped.length} ${rule.neighbor_platform || 'neighbour'}(s) not seen >${thr}s${names ? ' — ' + names : ''}`;
-          const openRow = await one(
-            `SELECT id FROM alerts WHERE device_id = $1 AND rule_id = $2 AND state = 'open' ORDER BY opened_at DESC LIMIT 1`,
-            [d.device_id, rule.id]
-          );
-          if (firing && !openRow) {
-            await q(`INSERT INTO alerts (device_id, rule_id, severity, state, detail, opened_at) VALUES ($1,$2,$3,'open',$4, now())`,
-              [d.device_id, rule.id, rule.severity || 'warning', detail]);
-            opened += 1;
-            transitions.push({ kind: 'open', device_id: d.device_id, serial: d.serial, site_name: d.site_name, detail, value: dropped.length, rule });
-          } else if (!firing && openRow) {
-            const r = await q(`UPDATE alerts SET state='cleared', cleared_at=now() WHERE device_id=$1 AND rule_id=$2 AND state='open'`, [d.device_id, rule.id]);
-            cleared += r.rowCount || 0;
-            if (r.rowCount) transitions.push({ kind: 'clear', device_id: d.device_id, serial: d.serial, site_name: d.site_name, detail, value: 0, rule });
-          }
+          const tr = await applyAlertState(d.device_id, rule, firing, detail, d.serial, d.site_name, dropped.length);
+          if (tr) transitions.push(tr);
         }
         continue; // handled — skip the device_state path for this rule
       }
@@ -1151,33 +1177,9 @@ function makePgStore(poolOrConfig) {
       for (const c of candidates) {
         const value = rule.metric === 'offline' ? c.status : c.value;
         const firing = transform.evaluateAlert(rule, value);
-
-        const openRow = await one(
-          `SELECT id FROM alerts
-            WHERE device_id = $1 AND rule_id = $2 AND state = 'open'
-            ORDER BY opened_at DESC LIMIT 1`,
-          [c.device_id, rule.id]
-        );
-
         const detail = `${rule.name}: ${rule.metric} ${rule.comparator} ${rule.threshold == null ? '' : rule.threshold} (value=${value == null ? 'null' : value})`;
-        if (firing && !openRow) {
-          await q(
-            `INSERT INTO alerts (device_id, rule_id, severity, state, detail, opened_at)
-             VALUES ($1, $2, $3, 'open', $4, now())`,
-            [c.device_id, rule.id, rule.severity || 'warning', detail]
-          );
-          opened += 1;
-          transitions.push({ kind: 'open', device_id: c.device_id, serial: c.serial, site_name: c.site_name, detail, value, rule });
-        } else if (!firing && openRow) {
-          const r = await q(
-            `UPDATE alerts
-                SET state = 'cleared', cleared_at = now()
-              WHERE device_id = $1 AND rule_id = $2 AND state = 'open'`,
-            [c.device_id, rule.id]
-          );
-          cleared += r.rowCount || 0;
-          if (r.rowCount) transitions.push({ kind: 'clear', device_id: c.device_id, serial: c.serial, site_name: c.site_name, detail, value, rule });
-        }
+        const tr = await applyAlertState(c.device_id, rule, firing, detail, c.serial, c.site_name, value);
+        if (tr) transitions.push(tr);
       }
     }
 
