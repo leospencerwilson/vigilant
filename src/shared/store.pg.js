@@ -1017,7 +1017,8 @@ function makePgStore(poolOrConfig) {
 
   async function getActiveAlertRules() {
     return rows(
-      `SELECT id, name, metric, comparator, threshold, for_seconds, severity, scope_tag, enabled
+      `SELECT id, name, metric, comparator, threshold, for_seconds, severity, scope_tag, enabled,
+              notify_email, notify_teams_webhook, notify_on
          FROM alert_rules
         WHERE enabled = true`,
       []
@@ -1031,6 +1032,7 @@ function makePgStore(poolOrConfig) {
     const rules = Array.isArray(rulesIn) ? rulesIn : await getActiveAlertRules();
     let opened = 0;
     let cleared = 0;
+    const transitions = []; // open/clear events for the worker to notify on
 
     for (const rule of rules) {
       if (rule.enabled === false) continue;
@@ -1046,7 +1048,8 @@ function makePgStore(poolOrConfig) {
           : 'NULL';
 
       const candidates = await rows(
-        `SELECT d.id AS device_id, ${selectVal} AS value, s.status AS status
+        `SELECT d.id AS device_id, d.serial AS serial, d.site_name AS site_name,
+                ${selectVal} AS value, s.status AS status
            FROM devices d
            JOIN device_state s ON s.device_id = d.id
           WHERE ($1::text IS NULL OR $1 = ANY (d.tags))`,
@@ -1064,18 +1067,15 @@ function makePgStore(poolOrConfig) {
           [c.device_id, rule.id]
         );
 
+        const detail = `${rule.name}: ${rule.metric} ${rule.comparator} ${rule.threshold == null ? '' : rule.threshold} (value=${value == null ? 'null' : value})`;
         if (firing && !openRow) {
           await q(
             `INSERT INTO alerts (device_id, rule_id, severity, state, detail, opened_at)
              VALUES ($1, $2, $3, 'open', $4, now())`,
-            [
-              c.device_id,
-              rule.id,
-              rule.severity || 'warning',
-              `${rule.name}: ${rule.metric} ${rule.comparator} ${rule.threshold == null ? '' : rule.threshold} (value=${value == null ? 'null' : value})`,
-            ]
+            [c.device_id, rule.id, rule.severity || 'warning', detail]
           );
           opened += 1;
+          transitions.push({ kind: 'open', device_id: c.device_id, serial: c.serial, site_name: c.site_name, detail, value, rule });
         } else if (!firing && openRow) {
           const r = await q(
             `UPDATE alerts
@@ -1084,11 +1084,12 @@ function makePgStore(poolOrConfig) {
             [c.device_id, rule.id]
           );
           cleared += r.rowCount || 0;
+          if (r.rowCount) transitions.push({ kind: 'clear', device_id: c.device_id, serial: c.serial, site_name: c.site_name, detail, value, rule });
         }
       }
     }
 
-    return { opened, cleared };
+    return { opened, cleared, transitions };
   }
 
   // ── retention / downsample ───────────────────────────────────────────────

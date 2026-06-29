@@ -278,8 +278,17 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     severity    text        NOT NULL DEFAULT 'warning'
                             CHECK (severity IN ('info','warning','critical')),
     scope_tag   text,                           -- null = all devices, else only devices with this tag
-    enabled     boolean     NOT NULL DEFAULT true
+    enabled     boolean     NOT NULL DEFAULT true,
+    -- Notification targets for this rule (dispatched by the worker on open/clear).
+    notify_email         text,                  -- comma-separated recipients (via Resend)
+    notify_teams_webhook text,                  -- MS Teams incoming-webhook URL
+    notify_on            text NOT NULL DEFAULT 'both'   -- 'open' | 'clear' | 'both'
+                         CHECK (notify_on IN ('open','clear','both'))
 );
+-- Existing deployments: add the notification columns idempotently.
+ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS notify_email         text;
+ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS notify_teams_webhook text;
+ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS notify_on            text NOT NULL DEFAULT 'both';
 
 CREATE TABLE IF NOT EXISTS alerts (
     id          bigserial   PRIMARY KEY,

@@ -61,6 +61,10 @@ const config = Object.freeze({
   neighborTtlS: num(process.env.NEIGHBOR_TTL_S, 86400),
   storeKind,
   enableNightlySnapshot: bool(process.env.ENABLE_NIGHTLY_SNAPSHOT, false),
+  // Alert notifications (worker dispatches on alert open/clear). Email via Resend; Teams via a
+  // per-rule incoming-webhook URL (no global key needed). All optional — unset = no email sent.
+  resendApiKey: process.env.RESEND_API_KEY || "",
+  alertEmailFrom: process.env.ALERT_EMAIL_FROM || "Vigilant <vigilant@western-communication.com>",
   // Supabase Realtime for the dashboard. The admin page is gated by ENROLL_TOKEN (not a
   // Supabase session), so the ingest mints a short-lived `authenticated` JWT (signed with the
   // Supabase JWT secret) after validating the admin token — the browser uses that + the anon

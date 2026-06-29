@@ -17,6 +17,7 @@
 
 const transform = require("../shared/transform");
 const log = require("../shared/log");
+const notify = require("./notify");
 
 // Resolve the worker's tunables from the typed config object, tolerating either camelCase
 // (config.js) or the raw env var names, with the contract defaults as the floor. This
@@ -87,15 +88,16 @@ function ruleTargetsDevice(rule, device) {
 async function evaluateAlerts({ store, now }) {
   let opened = 0;
   let cleared = 0;
+  const transitions = [];
 
   // Parity escape hatch: if the store implements a single evaluateAndApplyAlerts that
   // internally uses transform.evaluateAlert, defer to it (keeps mem/pg behaviour identical).
   const rules = (await store.getActiveAlertRules()) || [];
-  if (rules.length === 0) return { opened, cleared };
+  if (rules.length === 0) return { opened, cleared, transitions };
 
   if (typeof store.evaluateAndApplyAlerts === "function") {
     const res = (await store.evaluateAndApplyAlerts(rules)) || {};
-    return { opened: res.opened || 0, cleared: res.cleared || 0 };
+    return { opened: res.opened || 0, cleared: res.cleared || 0, transitions: res.transitions || [] };
   }
 
   // Primitive-read path: pull the fleet once, then evaluate each rule per device.
@@ -118,7 +120,23 @@ async function evaluateAlerts({ store, now }) {
       }
     }
   }
-  return { opened, cleared };
+  return { opened, cleared, transitions };
+}
+
+// Dispatch notifications (email/Teams) for the alert transitions from this pass. Best-effort:
+// a failed send is logged and never breaks the worker loop or other notifications.
+async function dispatchNotifications(transitions, config) {
+  const list = Array.isArray(transitions) ? transitions : [];
+  let sent = 0;
+  for (const t of list) {
+    try {
+      const r = await notify.dispatchAlert(t, { config, logger: log });
+      if (r && r.sent) sent += 1;
+    } catch (e) {
+      log.warn("worker: notify dispatch error", { msg: e && e.message });
+    }
+  }
+  return { sent };
 }
 
 // Flag devices whose newest config_snapshot is older than 24h and enqueue a read-only
@@ -143,6 +161,8 @@ async function runOnce({ store, config, now }) {
 
   // 2. alert rules (threshold decision in transform.evaluateAlert)
   summary.alerts = await evaluateAlerts({ store, now: at });
+  // 2b. notify (email/Teams) on the open/clear transitions — pass the FULL config (Resend key).
+  summary.notified = await dispatchNotifications(summary.alerts.transitions, config);
 
   // 3. history downsample + prune
   await store.downsampleHistory(at);

@@ -730,10 +730,12 @@ function makeMemStore(_config) {
     const { evaluateAlert } = require('./transform');
     let opened = 0;
     let cleared = 0;
+    const transitions = []; // open/clear events for the worker to notify on
     const ruleList = Array.isArray(rules) ? rules : [];
 
     for (const [deviceId, s] of deviceState) {
       const tags = deviceTags(deviceId);
+      const dev = devices.get(deviceId) || {};
       for (const rule of ruleList) {
         if (rule.enabled === false) continue;
         if (rule.scope_tag && !tags.includes(rule.scope_tag)) continue;
@@ -743,27 +745,25 @@ function makeMemStore(_config) {
         const open = alerts.find(
           (a) => a.device_id === deviceId && a.rule_id === rule.id && a.state === 'open'
         );
+        const detail = `${rule.name ? rule.name + ': ' : ''}${rule.metric} ${rule.comparator} ${rule.threshold != null ? rule.threshold : ''} (value=${value == null ? 'null' : value})`.trim();
 
         if (firing && !open) {
           alerts.push({
-            id: ++alertSeq,
-            device_id: deviceId,
-            rule_id: rule.id,
-            severity: rule.severity || 'warning',
-            state: 'open',
-            detail: `${rule.metric} ${rule.comparator} ${rule.threshold != null ? rule.threshold : ''}`.trim(),
-            opened_at: iso(),
-            cleared_at: null,
+            id: ++alertSeq, device_id: deviceId, rule_id: rule.id,
+            severity: rule.severity || 'warning', state: 'open',
+            detail, opened_at: iso(), cleared_at: null,
           });
           opened += 1;
+          transitions.push({ kind: 'open', device_id: deviceId, serial: dev.serial, site_name: dev.site_name, detail, value, rule });
         } else if (!firing && open) {
           open.state = 'cleared';
           open.cleared_at = iso();
           cleared += 1;
+          transitions.push({ kind: 'clear', device_id: deviceId, serial: dev.serial, site_name: dev.site_name, detail, value, rule });
         }
       }
     }
-    return { opened, cleared };
+    return { opened, cleared, transitions };
   }
 
   async function downsampleHistory(_now) {
@@ -861,6 +861,9 @@ function makeMemStore(_config) {
         severity: rule.severity || 'warning',
         scope_tag: rule.scope_tag != null ? rule.scope_tag : null,
         enabled: rule.enabled !== false,
+        notify_email: rule.notify_email != null ? rule.notify_email : null,
+        notify_teams_webhook: rule.notify_teams_webhook != null ? rule.notify_teams_webhook : null,
+        notify_on: rule.notify_on != null ? rule.notify_on : 'both',
       };
       alertRules.push(row);
       return { ...row };
