@@ -667,7 +667,7 @@
             :if (([:typeof [:find $msg "Download from"]] = "nothing") && ([:typeof [:find $msg "vigilant-agent"]] = "nothing")) do={
                 :local tpc ""; :do { :set tpc [:tostr [/log get $lid topics]] } on-error={}
                 :local tim ""; :do { :set tim [:tostr [/log get $lid time]] } on-error={}
-                :set ($logArr->[:len $logArr]) ("{\"time\":\"" . [$vigilantClean $tim] . "\",\"topics\":\"" . [$vigilantClean $tpc] . "\",\"message\":\"" . [$vigilantClean $msg] . "\"}")
+                :set logArr ($logArr , ("{\"time\":\"" . [$vigilantClean $tim] . "\",\"topics\":\"" . [$vigilantClean $tpc] . "\",\"message\":\"" . [$vigilantClean $msg] . "\"}"))
             }
             :set lk ($lk + 1)
         }
