@@ -1112,6 +1112,7 @@ module.exports = {
   fleet,
   deviceDetail,
   deviceHistory,
+  deviceLogs,
   ouiLookup,
   configJobsList,
   configJobCreate,
