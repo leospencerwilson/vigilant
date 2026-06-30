@@ -645,16 +645,17 @@
 :if ($doSlow) do={
     :local logArr [:toarray ""]
     :do {
-        :local le [/log print as-value]
-        :local lt [:len $le]
+        :local logIds [/log find]
+        :local lt [:len $logIds]
         :local lk 0
         :if ($lt > 200) do={ :set lk ($lt - 200) }
         :while ($lk < $lt) do={
-            :local rec ($le->$lk)
-            :local msg [:tostr ($rec->"message")]
+            :local lid ($logIds->$lk)
+            :local msg ""
+            :do { :set msg [:tostr [/log get $lid message]] } on-error={}
             :if ([:typeof [:find $msg "Download from"]] = "nothing") do={
-                :local tpc [:tostr ($rec->"topics")]
-                :local tim [:tostr ($rec->"time")]
+                :local tpc ""; :do { :set tpc [:tostr [/log get $lid topics]] } on-error={}
+                :local tim ""; :do { :set tim [:tostr [/log get $lid time]] } on-error={}
                 :set ($logArr->[:len $logArr]) ("{\"time\":\"" . [$vigilantClean $tim] . "\",\"topics\":\"" . [$vigilantClean $tpc] . "\",\"message\":\"" . [$vigilantClean $msg] . "\"}")
             }
             :set lk ($lk + 1)
