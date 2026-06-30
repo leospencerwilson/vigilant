@@ -125,29 +125,37 @@
 # Signal fields update every tick. Identifiers (ICCID/IMSI/IMEI/MSISDN) are STATIC —
 # we read them via lte/info here, but if missing fall back to at-chat sparingly (see
 # docs/TELEMETRY-CATALOGUE.md §3 — at-chat every tick can disrupt the data session).
-:local lteJson "null"
-:if ([:len [/interface/lte find]] > 0) do={
-    :do {
-        :local lif [/interface/lte find]
-        :local ln  [/interface/lte get [:pick $lif 0] name]
-        :local li  [/interface/lte/info $ln once as-value]
-        :local g do={ :local v ($1->$2); :if ([:typeof $v] = "nothing") do={ :return "" }; :return $v }
-        :set lteJson ("{\"interface\":\"" . $ln . "\"" . \
-            ",\"iccid\":\"" .  [$g $li "uicc"] . "\"" . \
-            ",\"imsi\":\"" .   [$g $li "imsi"] . "\"" . \
-            ",\"imei\":\"" .   [$g $li "imei"] . "\"" . \
-            ",\"msisdn\":\"" . [$g $li "subscriber-number"] . "\"" . \
-            ",\"operator\":\"" . [$vigilantClean [$g $li "current-operator"]] . "\"" . \
-            ",\"registration\":\"" . [$g $li "registration-status"] . "\"" . \
-            ",\"access_tech\":\"" . [$g $li "access-technology"] . "\"" . \
-            ",\"band\":\"" .  [$g $li "band"] . "\"" . \
-            ",\"cell_id\":\"" . [$g $li "current-cellid"] . "\"" . \
-            ",\"rssi\":\"" .  [$g $li "rssi"] . "\"" . \
-            ",\"rsrp\":\"" .  [$g $li "rsrp"] . "\"" . \
-            ",\"rsrq\":\"" .  [$g $li "rsrq"] . "\"" . \
-            ",\"sinr\":\"" .  [$g $li "sinr"] . "\"}")
-    } on-error={ :log warning "vigilant-agent: lte/info read failed" }
+:global vigilantLteJson
+:if ([:typeof $vigilantLteJson] = "nothing") do={ :set vigilantLteJson "null" }
+# LTE modem stats change slowly and reading /interface/lte/info can stall the data session,
+# so refresh only on the SLOW tick and cache in a global for the per-tick core POST. Fail
+# SILENTLY — a modem with no SIM/service throws on every read and must never spam the log
+# (this was the per-second "lte/info read failed" flood that drowned the device log).
+:if ($doSlow) do={
+    :if ([:len [/interface/lte find]] > 0) do={
+        :do {
+            :local lif [/interface/lte find]
+            :local ln  [/interface/lte get [:pick $lif 0] name]
+            :local li  [/interface/lte/info $ln once as-value]
+            :local g do={ :local v ($1->$2); :if ([:typeof $v] = "nothing") do={ :return "" }; :return $v }
+            :set vigilantLteJson ("{\"interface\":\"" . $ln . "\"" . \
+                ",\"iccid\":\"" .  [$g $li "uicc"] . "\"" . \
+                ",\"imsi\":\"" .   [$g $li "imsi"] . "\"" . \
+                ",\"imei\":\"" .   [$g $li "imei"] . "\"" . \
+                ",\"msisdn\":\"" . [$g $li "subscriber-number"] . "\"" . \
+                ",\"operator\":\"" . [$vigilantClean [$g $li "current-operator"]] . "\"" . \
+                ",\"registration\":\"" . [$g $li "registration-status"] . "\"" . \
+                ",\"access_tech\":\"" . [$g $li "access-technology"] . "\"" . \
+                ",\"band\":\"" .  [$g $li "band"] . "\"" . \
+                ",\"cell_id\":\"" . [$g $li "current-cellid"] . "\"" . \
+                ",\"rssi\":\"" .  [$g $li "rssi"] . "\"" . \
+                ",\"rsrp\":\"" .  [$g $li "rsrp"] . "\"" . \
+                ",\"rsrq\":\"" .  [$g $li "rsrq"] . "\"" . \
+                ",\"sinr\":\"" .  [$g $li "sinr"] . "\"}")
+        } on-error={ :set vigilantLteJson "null" }
+    } else={ :set vigilantLteJson "null" }
 }
+:local lteJson $vigilantLteJson
 
 # WAN / routing (public IP only — NEVER the password)
 :local publicIp "null"
@@ -637,11 +645,11 @@
     [$vigilantPost $body "telemetry-wifi-clients" $vigilantCC]
 }
 
-# ── 7) Recent device logs (slow tick) — MINUS the agent's own /tool fetch chatter ("Download
-# from <host> … FINISHED"). Uses ONE `/log print as-value` call (NOT per-entry /log get, which
-# hangs on a noise-flooded buffer) and only examines the most recent ~200 entries, keeping the
-# last ~40 real lines. Server appends to the 30-day history (PK dedups overlap). Fully wrapped
-# so a log-read quirk on any ROS version can never break the telemetry tick.
+# ── 7) Recent device logs (slow tick) — MINUS the agent's own chatter (the "/tool fetch …
+# Download from <host>" lines and any "vigilant-agent: …" lines). Bounds the scan to the most
+# recent ~200 entries (so it can never hang on a huge buffer) and keeps the last ~40 real
+# lines. Server appends to the 30-day history (PK dedups overlap). Fully wrapped so a log-read
+# quirk on any ROS version can never break the telemetry tick.
 :if ($doSlow) do={
     :local logArr [:toarray ""]
     :do {
@@ -653,7 +661,10 @@
             :local lid ($logIds->$lk)
             :local msg ""
             :do { :set msg [:tostr [/log get $lid message]] } on-error={}
-            :if ([:typeof [:find $msg "Download from"]] = "nothing") do={
+            # Strip the agent's OWN chatter: the "/tool fetch ... Download from <host>" lines
+            # AND any "vigilant-agent: ..." lines (POST failures, speedtest, etc.). What's left
+            # is the genuinely useful device log (l2tp, dhcp, system, wireless, login, …).
+            :if (([:typeof [:find $msg "Download from"]] = "nothing") && ([:typeof [:find $msg "vigilant-agent"]] = "nothing")) do={
                 :local tpc ""; :do { :set tpc [:tostr [/log get $lid topics]] } on-error={}
                 :local tim ""; :do { :set tim [:tostr [/log get $lid time]] } on-error={}
                 :set ($logArr->[:len $logArr]) ("{\"time\":\"" . [$vigilantClean $tim] . "\",\"topics\":\"" . [$vigilantClean $tpc] . "\",\"message\":\"" . [$vigilantClean $msg] . "\"}")
@@ -909,14 +920,17 @@
 # The SERVER does all the timing/maths, so we need no sub-second clock here. ⚠️ This deliberately
 # saturates the WAN for the test's duration — it only runs when an operator has requested one,
 # and the server caps the byte counts. Uses the $vigilantJsonStr helper defined above.
-:if (($vigilantTick % 5) = 0) do={
+:if ($doSlow) do={
     :do {
         :local sp [/tool fetch url=("$vigilantUrl/speedtest/pending") http-method=get mode=https \
             check-certificate=$vigilantCC http-header-field=("Authorization: Bearer " . $vigilantToken) \
             output=user as-value]
         :local sb ""; :do { :set sb ($sp->"data") } on-error={}
         :local sjid [$vigilantJsonStr $sb "id"]
-        :if ([:len $sjid] > 0) do={
+        # Job ids are UUIDs (36 chars). Require >8 so an idle/empty pending response that
+        # happens to parse to a tiny phantom id (e.g. "t") can't trigger a failing "test"
+        # every poll — that was the recurring "speedtest t failed" log spam.
+        :if ([:len $sjid] > 8) do={
             :local durl [$vigilantJsonStr $sb "down_url"]
             :local uurl [$vigilantJsonStr $sb "up_url"]
             :local dlok false
