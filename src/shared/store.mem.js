@@ -312,6 +312,11 @@ function makeMemStore(_config) {
     wirelessClients.set(deviceId, m);
   }
 
+  async function upsertDeviceLogs(deviceId, logs) {
+    const prev = deviceState.get(deviceId) || { device_id: deviceId };
+    deviceState.set(deviceId, { ...prev, recent_logs: Array.isArray(logs) ? logs.slice(0, 100) : [] });
+  }
+
   // ── history (append-only) ──────────────────────────────────────────────────
   async function appendMetricsHistory(deviceId, ts, row) {
     metricsHistory.push({ ...(row || {}), device_id: deviceId, ts: iso(ts) });
@@ -991,6 +996,7 @@ function makeMemStore(_config) {
     upsertMacHosts,
     upsertWifiNetworks,
     upsertWirelessClients,
+    upsertDeviceLogs,
     appendMetricsHistory,
     appendInterfaceHistory,
     appendLteHistory,

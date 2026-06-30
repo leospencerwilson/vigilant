@@ -348,6 +348,10 @@ async function telemetryIngest(ctx) {
   if (payload.wifi_clients != null && typeof store.upsertWirelessClients === 'function') {
     await store.upsertWirelessClients(device.id, payload.wifi_clients);
   }
+  // Recent device log lines (agent already strips its own fetch noise). Full-snapshot replace.
+  if (payload.logs != null && typeof store.upsertDeviceLogs === 'function') {
+    await store.upsertDeviceLogs(device.id, payload.logs);
+  }
 
   // Metrics history is a snapshot of the system block — only meaningful for a CORE chunk.
   // Skip it for a detail chunk so we never append an all-null metrics row that would dilute

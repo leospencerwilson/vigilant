@@ -295,6 +295,9 @@ ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS notify_teams_webhook text;
 ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS notify_on            text NOT NULL DEFAULT 'both';
 ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS neighbor_platform    text;
 
+-- Recent device log lines (agent-collected, fetch-noise stripped) for the device view.
+ALTER TABLE device_state ADD COLUMN IF NOT EXISTS recent_logs jsonb;
+
 CREATE TABLE IF NOT EXISTS alerts (
     id          bigserial   PRIMARY KEY,
     device_id   uuid        NOT NULL REFERENCES devices(id) ON DELETE CASCADE,

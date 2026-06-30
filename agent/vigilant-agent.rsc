@@ -77,11 +77,29 @@
 :if ([:typeof $vigilantTick] = "nothing") do={ :set vigilantTick 0 }
 :set vigilantTick ($vigilantTick + 1)
 :local doSlow false
-:if (($vigilantTick % 30) = 0) do={ :set doSlow true }
+# slow-tick decision is deferred until the serial is known — it's phased per-device (below)
 
 # ── identity / system ───────────────────────────────────────────────
 :global vigilantClean
 :local serial    "unknown"; :do { :set serial    [/system routerboard get serial-number] } on-error={}
+# Per-device phase for the slow (heavy) telemetry tick, derived deterministically from the
+# serial. Spreads the wifi/neighbour/host/log POSTs across the 30-tick window so a whole-fleet
+# reconnect (e.g. after an ingest redeploy) doesn't fire every router's heavy POST on the same
+# tick and exhaust the DB pool — ~1/30th of the fleet posts heavy data per tick at any scale.
+:local vigilantSlowOffset 0
+:do {
+    :local alpha "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    :local sn [:tostr $serial]
+    :local ss 0
+    :local si 0
+    :while ($si < [:len $sn]) do={
+        :local idx [:find $alpha [:pick $sn $si ($si + 1)]]
+        :if ([:typeof $idx] = "num") do={ :set ss ($ss + $idx) }
+        :set si ($si + 1)
+    }
+    :set vigilantSlowOffset ($ss % 30)
+} on-error={}
+:if (($vigilantTick % 30) = $vigilantSlowOffset) do={ :set doSlow true }
 :local identity  "unknown"; :do { :set identity  [$vigilantClean [/system identity get name]] } on-error={}
 :local uptime    "0";       :do { :set uptime    [/system resource get uptime] } on-error={}
 :local cpuLoad   "0";       :do { :set cpuLoad   [/system resource get cpu-load] } on-error={}
@@ -617,6 +635,43 @@
     }
     :set body ($body . "]}")
     [$vigilantPost $body "telemetry-wifi-clients" $vigilantCC]
+}
+
+# ── 7) Recent device logs (slow tick) — newest ~25 lines, MINUS the agent's own /tool fetch
+# chatter ("Download from <host> ... FINISHED") which otherwise floods /log every tick. We must
+# scan the WHOLE buffer (the last lines are almost all fetch noise) and keep the last 25 real
+# entries. Server replaces the device's log snapshot each POST, so the device view shows live
+# router events. Only sent when there's at least one real line (never wipes with an empty set).
+:if ($doSlow) do={
+    :local logArr [:toarray ""]
+    :local logIds [/log find]
+    :local lt [:len $logIds]
+    :local k 0
+    :while ($k < $lt) do={
+        :local lid ($logIds->$k)
+        :local msg ""; :do { :set msg [:tostr [/log get $lid message]] } on-error={}
+        :if ([:typeof [:find $msg "Download from"]] = "nothing") do={
+            :local tpc ""; :do { :set tpc [:tostr [/log get $lid topics]] } on-error={}
+            :local tim ""; :do { :set tim [:tostr [/log get $lid time]] } on-error={}
+            :set ($logArr->[:len $logArr]) ("{\"time\":\"" . [$vigilantClean $tim] . "\",\"topics\":\"" . [$vigilantClean $tpc] . "\",\"message\":\"" . [$vigilantClean $msg] . "\"}")
+        }
+        :set k ($k + 1)
+    }
+    :local lc [:len $logArr]
+    :if ($lc > 0) do={
+        :local lstart 0
+        :if ($lc > 25) do={ :set lstart ($lc - 25) }
+        :local body ("{\"serial\":\"" . $serial . "\",\"partial\":true,\"logs\":[")
+        :local j $lstart
+        :local sep ""
+        :while ($j < $lc) do={
+            :set body ($body . $sep . ($logArr->$j))
+            :set sep ","
+            :set j ($j + 1)
+        }
+        :set body ($body . "]}")
+        [$vigilantPost $body "telemetry-logs" $vigilantCC]
+    }
 }
 
 # NOTE: telemetry is now FIRE-AND-FORGET across all chunks (output=none everywhere), so we

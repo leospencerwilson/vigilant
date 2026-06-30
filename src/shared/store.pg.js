@@ -500,6 +500,12 @@ function makePgStore(poolOrConfig) {
     });
   }
 
+  // Recent device log lines — full-snapshot replace of the device_state.recent_logs column.
+  async function upsertDeviceLogs(deviceId, logs) {
+    const arr = Array.isArray(logs) ? logs.slice(0, 100) : [];
+    await q(`UPDATE device_state SET recent_logs = $2::jsonb WHERE device_id = $1`, [deviceId, JSON.stringify(arr)]);
+  }
+
   // ── history appends ──────────────────────────────────────────────────────
   async function appendMetricsHistory(deviceId, ts, row) {
     const r = row || {};
@@ -1309,6 +1315,7 @@ function makePgStore(poolOrConfig) {
     upsertMacHosts,
     upsertWifiNetworks,
     upsertWirelessClients,
+    upsertDeviceLogs,
     appendMetricsHistory,
     appendInterfaceHistory,
     appendLteHistory,
