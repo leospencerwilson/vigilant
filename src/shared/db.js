@@ -31,11 +31,12 @@ function makePool(databaseUrl) {
     // unreachable DB host.
     connectionTimeoutMillis: 10000,
     idleTimeoutMillis: 30000,
-    // Pool size. Default 25 (was 10): a whole-estate reconnect storm after a deploy POSTs
-    // telemetry from every device at once, each holding a connection through its transaction;
-    // 10 exhausted instantly → "timeout exceeded when trying to connect" → fleet looked down.
-    // Safe against the transaction-mode Supavisor pooler (6543). Override via PG_POOL_MAX.
-    max: Number(process.env.PG_POOL_MAX) || 25,
+    // Pool size. Default 12. Too LOW (10) exhausted under a reconnect storm; too HIGH (25)
+    // across ingest+worker overwhelmed the Supavisor pooler on a small VM (its scheduler
+    // stalled → "timeout exceeded when trying to connect" fleet-wide). 12 (ingest) + 8
+    // (worker, via PG_POOL_MAX) is a balanced demand on the transaction-mode pooler (6543).
+    // Override via PG_POOL_MAX.
+    max: Number(process.env.PG_POOL_MAX) || 12,
   });
 
   // CRITICAL: a pg Pool emits 'error' for failures on IDLE clients (dropped socket,
