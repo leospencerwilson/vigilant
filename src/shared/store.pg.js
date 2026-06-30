@@ -45,24 +45,29 @@ function makePgStore(poolOrConfig) {
     return r.rows;
   }
 
-  // Run fn inside a single transaction on one dedicated client.
+  // Run fn inside a single transaction on one dedicated client. Retries on transient
+  // serialization/deadlock errors (40P01 deadlock_detected, 40001 serialization_failure):
+  // the agent fires several chunk POSTs for the same device at once (neighbours/wifi/logs/…),
+  // so concurrent same-device writes can deadlock — the victim just retries and succeeds.
   async function tx(fn) {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await fn(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (err) {
+    let lastErr;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const client = await pool.connect();
       try {
-        await client.query('ROLLBACK');
-      } catch (_) {
-        /* ignore rollback failure; original error is what matters */
+        await client.query('BEGIN');
+        const result = await fn(client);
+        await client.query('COMMIT');
+        return result;
+      } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (_) { /* original error matters */ }
+        lastErr = err;
+        if (!((err.code === '40P01' || err.code === '40001') && attempt < 3)) throw err;
+        await new Promise((r) => setTimeout(r, 30 * (attempt + 1)));
+      } finally {
+        client.release();
       }
-      throw err;
-    } finally {
-      client.release();
     }
+    throw lastErr;
   }
 
   // ── migrate ────────────────────────────────────────────────────────────────
@@ -504,15 +509,18 @@ function makePgStore(poolOrConfig) {
   // the agent's overlapping re-sends — only genuinely new lines land.
   async function appendDeviceLogs(deviceId, logs) {
     const arr = Array.isArray(logs) ? logs.slice(0, 100) : [];
-    for (const l of arr) {
-      const msg = l && l.message != null ? String(l.message) : '';
-      if (!msg) continue;
-      await q(
-        `INSERT INTO device_logs (device_id, log_time, topics, message)
-         VALUES ($1,$2,$3,$4) ON CONFLICT (device_id, log_time, message) DO NOTHING`,
-        [deviceId, l.time != null ? String(l.time) : '', l.topics != null ? String(l.topics) : null, msg]
-      );
-    }
+    if (!arr.length) return;
+    await tx(async (client) => {
+      for (const l of arr) {
+        const msg = l && l.message != null ? String(l.message) : '';
+        if (!msg) continue;
+        await client.query(
+          `INSERT INTO device_logs (device_id, log_time, topics, message)
+           VALUES ($1,$2,$3,$4) ON CONFLICT (device_id, log_time, message) DO NOTHING`,
+          [deviceId, l.time != null ? String(l.time) : '', l.topics != null ? String(l.topics) : null, msg]
+        );
+      }
+    });
   }
   // Filtered log read (last 30 days). q = free text in message/topics; topic = topics filter.
   async function getDeviceLogs(deviceId, opts) {

@@ -350,6 +350,7 @@ async function telemetryIngest(ctx) {
   }
   // Device log lines (agent already strips its own fetch noise). Append to 30-day history.
   if (payload.logs != null && typeof store.appendDeviceLogs === 'function') {
+    log.info('telemetry: logs partial', { serial: device.serial, n: Array.isArray(payload.logs) ? payload.logs.length : 0 });
     await store.appendDeviceLogs(device.id, payload.logs);
   }
 
