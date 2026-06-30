@@ -312,10 +312,30 @@ function makeMemStore(_config) {
     wirelessClients.set(deviceId, m);
   }
 
-  async function upsertDeviceLogs(deviceId, logs) {
-    const prev = deviceState.get(deviceId) || { device_id: deviceId };
-    deviceState.set(deviceId, { ...prev, recent_logs: Array.isArray(logs) ? logs.slice(0, 100) : [] });
+  const deviceLogsArr = []; // {device_id, seen_at, log_time, topics, message}
+  async function appendDeviceLogs(deviceId, logs) {
+    const arr = Array.isArray(logs) ? logs.slice(0, 100) : [];
+    for (const l of arr) {
+      const msg = l && l.message != null ? String(l.message) : '';
+      if (!msg) continue;
+      const lt = l.time != null ? String(l.time) : '';
+      if (deviceLogsArr.some((x) => x.device_id === deviceId && x.log_time === lt && x.message === msg)) continue;
+      deviceLogsArr.push({ device_id: deviceId, seen_at: iso(), log_time: lt, topics: l.topics != null ? String(l.topics) : null, message: msg });
+    }
   }
+  async function getDeviceLogs(deviceId, opts) {
+    const o = opts || {};
+    const limit = Math.min(Math.max(parseInt(o.limit, 10) || 300, 1), 2000);
+    const qq = o.q != null && String(o.q).trim() !== '' ? String(o.q).trim().toLowerCase() : null;
+    const topic = o.topic != null && String(o.topic).trim() !== '' ? String(o.topic).trim().toLowerCase() : null;
+    return deviceLogsArr
+      .filter((x) => x.device_id === deviceId)
+      .filter((x) => !qq || (x.message || '').toLowerCase().includes(qq) || (x.topics || '').toLowerCase().includes(qq))
+      .filter((x) => !topic || (x.topics || '').toLowerCase().includes(topic))
+      .sort((a, b) => new Date(b.seen_at) - new Date(a.seen_at))
+      .slice(0, limit);
+  }
+  async function pruneDeviceLogs() { return { pruned: 0 }; }
 
   // ── history (append-only) ──────────────────────────────────────────────────
   async function appendMetricsHistory(deviceId, ts, row) {
@@ -996,7 +1016,9 @@ function makeMemStore(_config) {
     upsertMacHosts,
     upsertWifiNetworks,
     upsertWirelessClients,
-    upsertDeviceLogs,
+    appendDeviceLogs,
+    getDeviceLogs,
+    pruneDeviceLogs,
     appendMetricsHistory,
     appendInterfaceHistory,
     appendLteHistory,

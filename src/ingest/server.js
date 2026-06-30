@@ -313,6 +313,13 @@ function createServer({ store, config: cfg }) {
         ctx.params = { serial: decodeURIComponent(mHist[1]) };
         return handlers.deviceHistory(ctx);
       }
+      // GET /devices/:serial/logs?q=&topic=&limit= — filtered 30-day log history.
+      const mLogs = /^\/devices\/([^/]+)\/logs$/.exec(pathname);
+      if (method === 'GET' && mLogs) {
+        if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { serial: decodeURIComponent(mLogs[1]) };
+        return handlers.deviceLogs(ctx);
+      }
 
       // GET|POST /devices/:serial/config-jobs (admin) — list / author review-gated config-push
       // jobs. Matched before the bare /devices/:serial route (defence in depth; the bare regex

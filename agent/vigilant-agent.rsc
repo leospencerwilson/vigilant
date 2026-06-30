@@ -637,30 +637,33 @@
     [$vigilantPost $body "telemetry-wifi-clients" $vigilantCC]
 }
 
-# ── 7) Recent device logs (slow tick) — newest ~25 lines, MINUS the agent's own /tool fetch
-# chatter ("Download from <host> ... FINISHED") which otherwise floods /log every tick. We must
-# scan the WHOLE buffer (the last lines are almost all fetch noise) and keep the last 25 real
-# entries. Server replaces the device's log snapshot each POST, so the device view shows live
-# router events. Only sent when there's at least one real line (never wipes with an empty set).
+# ── 7) Recent device logs (slow tick) — MINUS the agent's own /tool fetch chatter ("Download
+# from <host> … FINISHED"). Uses ONE `/log print as-value` call (NOT per-entry /log get, which
+# hangs on a noise-flooded buffer) and only examines the most recent ~200 entries, keeping the
+# last ~40 real lines. Server appends to the 30-day history (PK dedups overlap). Fully wrapped
+# so a log-read quirk on any ROS version can never break the telemetry tick.
 :if ($doSlow) do={
     :local logArr [:toarray ""]
-    :local logIds [/log find]
-    :local lt [:len $logIds]
-    :local k 0
-    :while ($k < $lt) do={
-        :local lid ($logIds->$k)
-        :local msg ""; :do { :set msg [:tostr [/log get $lid message]] } on-error={}
-        :if ([:typeof [:find $msg "Download from"]] = "nothing") do={
-            :local tpc ""; :do { :set tpc [:tostr [/log get $lid topics]] } on-error={}
-            :local tim ""; :do { :set tim [:tostr [/log get $lid time]] } on-error={}
-            :set ($logArr->[:len $logArr]) ("{\"time\":\"" . [$vigilantClean $tim] . "\",\"topics\":\"" . [$vigilantClean $tpc] . "\",\"message\":\"" . [$vigilantClean $msg] . "\"}")
+    :do {
+        :local le [/log print as-value]
+        :local lt [:len $le]
+        :local lk 0
+        :if ($lt > 200) do={ :set lk ($lt - 200) }
+        :while ($lk < $lt) do={
+            :local rec ($le->$lk)
+            :local msg [:tostr ($rec->"message")]
+            :if ([:typeof [:find $msg "Download from"]] = "nothing") do={
+                :local tpc [:tostr ($rec->"topics")]
+                :local tim [:tostr ($rec->"time")]
+                :set ($logArr->[:len $logArr]) ("{\"time\":\"" . [$vigilantClean $tim] . "\",\"topics\":\"" . [$vigilantClean $tpc] . "\",\"message\":\"" . [$vigilantClean $msg] . "\"}")
+            }
+            :set lk ($lk + 1)
         }
-        :set k ($k + 1)
-    }
+    } on-error={}
     :local lc [:len $logArr]
     :if ($lc > 0) do={
         :local lstart 0
-        :if ($lc > 25) do={ :set lstart ($lc - 25) }
+        :if ($lc > 40) do={ :set lstart ($lc - 40) }
         :local body ("{\"serial\":\"" . $serial . "\",\"partial\":true,\"logs\":[")
         :local j $lstart
         :local sep ""

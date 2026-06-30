@@ -298,6 +298,19 @@ ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS neighbor_platform    text;
 -- Recent device log lines (agent-collected, fetch-noise stripped) for the device view.
 ALTER TABLE device_state ADD COLUMN IF NOT EXISTS recent_logs jsonb;
 
+-- Per-device log HISTORY (agent-collected, fetch-noise stripped). 30-day retention (worker
+-- prune). The agent re-sends its recent window each slow tick, so the PK dedups overlap;
+-- genuinely new lines accumulate. log_time defaults '' so it can sit in the PK.
+CREATE TABLE IF NOT EXISTS device_logs (
+    device_id  uuid        NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    seen_at    timestamptz NOT NULL DEFAULT now(),
+    log_time   text        NOT NULL DEFAULT '',
+    topics     text,
+    message    text        NOT NULL,
+    PRIMARY KEY (device_id, log_time, message)
+);
+CREATE INDEX IF NOT EXISTS device_logs_device_seen_idx ON device_logs (device_id, seen_at DESC);
+
 CREATE TABLE IF NOT EXISTS alerts (
     id          bigserial   PRIMARY KEY,
     device_id   uuid        NOT NULL REFERENCES devices(id) ON DELETE CASCADE,

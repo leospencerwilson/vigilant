@@ -348,9 +348,9 @@ async function telemetryIngest(ctx) {
   if (payload.wifi_clients != null && typeof store.upsertWirelessClients === 'function') {
     await store.upsertWirelessClients(device.id, payload.wifi_clients);
   }
-  // Recent device log lines (agent already strips its own fetch noise). Full-snapshot replace.
-  if (payload.logs != null && typeof store.upsertDeviceLogs === 'function') {
-    await store.upsertDeviceLogs(device.id, payload.logs);
+  // Device log lines (agent already strips its own fetch noise). Append to 30-day history.
+  if (payload.logs != null && typeof store.appendDeviceLogs === 'function') {
+    await store.appendDeviceLogs(device.id, payload.logs);
   }
 
   // Metrics history is a snapshot of the system block — only meaningful for a CORE chunk.
@@ -705,6 +705,17 @@ async function deviceDetail(ctx) {
   const detail = await store.getDeviceDetail(params.serial);
   if (!detail) return json(res, 404, { ok: false, error: 'not found' });
   return json(res, 200, detail);
+}
+// GET /devices/:serial/logs?q=&topic=&limit= — filtered 30-day log history for the device view.
+async function deviceLogs(ctx) {
+  const { res, store, params, query } = ctx;
+  const dev = await store.getDeviceBySerial(params.serial);
+  if (!dev) return json(res, 404, { ok: false, error: 'not found' });
+  const g = k => (query && typeof query.get === 'function' ? query.get(k) : undefined);
+  const logs = typeof store.getDeviceLogs === 'function'
+    ? await store.getDeviceLogs(dev.id, { q: g('q'), topic: g('topic'), limit: g('limit') })
+    : [];
+  return json(res, 200, { ok: true, serial: params.serial, logs: logs || [] });
 }
 
 // ── GET /devices/:serial/history?window=1h (admin) ───────────────────

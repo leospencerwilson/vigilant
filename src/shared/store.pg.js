@@ -500,10 +500,42 @@ function makePgStore(poolOrConfig) {
     });
   }
 
-  // Recent device log lines — full-snapshot replace of the device_state.recent_logs column.
-  async function upsertDeviceLogs(deviceId, logs) {
+  // Append device log lines to the 30-day history. PK (device_id, log_time, message) dedups
+  // the agent's overlapping re-sends — only genuinely new lines land.
+  async function appendDeviceLogs(deviceId, logs) {
     const arr = Array.isArray(logs) ? logs.slice(0, 100) : [];
-    await q(`UPDATE device_state SET recent_logs = $2::jsonb WHERE device_id = $1`, [deviceId, JSON.stringify(arr)]);
+    for (const l of arr) {
+      const msg = l && l.message != null ? String(l.message) : '';
+      if (!msg) continue;
+      await q(
+        `INSERT INTO device_logs (device_id, log_time, topics, message)
+         VALUES ($1,$2,$3,$4) ON CONFLICT (device_id, log_time, message) DO NOTHING`,
+        [deviceId, l.time != null ? String(l.time) : '', l.topics != null ? String(l.topics) : null, msg]
+      );
+    }
+  }
+  // Filtered log read (last 30 days). q = free text in message/topics; topic = topics filter.
+  async function getDeviceLogs(deviceId, opts) {
+    const o = opts || {};
+    const limit = Math.min(Math.max(parseInt(o.limit, 10) || 300, 1), 2000);
+    const qtext = o.q != null && String(o.q).trim() !== '' ? String(o.q).trim() : null;
+    const topic = o.topic != null && String(o.topic).trim() !== '' ? String(o.topic).trim() : null;
+    return rows(
+      `SELECT seen_at, log_time, topics, message
+         FROM device_logs
+        WHERE device_id = $1
+          AND seen_at > now() - interval '30 days'
+          AND ($2::text IS NULL OR message ILIKE '%'||$2||'%' OR topics ILIKE '%'||$2||'%')
+          AND ($3::text IS NULL OR topics ILIKE '%'||$3||'%')
+        ORDER BY seen_at DESC, log_time DESC
+        LIMIT $4`,
+      [deviceId, qtext, topic, limit]
+    );
+  }
+  // Retention: drop log lines older than 30 days (called from the worker prune pass).
+  async function pruneDeviceLogs() {
+    const r = await q(`DELETE FROM device_logs WHERE seen_at < now() - interval '30 days'`, []);
+    return { pruned: r.rowCount || 0 };
   }
 
   // ── history appends ──────────────────────────────────────────────────────
@@ -1315,7 +1347,9 @@ function makePgStore(poolOrConfig) {
     upsertMacHosts,
     upsertWifiNetworks,
     upsertWirelessClients,
-    upsertDeviceLogs,
+    appendDeviceLogs,
+    getDeviceLogs,
+    pruneDeviceLogs,
     appendMetricsHistory,
     appendInterfaceHistory,
     appendLteHistory,

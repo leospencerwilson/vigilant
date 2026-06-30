@@ -171,6 +171,8 @@ async function runOnce({ store, config, now }) {
   // 4. discovery-table prune (neighbors + L2 mac hosts share the neighbor TTL)
   await store.pruneNeighbors(at, cfg.neighborTtlS);
   await store.pruneMacHosts(at, cfg.neighborTtlS);
+  // 4b. device log history — 30-day retention
+  if (typeof store.pruneDeviceLogs === 'function') await store.pruneDeviceLogs();
 
   // 5. optional nightly config snapshots
   if (cfg.enableNightlySnapshot) {
