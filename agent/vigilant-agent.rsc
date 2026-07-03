@@ -31,6 +31,33 @@
 :if ($vigilantTlsCheck = "yes-without-crl") do={ :set vigilantCC "yes-without-crl" }
 :if ($vigilantTlsCheck = "yes") do={ :set vigilantCC "yes" }
 
+# ── RE-ENTRANCY GUARD — prevents /tool fetch "maximum connection count reached" ──
+# The scheduler fires this script every 1s and RouterOS does NOT serialise scheduled
+# runs: if a tick overruns 1s (slow/lossy WAN, big LAN), the next scheduled copy starts
+# WHILE the previous is still POSTing. Overlapping runs stack open fetch connections
+# until RouterOS refuses new ones ("maximum connection count reached"). Guard: if a run
+# is already in flight, skip this tick. vigilantBusyAt holds the uptime at which the
+# in-flight run started, so a run that DIED mid-tick (never cleared the flag) self-heals
+# once the stale window (20s) elapses and the next tick takes over. Cleared at EOF.
+:global vigilantBusy
+:global vigilantBusyAt
+:local nowUp [/system resource get uptime]
+:if ([:typeof $vigilantBusy] = "nothing") do={ :set vigilantBusy false }
+:if ($vigilantBusy = true) do={
+    :local stale true
+    :if ([:typeof $vigilantBusyAt] != "nothing") do={
+        :if (($nowUp - $vigilantBusyAt) <= 20s) do={ :set stale false }
+    }
+    :if (!$stale) do={
+        # A previous tick is still POSTing — do nothing this second. :error is the only
+        # way to abort a top-level scheduled script early.
+        :error "vigilant-agent: tick overlap — previous run in flight, skipping"
+    }
+    # stale=true → previous run crashed mid-tick; fall through and take the lock over.
+}
+:set vigilantBusy true
+:set vigilantBusyAt $nowUp
+
 # ── JSON free-text sanitiser ─────────────────────────────────────────
 # Vendor-supplied free text (identity, neighbour identity/platform, LTE operator,
 # interface comments) can contain characters that would BREAK the JSON document we
@@ -981,3 +1008,10 @@
         }
     } on-error={ :log warning "vigilant-agent: speedtest check failed" }
 }
+
+# ── Release the re-entrancy lock (see top of file) ──────────────────────────────
+# Tick completed normally → clear the busy flag so the next scheduled second runs.
+# If an uncaught error aborted the tick before reaching here, the flag stays set but
+# self-heals via the 20s stale window in the guard above — we never wedge permanently.
+:global vigilantBusy
+:set vigilantBusy false
