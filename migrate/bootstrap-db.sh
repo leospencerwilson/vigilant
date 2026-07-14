@@ -54,7 +54,7 @@ docker exec -e PGPASSWORD="$PGPW" vigilant-pg psql -q -U postgres -d postgres -f
 
 # --- export data from the WCN API (skip the two huge history tables) ---
 DATA=/tmp/vdata; mkdir -p "$DATA"
-TABLES="devices enrollment_tokens alert_rules agent_scripts config_jobs config_snapshots audit_log device_state interface_state lte_state lte_history neighbors mac_hosts wifi_networks wireless_clients speedtest_jobs device_logs"
+TABLES="devices enrollment_tokens alert_rules alerts agent_scripts config_jobs config_snapshots audit_log device_state interface_state lte_state lte_history neighbors mac_hosts wifi_networks wireless_clients speedtest_jobs device_logs"
 echo "Exporting tables from API..."
 for t in $TABLES; do
   curl -s -m 180 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
