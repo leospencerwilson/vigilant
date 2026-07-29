@@ -256,21 +256,81 @@ function makePgStore(poolOrConfig) {
     );
   }
 
+  // ── bulk write helpers ───────────────────────────────────────────────────
+  // The per-tick writes below used to issue ONE round-trip PER ROW inside a
+  // transaction (a router with ~19 interfaces and ~286 mac_hosts meant ~340
+  // sequential round-trips every tick, x365 devices). Postgres finished each
+  // tiny statement instantly and then sat in ClientRead waiting for the next
+  // one, so the cost was almost entirely round-trip latency. These helpers
+  // collapse each list into a single multi-row INSERT.
+  //
+  // `tuple(o)` renders the VALUES tuple for one row, numbering its bind params
+  // from 1-based offset `o` (so a tuple may contain SQL expressions such as
+  // COALESCE($n, now()), not just bare placeholders). Postgres caps a statement
+  // at 65535 bound params, so we chunk on that.
+  async function bulkInsert(client, head, tail, width, rowsParams, tuple) {
+    if (!rowsParams.length) return;
+    const maxRows = Math.max(1, Math.floor(65000 / width));
+    for (let i = 0; i < rowsParams.length; i += maxRows) {
+      const chunk = rowsParams.slice(i, i + maxRows);
+      const sql =
+        head +
+        ' VALUES ' +
+        chunk.map((_, r) => tuple(r * width + 1)).join(',') +
+        ' ' +
+        tail;
+      const params = [];
+      for (const p of chunk) params.push(...p);
+      await client.query(sql, params);
+    }
+  }
+
+  // A tuple of `n` plain placeholders, optionally followed by literal SQL
+  // (e.g. 'now()') that takes no bind param.
+  function placeholders(n, trailing) {
+    return (o) => {
+      const ph = [];
+      for (let c = 0; c < n; c++) ph.push('$' + (o + c));
+      if (trailing) ph.push(trailing);
+      return '(' + ph.join(',') + ')';
+    };
+  }
+
+  // Composite key for the dedupe maps below. U+0000 is used as the separator
+  // because it cannot appear in a RouterOS interface name, a MAC address or a
+  // log line, so distinct field pairs can never collide into one key.
+  function keyOf() {
+    return Array.prototype.join.call(arguments, '\u0000');
+  }
+  // Collapse rows that share an ON CONFLICT target — a multi-row INSERT ... ON
+  // CONFLICT DO UPDATE cannot touch the same row twice ("cannot affect row a
+  // second time"). Last one wins, matching the previous row-at-a-time behaviour
+  // where a later duplicate simply overwrote the earlier one.
+  function dedupeBy(list, keyFn) {
+    const byKey = new Map();
+    for (const r of list) byKey.set(keyFn(r), r);
+    return Array.from(byKey.values());
+  }
+
   // Each row already has rx_bps/tx_bps/role/is_wan computed by the ingest.
   async function upsertInterfaceStates(deviceId, rowsIn) {
     const list = Array.isArray(rowsIn) ? rowsIn : [];
     if (!list.length) return;
+    const uniq = dedupeBy(list, (r) => r && r.name);
+    const tuple = (o) =>
+      `($${o},$${o + 1},$${o + 2},$${o + 3},$${o + 4},$${o + 5},$${o + 6},$${o + 7},` +
+      `$${o + 8},$${o + 9},$${o + 10},$${o + 11},$${o + 12},COALESCE($${o + 13},false),` +
+      `$${o + 14},$${o + 15},$${o + 16},$${o + 17},$${o + 18},$${o + 19},$${o + 20},$${o + 21},` +
+      `$${o + 22},$${o + 23},$${o + 24},$${o + 25},$${o + 26},$${o + 27},COALESCE($${o + 28}, now()))`;
     await tx(async (client) => {
-      for (const r of list) {
-        await client.query(
-          `INSERT INTO interface_state
+      await bulkInsert(
+        client,
+        `INSERT INTO interface_state
              (device_id, name, type, comment, plugged, running, disabled, speed,
               full_duplex, last_link_up_at, last_link_down_at, link_downs, role, is_wan,
               bridge, poe_out_status, poe_out_power, mac, rx_bps, tx_bps, rx_byte, tx_byte,
-              rx_packet, tx_packet, rx_error, tx_error, rx_drop, tx_drop, sampled_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,false),
-                   $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,COALESCE($29, now()))
-           ON CONFLICT (device_id, name) DO UPDATE SET
+              rx_packet, tx_packet, rx_error, tx_error, rx_drop, tx_drop, sampled_at)`,
+        `ON CONFLICT (device_id, name) DO UPDATE SET
              type              = EXCLUDED.type,
              comment           = EXCLUDED.comment,
              plugged           = EXCLUDED.plugged,
@@ -298,39 +358,40 @@ function makePgStore(poolOrConfig) {
              rx_drop           = EXCLUDED.rx_drop,
              tx_drop           = EXCLUDED.tx_drop,
              sampled_at        = EXCLUDED.sampled_at`,
-          [
-            deviceId,
-            r.name,
-            nz(r.type),
-            nz(r.comment),
-            nb(r.plugged),
-            nb(r.running),
-            nb(r.disabled),
-            nz(r.speed),
-            nb(r.full_duplex),
-            r.last_link_up_at || null,
-            r.last_link_down_at || null,
-            nz(r.link_downs),
-            nz(r.role),
-            nb(r.is_wan),
-            nz(r.bridge),
-            nz(r.poe_out_status),
-            nz(r.poe_out_power),
-            nz(r.mac),
-            nz(r.rx_bps),
-            nz(r.tx_bps),
-            nz(r.rx_byte),
-            nz(r.tx_byte),
-            nz(r.rx_packet),
-            nz(r.tx_packet),
-            nz(r.rx_error),
-            nz(r.tx_error),
-            nz(r.rx_drop),
-            nz(r.tx_drop),
-            r.sampled_at || null,
-          ]
-        );
-      }
+        29,
+        uniq.map((r) => [
+          deviceId,
+          r.name,
+          nz(r.type),
+          nz(r.comment),
+          nb(r.plugged),
+          nb(r.running),
+          nb(r.disabled),
+          nz(r.speed),
+          nb(r.full_duplex),
+          r.last_link_up_at || null,
+          r.last_link_down_at || null,
+          nz(r.link_downs),
+          nz(r.role),
+          nb(r.is_wan),
+          nz(r.bridge),
+          nz(r.poe_out_status),
+          nz(r.poe_out_power),
+          nz(r.mac),
+          nz(r.rx_bps),
+          nz(r.tx_bps),
+          nz(r.rx_byte),
+          nz(r.tx_byte),
+          nz(r.rx_packet),
+          nz(r.tx_packet),
+          nz(r.rx_error),
+          nz(r.tx_error),
+          nz(r.rx_drop),
+          nz(r.tx_drop),
+          r.sampled_at || null,
+        ]),
+        tuple
+      );
     });
   }
 
@@ -394,32 +455,35 @@ function makePgStore(poolOrConfig) {
   async function upsertNeighbors(deviceId, rowsIn) {
     const list = Array.isArray(rowsIn) ? rowsIn : [];
     if (!list.length) return;
+    const uniq = dedupeBy(
+      list.filter((r) => r && r.interface && r.mac),
+      (r) => keyOf(r.interface, r.mac)
+    );
     await tx(async (client) => {
-      for (const r of list) {
-        if (!r || !r.interface || !r.mac) continue;
-        await client.query(
-          `INSERT INTO neighbors
-             (device_id, interface, mac, identity, address, platform, board, version, last_seen_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
-           ON CONFLICT (device_id, interface, mac) DO UPDATE SET
+      await bulkInsert(
+        client,
+        `INSERT INTO neighbors
+             (device_id, interface, mac, identity, address, platform, board, version, last_seen_at)`,
+        `ON CONFLICT (device_id, interface, mac) DO UPDATE SET
              identity     = EXCLUDED.identity,
              address      = EXCLUDED.address,
              platform     = EXCLUDED.platform,
              board        = COALESCE(EXCLUDED.board,   neighbors.board),
              version      = COALESCE(EXCLUDED.version, neighbors.version),
              last_seen_at = now()`,
-          [
-            deviceId,
-            r.interface,
-            r.mac,
-            nz(r.identity),
-            nz(r.address),
-            nz(r.platform),
-            nz(r.board),
-            nz(r.version),
-          ]
-        );
-      }
+        8,
+        uniq.map((r) => [
+          deviceId,
+          r.interface,
+          r.mac,
+          nz(r.identity),
+          nz(r.address),
+          nz(r.platform),
+          nz(r.board),
+          nz(r.version),
+        ]),
+        placeholders(8, 'now()')
+      );
     });
   }
 
@@ -427,21 +491,24 @@ function makePgStore(poolOrConfig) {
   async function upsertMacHosts(deviceId, rowsIn) {
     const list = Array.isArray(rowsIn) ? rowsIn : [];
     if (!list.length) return;
+    const uniq = dedupeBy(
+      list.filter((r) => r && r.interface && r.mac),
+      (r) => keyOf(r.interface, r.mac)
+    );
     await tx(async (client) => {
-      for (const r of list) {
-        if (!r || !r.interface || !r.mac) continue;
-        await client.query(
-          `INSERT INTO mac_hosts (device_id, interface, mac, ip, hostname, comment, vendor, last_seen_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7, now())
-           ON CONFLICT (device_id, interface, mac) DO UPDATE SET
+      await bulkInsert(
+        client,
+        `INSERT INTO mac_hosts (device_id, interface, mac, ip, hostname, comment, vendor, last_seen_at)`,
+        `ON CONFLICT (device_id, interface, mac) DO UPDATE SET
              ip           = EXCLUDED.ip,
              hostname     = COALESCE(EXCLUDED.hostname, mac_hosts.hostname),
              comment      = COALESCE(EXCLUDED.comment,  mac_hosts.comment),
              vendor       = COALESCE(EXCLUDED.vendor, mac_hosts.vendor),
              last_seen_at = now()`,
-          [deviceId, r.interface, r.mac, nz(r.ip), nz(r.hostname), nz(r.comment), nz(r.vendor)]
-        );
-      }
+        7,
+        uniq.map((r) => [deviceId, r.interface, r.mac, nz(r.ip), nz(r.hostname), nz(r.comment), nz(r.vendor)]),
+        placeholders(7, 'now()')
+      );
     });
   }
 
@@ -451,36 +518,39 @@ function makePgStore(poolOrConfig) {
     const list = Array.isArray(rowsIn) ? rowsIn : [];
     await tx(async (client) => {
       await client.query(`DELETE FROM wifi_networks WHERE device_id = $1`, [deviceId]);
-      for (const r of list) {
-        if (!r || !r.interface) continue;
-        await client.query(
-          `INSERT INTO wifi_networks
+      const uniq = dedupeBy(
+        list.filter((r) => r && r.interface),
+        (r) => r.interface
+      );
+      await bulkInsert(
+        client,
+        `INSERT INTO wifi_networks
              (device_id, interface, driver, band, ssid, passphrase, security,
-              channel, frequency_mhz, width_mhz, disabled, hidden, clients, last_seen_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, now())
-           ON CONFLICT (device_id, interface) DO UPDATE SET
+              channel, frequency_mhz, width_mhz, disabled, hidden, clients, last_seen_at)`,
+        `ON CONFLICT (device_id, interface) DO UPDATE SET
              driver=EXCLUDED.driver, band=EXCLUDED.band, ssid=EXCLUDED.ssid,
              passphrase=EXCLUDED.passphrase, security=EXCLUDED.security, channel=EXCLUDED.channel,
              frequency_mhz=EXCLUDED.frequency_mhz, width_mhz=EXCLUDED.width_mhz,
              disabled=EXCLUDED.disabled, hidden=EXCLUDED.hidden, clients=EXCLUDED.clients,
              last_seen_at=now()`,
-          [
-            deviceId,
-            r.interface,
-            nz(r.driver),
-            nz(r.band),
-            nz(r.ssid),
-            nz(r.passphrase),
-            nz(r.security),
-            nz(r.channel),
-            nz(r.frequency_mhz),
-            nz(r.width_mhz),
-            nb(r.disabled),
-            nb(r.hidden),
-            nz(r.clients),
-          ]
-        );
-      }
+        13,
+        uniq.map((r) => [
+          deviceId,
+          r.interface,
+          nz(r.driver),
+          nz(r.band),
+          nz(r.ssid),
+          nz(r.passphrase),
+          nz(r.security),
+          nz(r.channel),
+          nz(r.frequency_mhz),
+          nz(r.width_mhz),
+          nb(r.disabled),
+          nb(r.hidden),
+          nz(r.clients),
+        ]),
+        placeholders(13, 'now()')
+      );
     });
   }
 
@@ -490,18 +560,30 @@ function makePgStore(poolOrConfig) {
     const list = Array.isArray(rowsIn) ? rowsIn : [];
     await tx(async (client) => {
       await client.query(`DELETE FROM wireless_clients WHERE device_id = $1`, [deviceId]);
-      for (const r of list) {
-        if (!r || !r.interface || !r.mac) continue;
-        await client.query(
-          `INSERT INTO wireless_clients
-             (device_id, interface, mac, signal, tx_ccq, rx_rate, tx_rate, uptime_s, sampled_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
-           ON CONFLICT (device_id, interface, mac) DO UPDATE SET
+      const uniq = dedupeBy(
+        list.filter((r) => r && r.interface && r.mac),
+        (r) => keyOf(r.interface, r.mac)
+      );
+      await bulkInsert(
+        client,
+        `INSERT INTO wireless_clients
+             (device_id, interface, mac, signal, tx_ccq, rx_rate, tx_rate, uptime_s, sampled_at)`,
+        `ON CONFLICT (device_id, interface, mac) DO UPDATE SET
              signal=EXCLUDED.signal, tx_ccq=EXCLUDED.tx_ccq, rx_rate=EXCLUDED.rx_rate,
              tx_rate=EXCLUDED.tx_rate, uptime_s=EXCLUDED.uptime_s, sampled_at=now()`,
-          [deviceId, r.interface, r.mac, nz(r.signal), nz(r.tx_ccq), nz(r.rx_rate), nz(r.tx_rate), nz(r.uptime_s)]
-        );
-      }
+        8,
+        uniq.map((r) => [
+          deviceId,
+          r.interface,
+          r.mac,
+          nz(r.signal),
+          nz(r.tx_ccq),
+          nz(r.rx_rate),
+          nz(r.tx_rate),
+          nz(r.uptime_s),
+        ]),
+        placeholders(8, 'now()')
+      );
     });
   }
 
@@ -510,16 +592,29 @@ function makePgStore(poolOrConfig) {
   async function appendDeviceLogs(deviceId, logs) {
     const arr = Array.isArray(logs) ? logs.slice(0, 100) : [];
     if (!arr.length) return;
+    const params = [];
+    const seen = new Set();
+    for (const l of arr) {
+      const msg = l && l.message != null ? String(l.message) : '';
+      if (!msg) continue;
+      const logTime = l.time != null ? String(l.time) : '';
+      // Same dedupe the PK would do, but done here so one multi-row INSERT can
+      // carry the whole batch.
+      const key = keyOf(logTime, msg);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      params.push([deviceId, logTime, l.topics != null ? String(l.topics) : null, msg]);
+    }
+    if (!params.length) return;
     await tx(async (client) => {
-      for (const l of arr) {
-        const msg = l && l.message != null ? String(l.message) : '';
-        if (!msg) continue;
-        await client.query(
-          `INSERT INTO device_logs (device_id, log_time, topics, message)
-           VALUES ($1,$2,$3,$4) ON CONFLICT (device_id, log_time, message) DO NOTHING`,
-          [deviceId, l.time != null ? String(l.time) : '', l.topics != null ? String(l.topics) : null, msg]
-        );
-      }
+      await bulkInsert(
+        client,
+        `INSERT INTO device_logs (device_id, log_time, topics, message)`,
+        `ON CONFLICT (device_id, log_time, message) DO NOTHING`,
+        4,
+        params,
+        placeholders(4)
+      );
     });
   }
   // Filtered log read (last 30 days). q = free text in message/topics; topic = topics filter.
@@ -565,20 +660,25 @@ function makePgStore(poolOrConfig) {
   async function appendInterfaceHistory(deviceId, ts, rowsIn) {
     const list = Array.isArray(rowsIn) ? rowsIn : [];
     if (!list.length) return;
+    // ts is constant for the whole call, so the conflict key reduces to name.
+    const uniq = dedupeBy(
+      list.filter((r) => r && r.name),
+      (r) => r.name
+    );
+    if (!uniq.length) return;
     await tx(async (client) => {
-      for (const r of list) {
-        if (!r || !r.name) continue;
-        await client.query(
-          `INSERT INTO interface_history (device_id, name, ts, rx_bps, tx_bps, rx_error, tx_error)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)
-           ON CONFLICT (device_id, name, ts) DO UPDATE SET
+      await bulkInsert(
+        client,
+        `INSERT INTO interface_history (device_id, name, ts, rx_bps, tx_bps, rx_error, tx_error)`,
+        `ON CONFLICT (device_id, name, ts) DO UPDATE SET
              rx_bps   = EXCLUDED.rx_bps,
              tx_bps   = EXCLUDED.tx_bps,
              rx_error = EXCLUDED.rx_error,
              tx_error = EXCLUDED.tx_error`,
-          [deviceId, r.name, ts, nz(r.rx_bps), nz(r.tx_bps), nz(r.rx_error), nz(r.tx_error)]
-        );
-      }
+        7,
+        uniq.map((r) => [deviceId, r.name, ts, nz(r.rx_bps), nz(r.tx_bps), nz(r.rx_error), nz(r.tx_error)]),
+        placeholders(7)
+      );
     });
   }
 

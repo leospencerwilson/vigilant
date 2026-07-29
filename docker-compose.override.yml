@@ -1,0 +1,19 @@
+services:
+  ingest:
+    networks: [default, vigilant-net]
+    ports:
+      - "127.0.0.1:3000:3000"
+    # Run the ingest as a small cluster: Node is single-threaded and the ingest was
+    # pinned at ~107% (one core of six) while the box had spare capacity. The workers
+    # share the listening socket, so nothing else changes.
+    #   3 workers x PG_POOL_MAX 8 = 24 pg connections (server max_connections = 200),
+    #   and ~3 cores left for Postgres + the OS on this 6-vCPU VM.
+    command: ["node", "src/ingest/cluster.js"]
+    environment:
+      INGEST_WORKERS: "3"
+      PG_POOL_MAX: "8"
+  worker:
+    networks: [default, vigilant-net]
+networks:
+  vigilant-net:
+    external: true
