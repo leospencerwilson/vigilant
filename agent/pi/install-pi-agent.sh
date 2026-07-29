@@ -17,6 +17,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --url) URL="$2"; shift 2;;
     --token) TOKEN="$2"; shift 2;;
+    # Preferred over --token: an argument is visible in `ps` to every local user for as
+    # long as the install runs, and this is a bearer token that can post as the device.
+    --token-file) TOKEN="$(cat "$2")"; shift 2;;
     --serial) SERIAL="$2"; shift 2;;
     --printers) PRINTERS="$2"; shift 2;;
     --interval) INTERVAL="$2"; shift 2;;
@@ -89,7 +92,10 @@ Restart=always
 RestartSec=15
 # It only reads /proc, /sys and runs read-only queries.
 NoNewPrivileges=true
-ProtectSystem=strict
+# `full`, NOT `strict`: strict mounts / read-only inside the unit's namespace, which made
+# the agent's own "has the SD card flipped read-only?" check fire on every healthy Pi.
+# full still protects /usr and /boot while leaving / reported as it really is.
+ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/run

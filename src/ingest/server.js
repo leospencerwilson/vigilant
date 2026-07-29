@@ -331,6 +331,17 @@ function createServer({ store, config: cfg }) {
         return handlers.counterDelete(ctx);
       }
 
+      // ── Proxmox discovery (admin) ──────────────────────────────────────────
+      if (method === 'POST' && pathname === '/proxmox/report') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return handlers.proxmoxReport(ctx);
+      }
+      if (method === 'GET' && pathname === '/proxmox-vms') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.proxmoxList(ctx);
+      }
+
       // ── printers ───────────────────────────────────────────────────────────
       // Stats are collected by an agent on the pharmacy LAN (the counter Pi), because
       // nothing in the datacentre can reach a printer on a site network.

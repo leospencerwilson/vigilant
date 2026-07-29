@@ -1864,12 +1864,107 @@ function makePgStore(poolOrConfig) {
     return { printers: uniq.length };
   }
 
+  // ── discovered Proxmox VMs ─────────────────────────────────────────────────
+  // Pushed by a collector running ON a Proxmox node (Vigilant has no route to the
+  // management VLAN, and inverting the direction avoids opening one).
+
+  async function reportProxmoxVms(list) {
+    const arr = Array.isArray(list) ? list : [];
+    const uniq = dedupeBy(arr.filter((v) => v && Number.isFinite(Number(v.vmid))), (v) => Number(v.vmid));
+    if (!uniq.length) return { vms: 0 };
+    await tx(async (client) => {
+      await bulkInsert(
+        client,
+        `INSERT INTO proxmox_vms (vmid, node, name, status, vlan_tag, macs, cores, maxmem, maxdisk, uptime_s, template, seen_at)`,
+        `ON CONFLICT (vmid) DO UPDATE SET
+           node = EXCLUDED.node, name = EXCLUDED.name, status = EXCLUDED.status,
+           vlan_tag = EXCLUDED.vlan_tag, macs = EXCLUDED.macs, cores = EXCLUDED.cores,
+           maxmem = EXCLUDED.maxmem, maxdisk = EXCLUDED.maxdisk,
+           uptime_s = EXCLUDED.uptime_s, template = EXCLUDED.template, seen_at = now()`,
+        11,
+        uniq.map((v) => [
+          Number(v.vmid), nz(v.node), nz(v.name), nz(v.status),
+          v.vlan_tag == null ? null : Number(v.vlan_tag),
+          JSON.stringify(Array.isArray(v.macs) ? v.macs : []),
+          v.cores == null ? null : Number(v.cores),
+          v.maxmem == null ? null : Number(v.maxmem),
+          v.maxdisk == null ? null : Number(v.maxdisk),
+          v.uptime_s == null ? null : Number(v.uptime_s),
+          v.template === true,
+        ]),
+        placeholders(11, 'now()')
+      );
+    });
+    return { vms: uniq.length };
+  }
+
+  // Fill in what discovery can prove, and report what it cannot resolve.
+  //
+  // FILLS BLANKS ONLY. A vmid that disagrees with the discovered one is returned as a
+  // conflict, never overwritten: it usually means the VM was rebuilt under a new id, and
+  // silently repointing a pharmacy's records at a different VM is exactly the kind of
+  // "helpful" change that loses an afternoon.
+  async function reconcileProxmox() {
+    const vms = await rows(
+      `SELECT v.vmid, v.node, v.name, v.vlan_tag, p.id AS pharmacy_id, p.srv_vmid, p.proxmox_node
+         FROM proxmox_vms v
+         JOIN pharmacies p ON p.vlan = v.vlan_tag
+        WHERE v.vlan_tag IS NOT NULL AND NOT v.template`,
+      []
+    );
+    const out = { servers_linked: 0, counters_linked: 0, nodes_set: 0, conflicts: [] };
+
+    for (const v of vms) {
+      // The PMR server for the site.
+      if (/-srv$/i.test(v.name || '')) {
+        if (v.srv_vmid == null) {
+          await q(`UPDATE pharmacies SET srv_vmid = $2 WHERE id = $1 AND srv_vmid IS NULL`, [v.pharmacy_id, v.vmid]);
+          out.servers_linked += 1;
+        } else if (v.srv_vmid !== v.vmid) {
+          out.conflicts.push({ kind: 'pharmacy_srv_vmid', pharmacy_id: v.pharmacy_id, recorded: v.srv_vmid, discovered: v.vmid, name: v.name });
+        }
+        if (v.proxmox_node == null && v.node) {
+          await q(`UPDATE pharmacies SET proxmox_node = $2 WHERE id = $1 AND proxmox_node IS NULL`, [v.pharmacy_id, v.node]);
+          out.nodes_set += 1;
+        }
+        continue;
+      }
+
+      // A counter's desktop VM: pmr-<code>-cl<NN> where NN is the counter number.
+      const m = /-cl0*(\d+)$/i.exec(v.name || '');
+      if (!m) continue;
+      const n = Number(m[1]);
+      const counter = await one(`SELECT id, vmid FROM counters WHERE pharmacy_id = $1 AND n = $2`, [v.pharmacy_id, n]);
+      if (!counter) {
+        // A desktop VM exists for a counter nobody has recorded — worth knowing, since it
+        // means the registry is behind reality rather than ahead of it.
+        out.conflicts.push({ kind: 'counter_missing', pharmacy_id: v.pharmacy_id, counter_n: n, discovered: v.vmid, name: v.name });
+        continue;
+      }
+      if (counter.vmid == null) {
+        await q(`UPDATE counters SET vmid = $2, vm_hostname = COALESCE(vm_hostname, $3) WHERE id = $1`,
+          [counter.id, v.vmid, v.name]);
+        out.counters_linked += 1;
+      } else if (counter.vmid !== v.vmid) {
+        out.conflicts.push({ kind: 'counter_vmid', counter_id: counter.id, counter_n: n, recorded: counter.vmid, discovered: v.vmid, name: v.name });
+      }
+    }
+    return out;
+  }
+
+  async function listProxmoxVms() {
+    return rows(`SELECT * FROM proxmox_vms_v ORDER BY vlan_tag NULLS LAST, vmid`, []);
+  }
+
   // Expose the pool so callers (bin/migrate, graceful shutdown) can end() it.
   async function end() {
     await pool.end();
   }
 
   return {
+    reportProxmoxVms,
+    reconcileProxmox,
+    listProxmoxVms,
     listPrinters,
     upsertPrinter,
     deletePrinter,

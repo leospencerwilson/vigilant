@@ -444,7 +444,28 @@ SELECT c.id, c.pharmacy_id,
        w.latest_handshake AS pi_last_handshake,
        w.rx_bytes AS pi_rx_bytes, w.tx_bytes AS pi_tx_bytes,
        (w.latest_handshake IS NOT NULL
-        AND w.latest_handshake > now() - interval '3 minutes') AS pi_tunnel_up
+        AND w.latest_handshake > now() - interval '3 minutes') AS pi_tunnel_up,
+       -- ── appended, and it must stay appended ──────────────────────────────
+       -- CREATE OR REPLACE VIEW can only ADD columns at the END. Inserting one mid-list
+       -- fails with "cannot change name of view column", so new columns go here even
+       -- when they would read better next to related ones.
+       --
+       -- Which PMR system this counter works against and where it lives in Proxmox: the
+       -- desktop VM is only a shell that RDPs into the PMR server, so the server is the
+       -- meaningful target.
+       p.pmr_system,
+       p.server_ip AS pmr_server_ip,
+       p.srv_vmid  AS pmr_srv_vmid,
+       -- What the Pi's kiosk is ACTUALLY connected to, read from the running FreeRDP
+       -- process. Compared against pmr_server_ip: a Pi pointed at another pharmacy's PMR
+       -- server is a serious misconfiguration nothing else in the stack would notice.
+       ds.raw -> 'rdp' ->> 'target' AS pi_rdp_target,
+       -- The Pi's real address on the site LAN, as opposed to its tunnel /32.
+       ds.raw ->> 'primary_ip' AS pi_lan_ip,
+       -- Peripherals the agent actually found, kept separate from the operator's
+       -- `peripherals` column so a detection gap never silently overwrites a human's
+       -- assessment (and vice versa).
+       ds.raw -> 'peripherals' AS pi_peripherals_detected
   FROM counters c
   JOIN pharmacies p   ON p.id = c.pharmacy_id
   LEFT JOIN devices d ON d.id = c.pi_device_id
@@ -532,6 +553,62 @@ SELECT pr.*,
   FROM printers pr
   JOIN pharmacies ph ON ph.id = pr.pharmacy_id
   LEFT JOIN counters c ON c.id = pr.counter_id;
+
+-- ── discovered Proxmox VMs ───────────────────────────────────────────────────
+-- Observed cluster inventory, so a pharmacy's VMIDs and hostnames stop being hand-typed.
+--
+-- Collected BY A PROXMOX NODE and pushed here, not pulled: Vigilant sits on the DMZ VLAN
+-- and has no route to the Proxmox API on the management VLAN. Inverting the direction
+-- keeps it that way — no DMZ-to-management hole, and no API token, because a collector
+-- running on a node uses `pvesh` locally as root.
+--
+-- Matching is mechanical rather than configured: a VM's VLAN tag IS the pharmacy
+-- (tag = 100 + index), and the naming convention identifies its role
+-- (pmr-<code>-srv = PMR server, pmr-<code>-cl<NN> = counter NN's desktop).
+--
+-- Kept separate from `pharmacies`/`counters` for the same reason as wg_peers: discovery
+-- fills gaps and reports disagreement, but never silently overwrites what an operator set.
+CREATE TABLE IF NOT EXISTS proxmox_vms (
+    vmid        int         PRIMARY KEY,
+    node        text,
+    name        text,
+    status      text,
+    vlan_tag    int,                                -- from netN tag=, the pharmacy key
+    macs        jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    cores       int,
+    maxmem      bigint,
+    maxdisk     bigint,
+    uptime_s    bigint,
+    template    boolean     NOT NULL DEFAULT false,
+    seen_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS proxmox_vms_vlan_idx ON proxmox_vms (vlan_tag);
+
+-- Discovered VMs joined to whatever they were matched to, plus the disagreements. A VM
+-- whose vmid differs from the one recorded on the counter is surfaced rather than
+-- corrected: it usually means the VM was rebuilt, and a human should decide.
+CREATE OR REPLACE VIEW proxmox_vms_v AS
+SELECT v.*,
+       p.code AS pharmacy_code,
+       c.id   AS counter_id,
+       c.n    AS counter_n,
+       CASE
+         WHEN p.id IS NULL THEN 'unmatched'
+         WHEN v.name ~ '-srv$' AND p.srv_vmid IS NULL THEN 'fillable'
+         WHEN v.name ~ '-srv$' AND p.srv_vmid <> v.vmid THEN 'conflict'
+         WHEN c.id IS NOT NULL AND c.vmid IS NULL THEN 'fillable'
+         WHEN c.id IS NOT NULL AND c.vmid <> v.vmid THEN 'conflict'
+         WHEN c.id IS NOT NULL OR p.srv_vmid = v.vmid THEN 'linked'
+         ELSE 'unmatched'
+       END AS match_state,
+       (v.seen_at < now() - interval '30 minutes') AS stale
+  FROM proxmox_vms v
+  LEFT JOIN pharmacies p ON p.vlan = v.vlan_tag
+  -- substring() with a capture group yields NULL when the pattern does not match, so the
+  -- cast is safe. regexp_replace returns the ORIGINAL string on no-match, and casting
+  -- 'pmr-desktop-gateway' to int aborts the entire view.
+  LEFT JOIN counters  c ON c.pharmacy_id = p.id
+                       AND c.n = (substring(v.name from '-cl0*([0-9]+)$'))::int;
 
 -- Recent device log lines (agent-collected, fetch-noise stripped) for the device view.
 ALTER TABLE device_state ADD COLUMN IF NOT EXISTS recent_logs jsonb;

@@ -1367,6 +1367,32 @@ async function wgPeersList(ctx) {
   return json(res, 200, { ok: true, peers: await store.listWgPeers() });
 }
 
+// ── Proxmox discovery ───────────────────────────────────────────────────────
+// A collector on a Proxmox node pushes the cluster's VM inventory here. Vigilant cannot
+// pull it: it sits on the DMZ VLAN with no route to the management VLAN, and inverting the
+// direction avoids having to open one.
+async function proxmoxReport(ctx) {
+  const { res, store, body, log } = ctx;
+  if (typeof store.reportProxmoxVms !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const p = parseJsonBody(body);
+  if (!p) return json(res, 400, { ok: false, error: 'bad json' });
+  if (!Array.isArray(p.vms)) return json(res, 400, { ok: false, error: 'vms must be an array' });
+  const stored = await store.reportProxmoxVms(p.vms);
+  // Reconcile immediately so a freshly-provisioned pharmacy is linked up on the first
+  // report rather than after some later pass.
+  const linked = await store.reconcileProxmox();
+  if (linked.conflicts.length) {
+    log.warn('proxmox: discovery conflicts', { count: linked.conflicts.length });
+  }
+  return json(res, 200, { ok: true, ...stored, ...linked });
+}
+
+async function proxmoxList(ctx) {
+  const { res, store } = ctx;
+  if (typeof store.listProxmoxVms !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  return json(res, 200, { ok: true, vms: await store.listProxmoxVms() });
+}
+
 // PATCH /devices/:serial  { customer?, site_name?, identity?, model?, wan_type? }
 // Operator-editable metadata. Its main job is letting the field app write across the
 // audited MikroTik→company link, since Vigilant cannot see that database — and a populated
@@ -1517,6 +1543,8 @@ module.exports = {
   printerUpsert,
   printerDelete,
   printersReport,
+  proxmoxReport,
+  proxmoxList,
   tagRulesList,
   tagRulePreview,
   tagRuleCreate,
