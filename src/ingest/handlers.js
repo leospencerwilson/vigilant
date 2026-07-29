@@ -190,6 +190,23 @@ async function telemetryIngest(ctx) {
     return json(res, 409, { ok: false, error: 'serial mismatch' });
   }
 
+  // Keep devices.identity fresh from telemetry. The agent reports /system identity on every
+  // tick but nothing ever persisted it, so the column was empty fleet-wide (0/363) and
+  // useless for grouping or smart tags.
+  //
+  // Write ONLY when the value actually changes: the fleet posts several hundred times a
+  // second, so an unconditional UPDATE here would add a write per tick per device — the
+  // exact kind of per-tick cost that had this service saturated. Identity changes ~never.
+  const reportedIdentity = typeof payload.identity === 'string' ? payload.identity.trim() : '';
+  if (reportedIdentity && reportedIdentity !== (device.identity || '') && typeof store.setDeviceIdentity === 'function') {
+    try {
+      await store.setDeviceIdentity(device.id, reportedIdentity);
+    } catch (err) {
+      // Never fail an ingest over a metadata refresh.
+      log.warn('telemetry: identity refresh failed', { device: device.id, msg: err && err.message });
+    }
+  }
+
   // Sample time: prefer the agent-reported tick time (payload.ts, epoch ms) so the bps
   // delta is computed over the device's own inter-tick interval rather than HTTP
   // round-trip latency; fall back to receive time when the agent omits it.
@@ -1093,11 +1110,180 @@ async function adminMigrate(ctx) {
   }
 }
 
+// ── tags & smart tags ───────────────────────────────────────────────────────
+// Tags are what alert_rules.scope_tag and config_jobs.target_tag select on, so these
+// routes are what makes tag-scoped alerting usable at all.
+
+function parseJsonBody(body) {
+  if (body == null || body === '') return {};
+  if (typeof body === 'object') return body;
+  try { return JSON.parse(body); } catch (_) { return null; }
+}
+
+// GET /tags — every tag in use, device counts, and whether a rule owns it.
+async function tagsList(ctx) {
+  const { res, store } = ctx;
+  if (typeof store.listTags !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  return json(res, 200, { ok: true, tags: await store.listTags() });
+}
+
+// PATCH /devices/:serial/tags  { tags: [...] } — replaces the device's MANUAL tags.
+// Rule-owned tags are preserved by the store; sending one is ignored rather than
+// reverted a tick later by the worker.
+async function deviceTagsSet(ctx) {
+  const { res, store, body, params } = ctx;
+  if (typeof store.setDeviceTags !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const parsed = parseJsonBody(body);
+  if (!parsed) return json(res, 400, { ok: false, error: 'bad json' });
+  if (!Array.isArray(parsed.tags)) return json(res, 400, { ok: false, error: 'tags must be an array' });
+  if (parsed.tags.length > 50) return json(res, 400, { ok: false, error: 'too many tags (max 50)' });
+  const bad = parsed.tags.find((t) => String(t == null ? '' : t).length > 64);
+  if (bad !== undefined) return json(res, 400, { ok: false, error: 'tag too long (max 64 chars)' });
+  const updated = await store.setDeviceTags(params.serial, parsed.tags);
+  if (!updated) return json(res, 404, { ok: false, error: 'device not found' });
+  return json(res, 200, { ok: true, device: updated });
+}
+
+// PATCH /devices/:serial  { customer?, site_name?, identity?, model?, wan_type? }
+// Operator-editable metadata. Its main job is letting the field app write across the
+// audited MikroTik→company link, since Vigilant cannot see that database — and a populated
+// `customer` is what makes customer-scoped tag rules possible.
+const WAN_TYPES = ['pppoe', 'sim', 'dhcp', 'static', 'unknown'];
+async function deviceMetaSet(ctx) {
+  const { res, store, body, params } = ctx;
+  if (typeof store.updateDeviceMeta !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const parsed = parseJsonBody(body);
+  if (!parsed) return json(res, 400, { ok: false, error: 'bad json' });
+  const allowed = ['customer', 'site_name', 'identity', 'model', 'wan_type'];
+  const patch = {};
+  for (const k of allowed) if (parsed[k] !== undefined && parsed[k] !== null) patch[k] = String(parsed[k]).trim();
+  if (!Object.keys(patch).length) return json(res, 400, { ok: false, error: `nothing to update (allowed: ${allowed.join(', ')})` });
+  for (const [k, v] of Object.entries(patch)) {
+    if (v.length > 200) return json(res, 400, { ok: false, error: `${k} too long (max 200 chars)` });
+  }
+  // wan_type is CHECK-constrained in the schema; reject it here for a clean 400 rather
+  // than letting the constraint raise a 500.
+  if (patch.wan_type && !WAN_TYPES.includes(patch.wan_type)) {
+    return json(res, 400, { ok: false, error: `wan_type must be one of ${WAN_TYPES.join(', ')}` });
+  }
+  const updated = await store.updateDeviceMeta(params.serial, patch);
+  if (!updated) return json(res, 404, { ok: false, error: 'device not found' });
+  return json(res, 200, { ok: true, device: updated });
+}
+
+function validateTagRule(r, { partial } = {}) {
+  if (!partial || r.tag !== undefined) {
+    const tag = String(r.tag == null ? '' : r.tag).trim();
+    if (!tag) return 'tag is required';
+    if (tag.length > 64) return 'tag too long (max 64 chars)';
+    // Keep tags shell/URL-friendly: they end up in scope_tag, target_tag and query strings.
+    if (!/^[a-z0-9][a-z0-9._-]*$/i.test(tag)) return 'tag may contain letters, digits, dot, dash and underscore only';
+  }
+  if (!partial || r.name !== undefined) {
+    if (!String(r.name == null ? '' : r.name).trim()) return 'name is required';
+  }
+  if (r.conditions !== undefined) {
+    const c = r.conditions;
+    if (!c || typeof c !== 'object' || !Array.isArray(c.all)) return 'conditions must be {"all":[…]}';
+    if (c.all.length > 20) return 'too many conditions (max 20)';
+  }
+  return null;
+}
+
+async function tagRulesList(ctx) {
+  const { res, store } = ctx;
+  if (typeof store.listTagRules !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  return json(res, 200, { ok: true, rules: await store.listTagRules() });
+}
+
+// POST /tag-rules/preview { conditions } — blast radius BEFORE saving.
+async function tagRulePreview(ctx) {
+  const { res, store, body } = ctx;
+  if (typeof store.previewTagRule !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const parsed = parseJsonBody(body);
+  if (!parsed) return json(res, 400, { ok: false, error: 'bad json' });
+  try {
+    return json(res, 200, { ok: true, ...(await store.previewTagRule(parsed.conditions)) });
+  } catch (e) {
+    // The compiler raises 400s for unknown fields/operators — surface them as such.
+    return json(res, e && e.status === 400 ? 400 : 500, { ok: false, error: e.message });
+  }
+}
+
+async function tagRuleCreate(ctx) {
+  const { res, store, body } = ctx;
+  if (typeof store.createTagRule !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const parsed = parseJsonBody(body);
+  if (!parsed) return json(res, 400, { ok: false, error: 'bad json' });
+  const err = validateTagRule(parsed);
+  if (err) return json(res, 400, { ok: false, error: err });
+  // Reject conditions that don't compile, so a rule can never be saved in a state the
+  // worker will just log an error about every tick.
+  try { await store.previewTagRule(parsed.conditions || { all: [] }); }
+  catch (e) { return json(res, 400, { ok: false, error: e.message }); }
+  try {
+    const created = await store.createTagRule(parsed);
+    return json(res, 201, { ok: true, rule: created });
+  } catch (e) {
+    // tag is UNIQUE — one rule owns one tag.
+    if (e && e.code === '23505') return json(res, 409, { ok: false, error: 'a rule already owns that tag' });
+    throw e;
+  }
+}
+
+async function tagRuleUpdate(ctx) {
+  const { res, store, body, params } = ctx;
+  if (typeof store.updateTagRule !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const parsed = parseJsonBody(body);
+  if (!parsed) return json(res, 400, { ok: false, error: 'bad json' });
+  const err = validateTagRule(parsed, { partial: true });
+  if (err) return json(res, 400, { ok: false, error: err });
+  if (parsed.conditions !== undefined) {
+    try { await store.previewTagRule(parsed.conditions); }
+    catch (e) { return json(res, 400, { ok: false, error: e.message }); }
+  }
+  try {
+    const updated = await store.updateTagRule(params.id, parsed);
+    if (!updated) return json(res, 404, { ok: false, error: 'not found' });
+    return json(res, 200, { ok: true, rule: updated });
+  } catch (e) {
+    if (e && e.code === '23505') return json(res, 409, { ok: false, error: 'a rule already owns that tag' });
+    throw e;
+  }
+}
+
+// Deleting a rule also strips its tag from every device (store does this), so nothing is
+// left looking like a manual tag that nobody set.
+async function tagRuleDelete(ctx) {
+  const { res, store, params } = ctx;
+  if (typeof store.deleteTagRule !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const r = await store.deleteTagRule(params.id);
+  if (!r || !r.deleted) return json(res, 404, { ok: false, error: 'not found' });
+  return json(res, 200, { ok: true, ...r });
+}
+
+// POST /tag-rules/sync — apply rules now instead of waiting for the worker's next pass,
+// so the UI can show the result immediately after a rule is saved.
+async function tagRulesSync(ctx) {
+  const { res, store } = ctx;
+  if (typeof store.syncSmartTags !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  return json(res, 200, { ok: true, ...(await store.syncSmartTags()) });
+}
+
 module.exports = {
   healthz,
   adminUi,
   adminMigrate,
   realtimeConfig,
+  tagsList,
+  deviceTagsSet,
+  deviceMetaSet,
+  tagRulesList,
+  tagRulePreview,
+  tagRuleCreate,
+  tagRuleUpdate,
+  tagRuleDelete,
+  tagRulesSync,
   alertRulesList,
   alertHistory,
   alertRuleCreate,

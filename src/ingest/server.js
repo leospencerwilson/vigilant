@@ -271,6 +271,63 @@ function createServer({ store, config: cfg }) {
       }
 
       // ── alert-rule CRUD (admin) — backs the Rules UI ──
+      // ── tags & smart tags (admin) ──────────────────────────────────────────
+      // Tags are the grouping primitive alert_rules.scope_tag and
+      // config_jobs.target_tag select on, so these make tag-scoped alerting usable.
+      if (method === 'GET' && pathname === '/tags') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.tagsList(ctx);
+      }
+      if (method === 'GET' && pathname === '/tag-rules') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.tagRulesList(ctx);
+      }
+      // Preview before create/update, so the UI can show the blast radius first.
+      if (method === 'POST' && pathname === '/tag-rules/preview') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return handlers.tagRulePreview(ctx);
+      }
+      // Apply rules now rather than waiting for the worker's next pass.
+      if (method === 'POST' && pathname === '/tag-rules/sync') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.tagRulesSync(ctx);
+      }
+      if (method === 'POST' && pathname === '/tag-rules') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return handlers.tagRuleCreate(ctx);
+      }
+      const mTagRule = /^\/tag-rules\/([^/]+)$/.exec(pathname);
+      if (mTagRule && (method === 'PUT' || method === 'PATCH')) {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mTagRule[1]) };
+        ctx.body = await readBody(req);
+        return handlers.tagRuleUpdate(ctx);
+      }
+      if (mTagRule && method === 'DELETE') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mTagRule[1]) };
+        return handlers.tagRuleDelete(ctx);
+      }
+      // PATCH /devices/:serial/tags — set a device's manual tags.
+      const mDevTags = /^\/devices\/([^/]+)\/tags$/.exec(pathname);
+      if (mDevTags && (method === 'PUT' || method === 'PATCH')) {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { serial: decodeURIComponent(mDevTags[1]) };
+        ctx.body = await readBody(req);
+        return handlers.deviceTagsSet(ctx);
+      }
+      // PATCH /devices/:serial — operator-editable metadata (customer, site_name, …).
+      // Registered AFTER /devices/:serial/tags so the more specific path wins.
+      const mDevMeta = /^\/devices\/([^/]+)$/.exec(pathname);
+      if (mDevMeta && (method === 'PUT' || method === 'PATCH')) {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { serial: decodeURIComponent(mDevMeta[1]) };
+        ctx.body = await readBody(req);
+        return handlers.deviceMetaSet(ctx);
+      }
+
       if (method === 'GET' && pathname === '/alert-rules') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         return handlers.alertRulesList(ctx);

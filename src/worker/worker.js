@@ -159,6 +159,23 @@ async function runOnce({ store, config, now }) {
   // 1. staleness → status transitions
   summary.stale = await store.markStaleDevices(cfg.staleAfterS, cfg.offlineAfterS);
 
+  // 1b. smart tags — recompute which devices carry each rule-owned tag. Runs BEFORE the
+  // alert pass on purpose: alert_rules.scope_tag selects on devices.tags, so a device that
+  // has just started matching a rule is scoped correctly in this same tick rather than the
+  // next one. A failure here must not stop alerting, hence the try/catch.
+  if (typeof store.syncSmartTags === 'function') {
+    try {
+      summary.smartTags = await store.syncSmartTags();
+      const st = summary.smartTags;
+      if (st && (st.added || st.removed || (st.errors && st.errors.length))) {
+        log.info('worker: smart tags synced', st);
+      }
+    } catch (err) {
+      log.error('worker: smart tag sync failed (continuing)', { msg: err && err.message });
+      summary.smartTags = { error: err && err.message };
+    }
+  }
+
   // 2. alert rules (threshold decision in transform.evaluateAlert)
   summary.alerts = await evaluateAlerts({ store, now: at });
   // 2b. notify (email/Teams) on the open/clear transitions — pass the FULL config (Resend key).

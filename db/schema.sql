@@ -295,6 +295,36 @@ ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS notify_teams_webhook text;
 ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS notify_on            text NOT NULL DEFAULT 'both';
 ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS neighbor_platform    text;
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SMART TAGS
+--
+-- Tags are what `alert_rules.scope_tag` and `config_jobs.target_tag` select on, so a tag
+-- is really a *live group*: "every SIM-WAN router", "everything below RouterOS 7.16". A
+-- tag_rule owns exactly one tag and declares which devices carry it; the worker
+-- re-evaluates membership each pass and adds/removes that tag on `devices.tags`.
+--
+-- A tag is therefore either RULE-OWNED (managed here) or MANUAL (edited in the UI) and
+-- never both — otherwise the worker would overwrite an operator's edits on every tick.
+-- `tag` is UNIQUE to enforce exactly that.
+--
+-- `conditions` is {"all":[{field,op,value}, …]} over DEVICE ATTRIBUTES only
+-- (serial/identity/site_name/customer/model/ros_version/wan_type/expected). Live
+-- telemetry is deliberately excluded: thresholds on state are what alert_rules already
+-- do, and a tag that flapped with device state would make alert scoping circular.
+-- An empty condition list matches NOTHING (never the whole fleet).
+CREATE TABLE IF NOT EXISTS tag_rules (
+    id          bigserial   PRIMARY KEY,
+    name        text        NOT NULL,
+    tag         text        NOT NULL UNIQUE,
+    conditions  jsonb       NOT NULL DEFAULT '{"all":[]}'::jsonb,
+    enabled     boolean     NOT NULL DEFAULT true,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+-- devices.tags is membership-tested on every smart-tag sync and on every scope_tag /
+-- target_tag lookup, so give the array an index.
+CREATE INDEX IF NOT EXISTS devices_tags_gin ON devices USING gin (tags);
+
 -- Recent device log lines (agent-collected, fetch-noise stripped) for the device view.
 ALTER TABLE device_state ADD COLUMN IF NOT EXISTS recent_logs jsonb;
 

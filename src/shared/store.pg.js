@@ -83,7 +83,9 @@ function makePgStore(poolOrConfig) {
   // ── device registry / auth ──────────────────────────────────────────────────
   async function getDeviceByToken(tokenHash) {
     return one(
-      `SELECT d.id, d.serial, d.poll_interval_s, d.poll_until, d.agent_version
+      // d.identity is selected so the telemetry handler can tell whether the agent's
+      // reported /system identity has actually CHANGED, and skip the write when it hasn't.
+      `SELECT d.id, d.serial, d.identity, d.poll_interval_s, d.poll_until, d.agent_version
          FROM enrollment_tokens t
          JOIN devices d ON d.id = t.device_id
         WHERE t.token_hash = $1
@@ -120,7 +122,12 @@ function makePgStore(poolOrConfig) {
          customer   = COALESCE(EXCLUDED.customer,  devices.customer),
          model      = COALESCE(EXCLUDED.model,     devices.model),
          wan_type   = EXCLUDED.wan_type,
-         tags       = EXCLUDED.tags,
+         -- Only replace tags when the caller actually supplied some. Re-enrolling a
+         -- device (our standard fix for a mis-tokened router) passes tags:[] , which
+         -- used to wipe every tag it had — losing operator-set tags for good and
+         -- silently dropping it out of any tag-scoped alert rule until the next sync.
+         -- Clearing tags is done through setDeviceTags(), not by re-enrolling.
+         tags       = CASE WHEN cardinality(EXCLUDED.tags) > 0 THEN EXCLUDED.tags ELSE devices.tags END,
          notes      = COALESCE(EXCLUDED.notes,     devices.notes)
        RETURNING id, serial, identity, site_name, customer, model, ros_version, wan_type,
                  tags, expected, poll_interval_s, poll_until, agent_version, enrolled_at, notes`,
@@ -1434,12 +1441,192 @@ function makePgStore(poolOrConfig) {
     return { pruned: r.rowCount || 0 };
   }
 
+  // ── tags & smart tags ────────────────────────────────────────────────────
+  // Tags are the grouping primitive the rest of the platform selects on
+  // (`alert_rules.scope_tag`, `config_jobs.target_tag`). A tag is either MANUAL
+  // (set here by an operator) or RULE-OWNED (recomputed by syncSmartTags from a
+  // tag_rules row) — never both, so the worker can't clobber operator edits.
+
+  // Every tag in use, with how many devices carry it and whether a rule owns it.
+  // Drives the tag pickers in the UI so scoping is pick-from-list, not free text.
+  async function listTags() {
+    return rows(
+      `SELECT t.tag,
+              count(*)::int AS devices,
+              EXISTS (SELECT 1 FROM tag_rules r WHERE r.tag = t.tag) AS rule_owned
+         FROM (SELECT unnest(tags) AS tag FROM devices) t
+        GROUP BY t.tag
+        ORDER BY t.tag`,
+      []
+    );
+  }
+
+  // Replace a device's MANUAL tags. Rule-owned tags currently on the device are
+  // preserved untouched (the worker owns those), and any rule-owned name in the
+  // incoming list is ignored rather than silently reverted a tick later.
+  async function setDeviceTags(serial, tagsIn) {
+    const device = await getDeviceBySerial(serial);
+    if (!device) return null;
+    const ruleTags = new Set((await rows(`SELECT tag FROM tag_rules`, [])).map((r) => r.tag));
+    const manual = (Array.isArray(tagsIn) ? tagsIn : [])
+      .map((t) => String(t == null ? '' : t).trim())
+      .filter(Boolean)
+      .filter((t) => !ruleTags.has(t));
+    const keptSmart = (device.tags || []).filter((t) => ruleTags.has(t));
+    const final = Array.from(new Set([...keptSmart, ...manual])).sort();
+    return one(
+      `UPDATE devices SET tags = $2 WHERE serial = $1
+       RETURNING serial, site_name, tags`,
+      [serial, final]
+    );
+  }
+
+  // The agent reports /system identity on every tick but nothing persisted it, so
+  // devices.identity was empty fleet-wide and useless for grouping. Called from the
+  // telemetry handler ONLY when the value has changed.
+  async function setDeviceIdentity(deviceId, identity) {
+    return one(
+      `UPDATE devices SET identity = $2 WHERE id = $1 AND identity IS DISTINCT FROM $2
+       RETURNING id, serial, identity`,
+      [deviceId, identity == null ? null : String(identity)]
+    );
+  }
+
+  // Operator-editable device metadata. `customer` is the one that matters: the audited
+  // MikroTik→company link lives in the field app's own database, so Vigilant can only know
+  // it if it is written across — which is what makes customer-scoped tag rules possible.
+  async function updateDeviceMeta(serial, fields) {
+    const f = fields || {};
+    return one(
+      `UPDATE devices SET
+         customer  = COALESCE($2, customer),
+         site_name = COALESCE($3, site_name),
+         identity  = COALESCE($4, identity),
+         model     = COALESCE($5, model),
+         wan_type  = COALESCE($6, wan_type)
+       WHERE serial = $1
+       RETURNING serial, site_name, customer, identity, model, wan_type, tags`,
+      [serial, nz(f.customer), nz(f.site_name), nz(f.identity), nz(f.model), nz(f.wan_type)]
+    );
+  }
+
+  async function listTagRules() {
+    return rows(
+      `SELECT id, name, tag, conditions, enabled, created_at, updated_at
+         FROM tag_rules ORDER BY tag`,
+      []
+    );
+  }
+
+  async function createTagRule(f) {
+    const r = f || {};
+    return one(
+      `INSERT INTO tag_rules (name, tag, conditions, enabled)
+       VALUES ($1,$2,COALESCE($3,'{"all":[]}'::jsonb),COALESCE($4,true))
+       RETURNING id, name, tag, conditions, enabled, created_at, updated_at`,
+      [String(r.name || r.tag || '').trim(), String(r.tag || '').trim(),
+       r.conditions ? JSON.stringify(r.conditions) : null,
+       typeof r.enabled === 'boolean' ? r.enabled : null]
+    );
+  }
+
+  async function updateTagRule(id, f) {
+    const r = f || {};
+    return one(
+      `UPDATE tag_rules SET
+         name       = COALESCE($2, name),
+         tag        = COALESCE($3, tag),
+         conditions = COALESCE($4, conditions),
+         enabled    = COALESCE($5, enabled),
+         updated_at = now()
+       WHERE id = $1
+       RETURNING id, name, tag, conditions, enabled, created_at, updated_at`,
+      [id, nz(r.name), nz(r.tag), r.conditions ? JSON.stringify(r.conditions) : null,
+       typeof r.enabled === 'boolean' ? r.enabled : null]
+    );
+  }
+
+  // Deleting a rule also strips its tag from every device, so a removed rule can't
+  // leave orphan tags behind that look manual but nobody set.
+  async function deleteTagRule(id) {
+    const rule = await one(`SELECT tag FROM tag_rules WHERE id = $1`, [id]);
+    if (!rule) return { deleted: 0, untagged: 0 };
+    const u = await q(
+      `UPDATE devices SET tags = array_remove(tags, $1) WHERE $1 = ANY(tags)`,
+      [rule.tag]
+    );
+    const d = await q(`DELETE FROM tag_rules WHERE id = $1`, [id]);
+    return { deleted: d.rowCount || 0, untagged: u.rowCount || 0 };
+  }
+
+  // How many devices a set of conditions would match, plus a sample — so the UI can
+  // show the blast radius BEFORE the rule is saved.
+  async function previewTagRule(conditions) {
+    const c = compileTagConditions(conditions, 1);
+    const n = await one(`SELECT count(*)::int AS n FROM devices d WHERE ${c.sql}`, c.params);
+    // Read ros_version from device_state, same as the matcher — selecting it off `devices`
+    // would show "no version" for every row and make the preview look broken.
+    const sample = await rows(
+      `SELECT d.serial, d.site_name, d.customer, d.model, d.wan_type,
+              (SELECT s.ros_version FROM device_state s WHERE s.device_id = d.id) AS ros_version
+         FROM devices d WHERE ${c.sql}
+        ORDER BY d.site_name NULLS LAST LIMIT 10`,
+      c.params
+    );
+    return { count: n ? n.n : 0, sample };
+  }
+
+  // Recompute membership for every enabled rule. Idempotent: adds the tag to devices
+  // that match and don't have it, removes it from devices that have it and no longer
+  // match. A rule whose conditions are empty matches nothing, so its tag is removed
+  // everywhere rather than applied to the whole fleet.
+  async function syncSmartTags() {
+    const rules = await rows(
+      `SELECT id, name, tag, conditions FROM tag_rules WHERE enabled ORDER BY id`,
+      []
+    );
+    const out = { rules: 0, added: 0, removed: 0, errors: [] };
+    for (const r of rules) {
+      let c;
+      try {
+        c = compileTagConditions(r.conditions, 2); // $1 is the tag
+      } catch (e) {
+        out.errors.push({ tag: r.tag, message: e.message });
+        continue;
+      }
+      const add = await q(
+        `UPDATE devices d SET tags = array_append(d.tags, $1)
+          WHERE NOT ($1 = ANY(d.tags)) AND (${c.sql})`,
+        [r.tag, ...c.params]
+      );
+      const del = await q(
+        `UPDATE devices d SET tags = array_remove(d.tags, $1)
+          WHERE $1 = ANY(d.tags) AND NOT (${c.sql})`,
+        [r.tag, ...c.params]
+      );
+      out.rules += 1;
+      out.added += add.rowCount || 0;
+      out.removed += del.rowCount || 0;
+    }
+    return out;
+  }
+
   // Expose the pool so callers (bin/migrate, graceful shutdown) can end() it.
   async function end() {
     await pool.end();
   }
 
   return {
+    listTags,
+    setDeviceTags,
+    setDeviceIdentity,
+    updateDeviceMeta,
+    listTagRules,
+    createTagRule,
+    updateTagRule,
+    deleteTagRule,
+    previewTagRule,
+    syncSmartTags,
     pool,
     migrate,
     getDeviceByToken,
@@ -1520,6 +1707,121 @@ function resolvePool(poolOrConfig) {
     throw new Error('makePgStore: config must provide databaseUrl or connectionString');
   }
   return makePool(url);
+}
+
+// ── smart-tag condition compiler ────────────────────────────────────────────
+// Turn a tag rule's {"all":[{field,op,value}, …]} into a parameterised WHERE fragment
+// over `devices d`. Fields and operators are WHITELISTED and values are always bound —
+// nothing from the rule is ever interpolated into SQL.
+//
+// Attributes only, by design. Live telemetry is excluded because thresholds on state are
+// what alert_rules already do, and a tag that flapped with state would make scoping an
+// alert rule to it circular.
+// Some attributes live on `devices` (operator-set metadata) and some only arrive with
+// telemetry, which lands in `device_state`. ros_version is the important one: `devices`
+// .ros_version is never written by the ingest (0/363 populated as of 2026-07-29) while
+// device_state.ros_version is complete and varied — so a firmware-cohort rule has to read
+// the state table or it silently matches nothing/everything. Pulled via a correlated
+// subquery so every call site (SELECT preview and UPDATE sync) works unchanged, and
+// devices with no state row simply yield NULL rather than being dropped by a join.
+const fromState = (col) => `(SELECT s.${col} FROM device_state s WHERE s.device_id = d.id)`;
+
+const TAG_FIELDS = {
+  serial: { expr: 'd.serial', kind: 'text' },
+  identity: { expr: 'd.identity', kind: 'text' },
+  site_name: { expr: 'd.site_name', kind: 'text' },
+  customer: { expr: 'd.customer', kind: 'text' },
+  model: { expr: 'd.model', kind: 'text' },
+  wan_type: { expr: 'd.wan_type', kind: 'text' },
+  expected: { expr: 'd.expected', kind: 'bool' },
+  ros_version: { expr: fromState('ros_version'), kind: 'text' },
+  firmware: { expr: fromState('firmware'), kind: 'text' },
+};
+
+// RouterOS versions must compare NUMERICALLY — plain text ordering puts '7.9' after
+// '7.16', which would silently invert an "older than" rule. Pull the leading numeric-dot
+// run out of values like "7.16.1 (stable)" and let Postgres compare int[] element-wise.
+// substring() uses a non-capturing group so it returns the whole match, not group 1.
+const versionArray = (expr) =>
+  `string_to_array(COALESCE(substring(COALESCE(${expr},'') from '[0-9]+(?:\\.[0-9]+)*'), '0'), '.')::int[]`;
+
+function tagRuleError(message) {
+  const err = new Error(message);
+  err.status = 400;
+  return err;
+}
+
+function compileTagConditions(conditions, startIdx) {
+  let parsed = conditions;
+  if (typeof parsed === 'string') {
+    try { parsed = JSON.parse(parsed); } catch (_) { throw tagRuleError('conditions is not valid JSON'); }
+  }
+  const list = parsed && Array.isArray(parsed.all) ? parsed.all : [];
+  const params = [];
+  const parts = [];
+  let i = typeof startIdx === 'number' ? startIdx : 1;
+
+  for (const raw of list) {
+    const c = raw || {};
+    const field = c.field;
+    const spec = TAG_FIELDS[field];
+    if (!spec) {
+      throw tagRuleError(`unknown condition field "${field}" (allowed: ${Object.keys(TAG_FIELDS).join(', ')})`);
+    }
+    const kind = spec.kind;
+    const op = String(c.op || '').toLowerCase();
+    const col = spec.expr;
+
+    if (kind === 'bool') {
+      if (op !== 'eq') throw tagRuleError(`field "${field}" only supports op "eq"`);
+      parts.push(`${col} = $${i}::boolean`);
+      params.push(c.value === true || c.value === 'true');
+      i += 1;
+      continue;
+    }
+
+    switch (op) {
+      // Case-insensitive so "Allied" and "allied" behave the same for operators.
+      case 'eq':
+        parts.push(`lower(${col}) = lower($${i})`); params.push(String(c.value ?? '')); i += 1; break;
+      // NULL-safe: a device with no model should satisfy "model is not X".
+      case 'ne':
+        parts.push(`(${col} IS NULL OR lower(${col}) <> lower($${i}))`); params.push(String(c.value ?? '')); i += 1; break;
+      case 'contains':
+        parts.push(`${col} ILIKE '%'||$${i}||'%'`); params.push(String(c.value ?? '')); i += 1; break;
+      case 'not_contains':
+        parts.push(`(${col} IS NULL OR ${col} NOT ILIKE '%'||$${i}||'%')`); params.push(String(c.value ?? '')); i += 1; break;
+      case 'starts_with':
+        parts.push(`${col} ILIKE $${i}||'%'`); params.push(String(c.value ?? '')); i += 1; break;
+      case 'in': {
+        const vals = (Array.isArray(c.value) ? c.value : String(c.value ?? '').split(','))
+          .map((v) => String(v).trim()).filter(Boolean);
+        if (!vals.length) throw tagRuleError(`op "in" on "${field}" needs at least one value`);
+        parts.push(`lower(${col}) = ANY (SELECT lower(x) FROM unnest($${i}::text[]) x)`);
+        params.push(vals); i += 1; break;
+      }
+      case 'is_empty':
+        parts.push(`(${col} IS NULL OR ${col} = '')`); break;
+      case 'is_not_empty':
+        parts.push(`(${col} IS NOT NULL AND ${col} <> '')`); break;
+      // Version-aware: "older than 7.16" / "at least 7.16".
+      // A device with NO reported version must NOT match either way — an unknown version
+      // is not an old one. Without this guard "older than 7.16" matched the entire fleet,
+      // because an empty string normalises to version 0.
+      case 'version_lt':
+        parts.push(`(${col} IS NOT NULL AND ${col} <> '' AND ${versionArray(col)} < ${versionArray(`$${i}`)})`);
+        params.push(String(c.value ?? '')); i += 1; break;
+      case 'version_gte':
+        parts.push(`(${col} IS NOT NULL AND ${col} <> '' AND ${versionArray(col)} >= ${versionArray(`$${i}`)})`);
+        params.push(String(c.value ?? '')); i += 1; break;
+      default:
+        throw tagRuleError(`unknown operator "${c.op}" for field "${field}"`);
+    }
+  }
+
+  // An empty rule must match NOTHING. Defaulting to TRUE here would tag the entire
+  // fleet the moment someone saved a half-written rule.
+  return { sql: parts.length ? parts.join(' AND ') : 'false', params };
 }
 
 // Coerce undefined -> null so parameterised queries get a clean SQL NULL.
