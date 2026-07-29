@@ -325,6 +325,214 @@ CREATE TABLE IF NOT EXISTS tag_rules (
 -- target_tag lookup, so give the array an index.
 CREATE INDEX IF NOT EXISTS devices_tags_gin ON devices USING gin (tags);
 
+-- ═════════════════════════════════════════════════════════════════════════════
+-- PMR VIRTUAL DESKTOP — pharmacies, counters, and their Raspberry Pi thin clients
+--
+-- The counter Pis need exactly what Vigilant already provides for MikroTiks: a
+-- per-device enrolment token, a telemetry ingest, device_state, alert rules and
+-- tags. So a Pi IS a `devices` row and reuses all of it, rather than a second
+-- service growing its own copy. `pharmacies`/`counters` add only the things
+-- Vigilant does not already model.
+--
+-- `devices.kind` is the discriminator that makes this safe. Everything existing
+-- assumes RouterOS — the agent-script route serves a .rsc, config_jobs push
+-- RouterOS config, and alert metrics read RouterOS fields. Without a kind, the
+-- config-push path would happily target a Raspberry Pi.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'mikrotik';
+DO $$ BEGIN
+    ALTER TABLE devices ADD CONSTRAINT devices_kind_check
+        CHECK (kind IN ('mikrotik', 'counter-pi'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS devices_kind_idx ON devices (kind);
+
+-- ── pharmacies ───────────────────────────────────────────────────────────────
+-- ADDRESSING IS DERIVED, NEVER TYPED. From systems/pmr-vpn/network-design.md, a
+-- pharmacy index N gives: vlan 100+N, subnet 10.N.0.0/24, gateway 10.N.0.1,
+-- PMR server 10.N.0.10, counter VM 10.N.0.(20+n), counter Pi 10.255.N.n/32.
+-- Storing those would let them drift from the scheme the gateway's nftables and
+-- dnsmasq config — and the provisioning scripts — already assume.
+CREATE TABLE IF NOT EXISTS pharmacies (
+    id           bigserial   PRIMARY KEY,
+    code         text        NOT NULL UNIQUE,          -- NHS/site code, e.g. 'RX54554'
+    -- Bounded because N is both the VLAN offset (100+N) and an octet in 10.255.N.n.
+    idx          int         NOT NULL UNIQUE CHECK (idx BETWEEN 1 AND 154),
+    name         text        NOT NULL,
+    pmr_system   text        NOT NULL DEFAULT 'proscript'
+                             CHECK (pmr_system IN ('proscript', 'titan', 'other')),
+    status       text        NOT NULL DEFAULT 'planned'
+                             CHECK (status IN ('planned', 'building', 'live', 'suspended', 'decommissioned')),
+    proxmox_node text,
+    srv_vmid     int,                                  -- Proxmox VMID of the PMR server VM
+    go_live_on   date,
+    notes        text,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+
+    vlan       int  GENERATED ALWAYS AS (100 + idx) STORED,
+    subnet     text GENERATED ALWAYS AS ('10.' || idx || '.0.0/24') STORED,
+    gateway_ip text GENERATED ALWAYS AS ('10.' || idx || '.0.1') STORED,
+    server_ip  text GENERATED ALWAYS AS ('10.' || idx || '.0.10') STORED,
+    dhcp_from  text GENERATED ALWAYS AS ('10.' || idx || '.0.100') STORED,
+    dhcp_to    text GENERATED ALWAYS AS ('10.' || idx || '.0.149') STORED
+);
+
+-- ── counters ─────────────────────────────────────────────────────────────────
+-- One counter = one Windows desktop VM + one Pi thin client on its own WireGuard
+-- tunnel. One row because they are provisioned, replaced and retired together.
+CREATE TABLE IF NOT EXISTS counters (
+    id            bigserial   PRIMARY KEY,
+    pharmacy_id   bigint      NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    -- Bounded so the derived VM octet (20+n) stays inside the .20–.99 counter band.
+    n             int         NOT NULL CHECK (n BETWEEN 1 AND 79),
+    label         text,
+    status        text        NOT NULL DEFAULT 'planned'
+                              CHECK (status IN ('planned', 'building', 'live', 'suspended', 'decommissioned')),
+    vmid          int,                                 -- Proxmox VMID of the desktop VM
+    vm_hostname   text,
+    -- The Pi as a Vigilant device: this is what gives it a token, telemetry,
+    -- alerting and tags for free. SET NULL on delete so retiring a Pi's device row
+    -- leaves the counter (and its VM) intact.
+    pi_device_id  uuid        UNIQUE REFERENCES devices(id) ON DELETE SET NULL,
+    pi_hostname   text,
+    pi_model      text,
+    -- WireGuard identity, UNIQUE so one key cannot be enrolled twice and observed
+    -- peers can be joined back to the counter that owns them.
+    pi_public_key text        UNIQUE,
+    pi_enrolled_at timestamptz,
+    -- {"smartcard":"untested","printer":"ok","scanner":null} — the peripheral set
+    -- differs per site, and NHS smartcard over the tunnel is still the open
+    -- go/no-go for the whole counter model.
+    peripherals   jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    notes         text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (pharmacy_id, n)
+);
+CREATE INDEX IF NOT EXISTS counters_pharmacy_idx ON counters (pharmacy_id);
+
+-- ── observed WireGuard peer state on the hub (VM 300) ────────────────────────
+-- Kept separate from `counters` so live telemetry never overwrites intended
+-- configuration, and so a peer that is connected but NOT registered still shows
+-- up — an unknown Pi on the VPN is precisely what you want surfaced.
+CREATE TABLE IF NOT EXISTS wg_peers (
+    public_key       text        PRIMARY KEY,
+    allowed_ips      text,
+    endpoint         text,
+    latest_handshake timestamptz,
+    rx_bytes         bigint,
+    tx_bytes         bigint,
+    seen_at          timestamptz NOT NULL DEFAULT now()
+);
+
+-- The view the Desktop UI reads: intent joined to observed state, with the derived
+-- addresses (which need the pharmacy's index, so they cannot be generated columns
+-- on `counters`). `pi_online` uses a 3-minute handshake window — WireGuard is
+-- silent when idle, but a Pi holding an RDP session handshakes well inside that,
+-- so a longer window would mask a Pi that has genuinely dropped.
+CREATE OR REPLACE VIEW counters_v AS
+SELECT c.id, c.pharmacy_id,
+       p.code AS pharmacy_code, p.name AS pharmacy_name, p.idx AS pharmacy_idx, p.vlan,
+       c.n, c.label, c.status, c.vmid, c.vm_hostname,
+       '10.' || p.idx || '.0.' || (20 + c.n)     AS vm_ip,
+       '10.255.' || p.idx || '.' || c.n || '/32' AS pi_tunnel_ip,
+       c.pi_device_id, c.pi_hostname, c.pi_model, c.pi_public_key, c.pi_enrolled_at,
+       c.peripherals, c.notes,
+       d.serial       AS pi_serial,
+       ds.status      AS pi_agent_status,      -- from the Pi's Vigilant telemetry
+       ds.last_seen_at AS pi_last_seen_at,
+       w.endpoint     AS pi_endpoint,
+       w.latest_handshake AS pi_last_handshake,
+       w.rx_bytes AS pi_rx_bytes, w.tx_bytes AS pi_tx_bytes,
+       (w.latest_handshake IS NOT NULL
+        AND w.latest_handshake > now() - interval '3 minutes') AS pi_tunnel_up
+  FROM counters c
+  JOIN pharmacies p   ON p.id = c.pharmacy_id
+  LEFT JOIN devices d ON d.id = c.pi_device_id
+  LEFT JOIN device_state ds ON ds.device_id = c.pi_device_id
+  LEFT JOIN wg_peers w ON w.public_key = c.pi_public_key;
+
+-- Keep updated_at honest on the PMR tables. Without this the column exists but never
+-- moves, which is worse than not having it — it reads as "nothing has changed since
+-- creation" on rows that have been edited repeatedly.
+CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS pharmacies_touch ON pharmacies;
+CREATE TRIGGER pharmacies_touch BEFORE UPDATE ON pharmacies
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+DROP TRIGGER IF EXISTS counters_touch ON counters;
+CREATE TRIGGER counters_touch BEFORE UPDATE ON counters
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- ── printers ─────────────────────────────────────────────────────────────────
+-- Pharmacy printing is part of whether a counter can actually dispense, so printer
+-- health belongs next to the counters rather than in a separate tool.
+--
+-- Stats come from an agent ON THE PHARMACY LAN (the counter Pi), because nothing in
+-- the datacentre can reach a printer on a site network:
+--   SNMP Printer MIB (RFC 3805) — prtMarkerLifeCount (lifetime pages),
+--     prtMarkerSuppliesLevel/MaxCapacity (toner/drum), prtAlertDescription (jams)
+--   IPP                          — marker-levels / printer-state-reasons on newer kit
+--   CUPS (local queue)           — queue depth and failed jobs, which SNMP cannot see
+--
+-- `printers` therefore mixes IDENTITY (stable, may be operator-set) with OBSERVED
+-- state (overwritten by each report), and records which device reported it so a stale
+-- row can be traced to a Pi that has stopped polling.
+CREATE TABLE IF NOT EXISTS printers (
+    id             bigserial   PRIMARY KEY,
+    pharmacy_id    bigint      NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    -- Which counter it serves, when that is known. SET NULL so retiring a counter does
+    -- not delete a printer that is still on the wall.
+    counter_id     bigint      REFERENCES counters(id) ON DELETE SET NULL,
+    -- CUPS queue name or the operator's label. Unique per site so repeated reports
+    -- update one row rather than growing duplicates.
+    name           text        NOT NULL,
+    address        text,                              -- IP/hostname on the pharmacy LAN
+    make           text,
+    model          text,
+    serial         text,
+    discovered_via text        CHECK (discovered_via IN ('snmp', 'ipp', 'cups', 'manual')),
+    notes          text,
+    -- ── observed ──
+    status         text,                              -- idle | printing | stopped | unreachable
+    state_reasons  text,                              -- 'media-jam', 'toner-low', …
+    page_count     bigint,                            -- lifetime pages (counter, not a rate)
+    -- [{name,type,level,max_capacity,pct}] — level/max kept raw as reported, because a
+    -- percentage alone loses the difference between "unknown" and "empty".
+    supplies       jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    queue_depth    int,
+    jobs_failed    int,
+    reported_by    uuid        REFERENCES devices(id) ON DELETE SET NULL,
+    last_seen_at   timestamptz,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (pharmacy_id, name)
+);
+CREATE INDEX IF NOT EXISTS printers_pharmacy_idx ON printers (pharmacy_id);
+
+DROP TRIGGER IF EXISTS printers_touch ON printers;
+CREATE TRIGGER printers_touch BEFORE UPDATE ON printers
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- Adds the derived bits the UI needs: the lowest supply level (what you actually alert a
+-- human on) and whether the report has gone stale. `stale` is 15 minutes because printer
+-- polling is deliberately infrequent — toner does not move fast, and hammering a printer's
+-- SNMP agent can wedge older devices.
+CREATE OR REPLACE VIEW printers_v AS
+SELECT pr.*,
+       ph.code AS pharmacy_code,
+       ph.name AS pharmacy_name,
+       c.n     AS counter_n,
+       (SELECT min((s->>'pct')::numeric)
+          FROM jsonb_array_elements(pr.supplies) s
+         WHERE (s->>'pct') ~ '^[0-9.]+$')            AS min_supply_pct,
+       (pr.last_seen_at IS NULL
+        OR pr.last_seen_at < now() - interval '15 minutes') AS stale
+  FROM printers pr
+  JOIN pharmacies ph ON ph.id = pr.pharmacy_id
+  LEFT JOIN counters c ON c.id = pr.counter_id;
+
 -- Recent device log lines (agent-collected, fetch-noise stripped) for the device view.
 ALTER TABLE device_state ADD COLUMN IF NOT EXISTS recent_logs jsonb;
 

@@ -271,6 +271,104 @@ function createServer({ store, config: cfg }) {
       }
 
       // ── alert-rule CRUD (admin) — backs the Rules UI ──
+      // ── PMR virtual desktop (admin) ────────────────────────────────────────
+      // Pharmacies, counters, and counter Pis. A Pi is enrolled as a Vigilant device
+      // (kind='counter-pi') so it reuses token auth, telemetry, alerting and tags.
+      if (method === 'GET' && pathname === '/pharmacies') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.pharmaciesList(ctx);
+      }
+      if (method === 'POST' && pathname === '/pharmacies') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return handlers.pharmacyCreate(ctx);
+      }
+      const mPharm = /^\/pharmacies\/([^/]+)$/.exec(pathname);
+      if (mPharm && method === 'GET') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPharm[1]) };
+        return handlers.pharmacyGet(ctx);
+      }
+      if (mPharm && (method === 'PUT' || method === 'PATCH')) {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPharm[1]) };
+        ctx.body = await readBody(req);
+        return handlers.pharmacyUpdate(ctx);
+      }
+      if (mPharm && method === 'DELETE') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPharm[1]) };
+        return handlers.pharmacyDelete(ctx);
+      }
+
+      if (method === 'GET' && pathname === '/counters') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.countersList(ctx);
+      }
+      if (method === 'POST' && pathname === '/counters') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return handlers.counterCreate(ctx);
+      }
+      // Enrol route FIRST — it is more specific than /counters/:id.
+      const mCounterPi = /^\/counters\/([^/]+)\/enrol-pi$/.exec(pathname);
+      if (mCounterPi && method === 'POST') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mCounterPi[1]) };
+        ctx.body = await readBody(req);
+        return handlers.counterEnrolPi(ctx);
+      }
+      const mCounter = /^\/counters\/([^/]+)$/.exec(pathname);
+      if (mCounter && (method === 'PUT' || method === 'PATCH')) {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mCounter[1]) };
+        ctx.body = await readBody(req);
+        return handlers.counterUpdate(ctx);
+      }
+      if (mCounter && method === 'DELETE') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mCounter[1]) };
+        return handlers.counterDelete(ctx);
+      }
+
+      // ── printers ───────────────────────────────────────────────────────────
+      // Stats are collected by an agent on the pharmacy LAN (the counter Pi), because
+      // nothing in the datacentre can reach a printer on a site network.
+      if (method === 'GET' && pathname === '/printers') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.printersList(ctx);
+      }
+      if (method === 'POST' && pathname === '/printers') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return handlers.printerUpsert(ctx);
+      }
+      // DEVICE route — the Pi reports with its own token, not the admin token.
+      if (method === 'POST' && pathname === '/printers/report') {
+        const dev = await authDevice(req, store);
+        if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.device = dev;
+        ctx.body = await readBody(req);
+        return handlers.printersReport(ctx);
+      }
+      const mPrinter = /^\/printers\/([^/]+)$/.exec(pathname);
+      if (mPrinter && method === 'DELETE') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPrinter[1]) };
+        return handlers.printerDelete(ctx);
+      }
+
+      // Observed WireGuard state from the hub's collector.
+      if (method === 'GET' && pathname === '/wg-peers') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.wgPeersList(ctx);
+      }
+      if (method === 'POST' && pathname === '/wg-peers/report') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return handlers.wgPeersReport(ctx);
+      }
+
       // ── tags & smart tags (admin) ──────────────────────────────────────────
       // Tags are the grouping primitive alert_rules.scope_tag and
       // config_jobs.target_tag select on, so these make tag-scoped alerting usable.

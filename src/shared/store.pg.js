@@ -110,12 +110,12 @@ function makePgStore(poolOrConfig) {
     return one(
       `INSERT INTO devices
          (serial, identity, site_name, customer, model, ros_version, wan_type, tags,
-          expected, poll_interval_s, poll_until, agent_version, notes)
+          expected, poll_interval_s, poll_until, agent_version, notes, kind)
        VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,'unknown'),
                COALESCE($8,'{}'::text[]),
                COALESCE($9,true),
                COALESCE($10,10),
-               $11,$12,$13)
+               $11,$12,$13,COALESCE($14,'mikrotik'))
        ON CONFLICT (serial) DO UPDATE SET
          identity   = COALESCE(EXCLUDED.identity,  devices.identity),
          site_name  = COALESCE(EXCLUDED.site_name, devices.site_name),
@@ -128,9 +128,12 @@ function makePgStore(poolOrConfig) {
          -- silently dropping it out of any tag-scoped alert rule until the next sync.
          -- Clearing tags is done through setDeviceTags(), not by re-enrolling.
          tags       = CASE WHEN cardinality(EXCLUDED.tags) > 0 THEN EXCLUDED.tags ELSE devices.tags END,
-         notes      = COALESCE(EXCLUDED.notes,     devices.notes)
+         notes      = COALESCE(EXCLUDED.notes,     devices.notes),
+         -- Never silently downgrade a counter-pi to a mikrotik on re-enrol: the kind
+         -- gates whether RouterOS config pushes are offered for this device.
+         kind       = COALESCE(EXCLUDED.kind, devices.kind)
        RETURNING id, serial, identity, site_name, customer, model, ros_version, wan_type,
-                 tags, expected, poll_interval_s, poll_until, agent_version, enrolled_at, notes`,
+                 tags, expected, poll_interval_s, poll_until, agent_version, enrolled_at, notes, kind`,
       [
         f.serial,
         f.identity || null,
@@ -145,6 +148,7 @@ function makePgStore(poolOrConfig) {
         f.poll_until || null,
         f.agent_version || null,
         f.notes || null,
+        f.kind || null,
       ]
     );
   }
@@ -1611,12 +1615,278 @@ function makePgStore(poolOrConfig) {
     return out;
   }
 
+  // ── PMR virtual desktop: pharmacies, counters, counter Pis ────────────────
+  // A counter Pi is a `devices` row (kind='counter-pi'), so it inherits Vigilant's
+  // token auth, telemetry, alerting and tags. These methods add only what Vigilant
+  // does not already model. Derived addressing is never written — it comes from the
+  // generated columns and counters_v.
+
+  async function listPharmacies() {
+    return rows(
+      `SELECT p.*,
+              (SELECT count(*) FROM counters c WHERE c.pharmacy_id = p.id)::int AS counters,
+              (SELECT count(*) FROM counters c WHERE c.pharmacy_id = p.id
+                 AND c.pi_device_id IS NOT NULL)::int AS pis_enrolled
+         FROM pharmacies p ORDER BY p.idx`,
+      []
+    );
+  }
+
+  async function getPharmacy(idOrCode) {
+    // Accept either the surrogate id or the human code, so URLs can use the code.
+    return one(
+      `SELECT * FROM pharmacies
+        WHERE ($1 ~ '^[0-9]+$' AND id = ($1)::bigint) OR upper(code) = upper($1)`,
+      [String(idOrCode)]
+    );
+  }
+
+  async function createPharmacy(f) {
+    const r = f || {};
+    return one(
+      `INSERT INTO pharmacies (code, idx, name, pmr_system, status, proxmox_node, srv_vmid, go_live_on, notes)
+       VALUES ($1,$2,$3,COALESCE($4,'proscript'),COALESCE($5,'planned'),$6,$7,$8,$9)
+       RETURNING *`,
+      [String(r.code || '').trim().toUpperCase(), r.idx, String(r.name || '').trim(),
+       nz(r.pmr_system), nz(r.status), nz(r.proxmox_node), nz(r.srv_vmid), nz(r.go_live_on), nz(r.notes)]
+    );
+  }
+
+  async function updatePharmacy(id, f) {
+    const r = f || {};
+    // idx is deliberately NOT updatable: it derives the VLAN and every address in the
+    // subnet, all of which are already live in nftables, dnsmasq and the VM configs.
+    // Renumbering a pharmacy is a migration, not a field edit.
+    return one(
+      `UPDATE pharmacies SET
+         name = COALESCE($2, name), pmr_system = COALESCE($3, pmr_system),
+         status = COALESCE($4, status), proxmox_node = COALESCE($5, proxmox_node),
+         srv_vmid = COALESCE($6, srv_vmid), go_live_on = COALESCE($7, go_live_on),
+         notes = COALESCE($8, notes)
+       WHERE id = $1 RETURNING *`,
+      [id, nz(r.name), nz(r.pmr_system), nz(r.status), nz(r.proxmox_node),
+       nz(r.srv_vmid), nz(r.go_live_on), nz(r.notes)]
+    );
+  }
+
+  // Cascades to counters (FK ON DELETE CASCADE). The Pis' `devices` rows survive —
+  // deleting a pharmacy record should not silently unenroll hardware that still exists.
+  async function deletePharmacy(id) {
+    const r = await q(`DELETE FROM pharmacies WHERE id = $1`, [id]);
+    return { deleted: r.rowCount || 0 };
+  }
+
+  async function listCounters(pharmacyId) {
+    if (pharmacyId) {
+      return rows(`SELECT * FROM counters_v WHERE pharmacy_id = $1 ORDER BY n`, [pharmacyId]);
+    }
+    return rows(`SELECT * FROM counters_v ORDER BY pharmacy_code, n`, []);
+  }
+
+  async function getCounter(id) {
+    return one(`SELECT * FROM counters_v WHERE id = $1`, [id]);
+  }
+
+  async function createCounter(f) {
+    const r = f || {};
+    const created = await one(
+      `INSERT INTO counters (pharmacy_id, n, label, status, vmid, vm_hostname, pi_hostname, pi_model, peripherals, notes)
+       VALUES ($1,$2,$3,COALESCE($4,'planned'),$5,$6,$7,$8,COALESCE($9,'{}'::jsonb),$10)
+       RETURNING id`,
+      [r.pharmacy_id, r.n, nz(r.label), nz(r.status), nz(r.vmid), nz(r.vm_hostname),
+       nz(r.pi_hostname), nz(r.pi_model),
+       r.peripherals ? JSON.stringify(r.peripherals) : null, nz(r.notes)]
+    );
+    return created ? getCounter(created.id) : null;
+  }
+
+  async function updateCounter(id, f) {
+    const r = f || {};
+    // `n` is not updatable for the same reason as pharmacy idx — it derives the VM's
+    // address and the Pi's tunnel /32, both already configured on the gateway.
+    const updated = await one(
+      `UPDATE counters SET
+         label = COALESCE($2, label), status = COALESCE($3, status),
+         vmid = COALESCE($4, vmid), vm_hostname = COALESCE($5, vm_hostname),
+         pi_hostname = COALESCE($6, pi_hostname), pi_model = COALESCE($7, pi_model),
+         peripherals = COALESCE($8, peripherals), notes = COALESCE($9, notes)
+       WHERE id = $1 RETURNING id`,
+      [id, nz(r.label), nz(r.status), nz(r.vmid), nz(r.vm_hostname), nz(r.pi_hostname),
+       nz(r.pi_model), r.peripherals ? JSON.stringify(r.peripherals) : null, nz(r.notes)]
+    );
+    return updated ? getCounter(id) : null;
+  }
+
+  async function deleteCounter(id) {
+    const r = await q(`DELETE FROM counters WHERE id = $1`, [id]);
+    return { deleted: r.rowCount || 0 };
+  }
+
+  // Attach an already-created Vigilant device (the Pi) to a counter. Token minting
+  // stays in the handler, matching how router enrolment already works.
+  async function linkCounterPi(counterId, f) {
+    const r = f || {};
+    const updated = await one(
+      `UPDATE counters SET
+         pi_device_id  = COALESCE($2, pi_device_id),
+         pi_hostname   = COALESCE($3, pi_hostname),
+         pi_model      = COALESCE($4, pi_model),
+         pi_public_key = COALESCE($5, pi_public_key),
+         pi_enrolled_at = now()
+       WHERE id = $1 RETURNING id`,
+      [counterId, nz(r.pi_device_id), nz(r.pi_hostname), nz(r.pi_model), nz(r.pi_public_key)]
+    );
+    return updated ? getCounter(counterId) : null;
+  }
+
+  // ── observed WireGuard state, reported by a collector on the hub ───────────
+  async function reportWgPeers(peers) {
+    const list = Array.isArray(peers) ? peers : [];
+    if (!list.length) return { peers: 0 };
+    // Same batching discipline as the telemetry path: one multi-row upsert, deduped on
+    // the conflict key so a repeated public key in one report can't abort the statement.
+    const uniq = dedupeBy(list.filter((p) => p && p.public_key), (p) => p.public_key);
+    await tx(async (client) => {
+      await bulkInsert(
+        client,
+        `INSERT INTO wg_peers (public_key, allowed_ips, endpoint, latest_handshake, rx_bytes, tx_bytes, seen_at)`,
+        `ON CONFLICT (public_key) DO UPDATE SET
+           allowed_ips = EXCLUDED.allowed_ips, endpoint = EXCLUDED.endpoint,
+           latest_handshake = EXCLUDED.latest_handshake,
+           rx_bytes = EXCLUDED.rx_bytes, tx_bytes = EXCLUDED.tx_bytes, seen_at = now()`,
+        6,
+        uniq.map((p) => [
+          p.public_key, nz(p.allowed_ips), nz(p.endpoint),
+          // Accept epoch seconds (what `wg show dump` prints) or an ISO string; 0 = never.
+          p.latest_handshake ? new Date(typeof p.latest_handshake === 'number'
+            ? p.latest_handshake * 1000 : p.latest_handshake).toISOString() : null,
+          Number(p.rx_bytes) || 0, Number(p.tx_bytes) || 0,
+        ]),
+        placeholders(6, 'now()')
+      );
+    });
+    return { peers: uniq.length };
+  }
+
+  // Observed peers joined to the counter that owns them. A row with no counter is a Pi
+  // on the VPN that nobody registered — worth seeing, not hiding.
+  async function listWgPeers() {
+    return rows(
+      `SELECT w.*, c.id AS counter_id, c.n AS counter_n, p.code AS pharmacy_code,
+              (w.latest_handshake IS NOT NULL
+               AND w.latest_handshake > now() - interval '3 minutes') AS online
+         FROM wg_peers w
+         LEFT JOIN counters c   ON c.pi_public_key = w.public_key
+         LEFT JOIN pharmacies p ON p.id = c.pharmacy_id
+        ORDER BY w.latest_handshake DESC NULLS LAST`,
+      []
+    );
+  }
+
+  // ── printers ───────────────────────────────────────────────────────────────
+  // Reported by an agent on the pharmacy LAN (the counter Pi), since nothing in the
+  // datacentre can reach a printer on a site network.
+
+  async function listPrinters(pharmacyId) {
+    if (pharmacyId) return rows(`SELECT * FROM printers_v WHERE pharmacy_id = $1 ORDER BY name`, [pharmacyId]);
+    return rows(`SELECT * FROM printers_v ORDER BY pharmacy_code, name`, []);
+  }
+
+  async function upsertPrinter(f) {
+    const r = f || {};
+    // Operator-set identity fields are COALESCEd so a discovery report can fill blanks
+    // but never blank out something a human typed (a friendly model, the counter link).
+    const saved = await one(
+      `INSERT INTO printers (pharmacy_id, counter_id, name, address, make, model, serial,
+                             discovered_via, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT (pharmacy_id, name) DO UPDATE SET
+         counter_id     = COALESCE(EXCLUDED.counter_id, printers.counter_id),
+         address        = COALESCE(EXCLUDED.address,    printers.address),
+         make           = COALESCE(EXCLUDED.make,       printers.make),
+         model          = COALESCE(EXCLUDED.model,      printers.model),
+         serial         = COALESCE(EXCLUDED.serial,     printers.serial),
+         discovered_via = COALESCE(EXCLUDED.discovered_via, printers.discovered_via),
+         notes          = COALESCE(EXCLUDED.notes,      printers.notes)
+       RETURNING id`,
+      [r.pharmacy_id, nz(r.counter_id), String(r.name || '').trim(), nz(r.address),
+       nz(r.make), nz(r.model), nz(r.serial), nz(r.discovered_via), nz(r.notes)]
+    );
+    return saved ? one(`SELECT * FROM printers_v WHERE id = $1`, [saved.id]) : null;
+  }
+
+  async function deletePrinter(id) {
+    const r = await q(`DELETE FROM printers WHERE id = $1`, [id]);
+    return { deleted: r.rowCount || 0 };
+  }
+
+  // A poll report from one Pi: identity is filled in only where blank, observed state is
+  // replaced wholesale. Batched into a single multi-row upsert like the telemetry path.
+  async function reportPrinters(deviceId, pharmacyId, list) {
+    const arr = Array.isArray(list) ? list : [];
+    const uniq = dedupeBy(arr.filter((p) => p && String(p.name || '').trim()), (p) => String(p.name).trim());
+    if (!uniq.length) return { printers: 0 };
+    await tx(async (client) => {
+      await bulkInsert(
+        client,
+        `INSERT INTO printers (pharmacy_id, name, address, make, model, serial, discovered_via,
+                               status, state_reasons, page_count, supplies, queue_depth,
+                               jobs_failed, reported_by, last_seen_at)`,
+        `ON CONFLICT (pharmacy_id, name) DO UPDATE SET
+           address        = COALESCE(printers.address, EXCLUDED.address),
+           make           = COALESCE(printers.make,   EXCLUDED.make),
+           model          = COALESCE(printers.model,  EXCLUDED.model),
+           serial         = COALESCE(printers.serial, EXCLUDED.serial),
+           discovered_via = COALESCE(printers.discovered_via, EXCLUDED.discovered_via),
+           status         = EXCLUDED.status,
+           state_reasons  = EXCLUDED.state_reasons,
+           -- Lifetime page count only ever goes up; a lower value means a failed read or a
+           -- replaced unit, and taking it would corrupt any usage figure derived from it.
+           page_count     = GREATEST(COALESCE(printers.page_count, 0), COALESCE(EXCLUDED.page_count, 0)),
+           supplies       = EXCLUDED.supplies,
+           queue_depth    = EXCLUDED.queue_depth,
+           jobs_failed    = EXCLUDED.jobs_failed,
+           reported_by    = EXCLUDED.reported_by,
+           last_seen_at   = now()`,
+        14,
+        uniq.map((p) => [
+          pharmacyId, String(p.name).trim(), nz(p.address), nz(p.make), nz(p.model), nz(p.serial),
+          nz(p.discovered_via), nz(p.status), nz(p.state_reasons),
+          p.page_count == null ? null : Number(p.page_count),
+          JSON.stringify(Array.isArray(p.supplies) ? p.supplies : []),
+          p.queue_depth == null ? null : Number(p.queue_depth),
+          p.jobs_failed == null ? null : Number(p.jobs_failed),
+          nz(deviceId),
+        ]),
+        placeholders(14, 'now()')
+      );
+    });
+    return { printers: uniq.length };
+  }
+
   // Expose the pool so callers (bin/migrate, graceful shutdown) can end() it.
   async function end() {
     await pool.end();
   }
 
   return {
+    listPrinters,
+    upsertPrinter,
+    deletePrinter,
+    reportPrinters,
+    listPharmacies,
+    getPharmacy,
+    createPharmacy,
+    updatePharmacy,
+    deletePharmacy,
+    listCounters,
+    getCounter,
+    createCounter,
+    updateCounter,
+    deleteCounter,
+    linkCounterPi,
+    reportWgPeers,
+    listWgPeers,
     listTags,
     setDeviceTags,
     setDeviceIdentity,
@@ -1734,6 +2004,8 @@ const TAG_FIELDS = {
   model: { expr: 'd.model', kind: 'text' },
   wan_type: { expr: 'd.wan_type', kind: 'text' },
   expected: { expr: 'd.expected', kind: 'bool' },
+  // Lets a smart tag group the fleet by device type, e.g. kind = 'counter-pi'.
+  kind: { expr: 'd.kind', kind: 'text' },
   ros_version: { expr: fromState('ros_version'), kind: 'text' },
   firmware: { expr: fromState('firmware'), kind: 'text' },
 };

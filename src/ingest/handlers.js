@@ -1144,6 +1144,229 @@ async function deviceTagsSet(ctx) {
   return json(res, 200, { ok: true, device: updated });
 }
 
+// ── PMR virtual desktop: pharmacies, counters, counter Pis ──────────────────
+// A counter Pi is enrolled as a Vigilant device (kind='counter-pi'), so it reuses the
+// same token auth, telemetry ingest, alerting and tags as a router. These handlers add
+// only the pharmacy/counter layer on top.
+
+const PMR_SYSTEMS = ['proscript', 'titan', 'other'];
+const PMR_STATUSES = ['planned', 'building', 'live', 'suspended', 'decommissioned'];
+
+async function pharmaciesList(ctx) {
+  const { res, store } = ctx;
+  if (typeof store.listPharmacies !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  return json(res, 200, { ok: true, pharmacies: await store.listPharmacies() });
+}
+
+async function pharmacyGet(ctx) {
+  const { res, store, params } = ctx;
+  const p = await store.getPharmacy(params.id);
+  if (!p) return json(res, 404, { ok: false, error: 'not found' });
+  const counters = typeof store.listCounters === 'function' ? await store.listCounters(p.id) : [];
+  return json(res, 200, { ok: true, pharmacy: p, counters });
+}
+
+async function pharmacyCreate(ctx) {
+  const { res, store, body } = ctx;
+  const p = parseJsonBody(body);
+  if (!p) return json(res, 400, { ok: false, error: 'bad json' });
+  if (!String(p.code || '').trim()) return json(res, 400, { ok: false, error: 'code is required' });
+  if (!String(p.name || '').trim()) return json(res, 400, { ok: false, error: 'name is required' });
+  // idx drives the VLAN and every address in the subnet, so it must be a sane integer
+  // up front — the DB CHECK would otherwise surface as a 500.
+  const idx = Number(p.idx);
+  if (!Number.isInteger(idx) || idx < 1 || idx > 154) {
+    return json(res, 400, { ok: false, error: 'idx must be an integer 1–154 (it derives vlan 100+idx and 10.idx.0.0/24)' });
+  }
+  if (p.pmr_system && !PMR_SYSTEMS.includes(p.pmr_system)) return json(res, 400, { ok: false, error: `pmr_system must be one of ${PMR_SYSTEMS.join(', ')}` });
+  if (p.status && !PMR_STATUSES.includes(p.status)) return json(res, 400, { ok: false, error: `status must be one of ${PMR_STATUSES.join(', ')}` });
+  try {
+    return json(res, 201, { ok: true, pharmacy: await store.createPharmacy({ ...p, idx }) });
+  } catch (e) {
+    // code and idx are both UNIQUE — a clash is the caller's problem, not a 500.
+    if (e && e.code === '23505') return json(res, 409, { ok: false, error: 'a pharmacy already uses that code or index' });
+    throw e;
+  }
+}
+
+async function pharmacyUpdate(ctx) {
+  const { res, store, body, params } = ctx;
+  const p = parseJsonBody(body);
+  if (!p) return json(res, 400, { ok: false, error: 'bad json' });
+  if (p.idx !== undefined) {
+    return json(res, 400, { ok: false, error: 'idx cannot be changed — it derives the VLAN and every address already live in nftables/dnsmasq and the VM configs' });
+  }
+  if (p.pmr_system && !PMR_SYSTEMS.includes(p.pmr_system)) return json(res, 400, { ok: false, error: `pmr_system must be one of ${PMR_SYSTEMS.join(', ')}` });
+  if (p.status && !PMR_STATUSES.includes(p.status)) return json(res, 400, { ok: false, error: `status must be one of ${PMR_STATUSES.join(', ')}` });
+  const updated = await store.updatePharmacy(params.id, p);
+  if (!updated) return json(res, 404, { ok: false, error: 'not found' });
+  return json(res, 200, { ok: true, pharmacy: updated });
+}
+
+async function pharmacyDelete(ctx) {
+  const { res, store, params } = ctx;
+  const r = await store.deletePharmacy(params.id);
+  if (!r || !r.deleted) return json(res, 404, { ok: false, error: 'not found' });
+  return json(res, 200, { ok: true, ...r });
+}
+
+async function countersList(ctx) {
+  const { res, store, query } = ctx;
+  if (typeof store.listCounters !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const pid = query && query.get('pharmacy_id');
+  return json(res, 200, { ok: true, counters: await store.listCounters(pid || null) });
+}
+
+async function counterCreate(ctx) {
+  const { res, store, body } = ctx;
+  const p = parseJsonBody(body);
+  if (!p) return json(res, 400, { ok: false, error: 'bad json' });
+  if (!p.pharmacy_id) return json(res, 400, { ok: false, error: 'pharmacy_id is required' });
+  const n = Number(p.n);
+  if (!Number.isInteger(n) || n < 1 || n > 79) {
+    return json(res, 400, { ok: false, error: 'n must be an integer 1–79 (it derives the VM address 10.x.0.(20+n) and the Pi tunnel 10.255.x.n)' });
+  }
+  if (p.status && !PMR_STATUSES.includes(p.status)) return json(res, 400, { ok: false, error: `status must be one of ${PMR_STATUSES.join(', ')}` });
+  try {
+    return json(res, 201, { ok: true, counter: await store.createCounter({ ...p, n }) });
+  } catch (e) {
+    if (e && e.code === '23505') return json(res, 409, { ok: false, error: 'that counter number already exists for this pharmacy' });
+    if (e && e.code === '23503') return json(res, 400, { ok: false, error: 'unknown pharmacy_id' });
+    throw e;
+  }
+}
+
+async function counterUpdate(ctx) {
+  const { res, store, body, params } = ctx;
+  const p = parseJsonBody(body);
+  if (!p) return json(res, 400, { ok: false, error: 'bad json' });
+  if (p.n !== undefined) {
+    return json(res, 400, { ok: false, error: 'n cannot be changed — it derives the VM address and the Pi tunnel /32 already configured on the gateway' });
+  }
+  if (p.status && !PMR_STATUSES.includes(p.status)) return json(res, 400, { ok: false, error: `status must be one of ${PMR_STATUSES.join(', ')}` });
+  const updated = await store.updateCounter(params.id, p);
+  if (!updated) return json(res, 404, { ok: false, error: 'not found' });
+  return json(res, 200, { ok: true, counter: updated });
+}
+
+async function counterDelete(ctx) {
+  const { res, store, params } = ctx;
+  const r = await store.deleteCounter(params.id);
+  if (!r || !r.deleted) return json(res, 404, { ok: false, error: 'not found' });
+  return json(res, 200, { ok: true, ...r });
+}
+
+// POST /counters/:id/enrol-pi  { serial?, pi_hostname?, pi_model?, pi_public_key? }
+// Creates the Pi as a Vigilant device (kind='counter-pi'), mints its bearer token and
+// links it to the counter — one action, because a Pi with no device row can't report and
+// a device row with no counter is orphaned. The plaintext token is returned ONCE.
+async function counterEnrolPi(ctx) {
+  const { res, store, config, log, body, params } = ctx;
+  const p = parseJsonBody(body) || {};
+  const counter = await store.getCounter(params.id);
+  if (!counter) return json(res, 404, { ok: false, error: 'counter not found' });
+  if (counter.pi_device_id && !p.replace) {
+    // Re-enrolling silently would strand the old token; make the caller be explicit.
+    return json(res, 409, { ok: false, error: 'this counter already has a Pi enrolled — pass {"replace":true} to issue a new token' });
+  }
+
+  // Prefer the Pi's real hardware serial; fall back to a deterministic one derived from
+  // the site so the device row is still uniquely identifiable without it.
+  const serial = String(p.serial || `PI-${counter.pharmacy_code}-${counter.n}`).trim();
+
+  const device = await store.createDevice({
+    serial,
+    kind: 'counter-pi',
+    site_name: `${counter.pharmacy_code} counter ${counter.n}`,
+    customer: counter.pharmacy_name || null,
+    model: p.pi_model || null,
+    // Tag it so the Pi fleet is filterable and alert rules can scope to it out of the box.
+    tags: ['counter-pi'],
+  });
+
+  const token = crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  await store.setDeviceToken(device.id, tokenHash);
+
+  const linked = await store.linkCounterPi(params.id, {
+    pi_device_id: device.id,
+    pi_hostname: p.pi_hostname || null,
+    pi_model: p.pi_model || null,
+    pi_public_key: p.pi_public_key || null,
+  });
+
+  log.info('pmr: counter Pi enrolled', { counter: params.id, serial, device: device.id });
+  return json(res, 201, {
+    ok: true,
+    counter: linked,
+    device: { id: device.id, serial: device.serial, kind: 'counter-pi' },
+    // Shown once and never recoverable — same contract as router enrolment.
+    token,
+    telemetry_url: `${config.publicBaseUrl}/telemetry`,
+  });
+}
+
+async function printersList(ctx) {
+  const { res, store, query } = ctx;
+  if (typeof store.listPrinters !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const pid = query && query.get('pharmacy_id');
+  return json(res, 200, { ok: true, printers: await store.listPrinters(pid || null) });
+}
+
+async function printerUpsert(ctx) {
+  const { res, store, body } = ctx;
+  const p = parseJsonBody(body);
+  if (!p) return json(res, 400, { ok: false, error: 'bad json' });
+  if (!p.pharmacy_id) return json(res, 400, { ok: false, error: 'pharmacy_id is required' });
+  if (!String(p.name || '').trim()) return json(res, 400, { ok: false, error: 'name is required' });
+  if (p.discovered_via && !['snmp', 'ipp', 'cups', 'manual'].includes(p.discovered_via)) {
+    return json(res, 400, { ok: false, error: 'discovered_via must be snmp, ipp, cups or manual' });
+  }
+  try {
+    return json(res, 200, { ok: true, printer: await store.upsertPrinter(p) });
+  } catch (e) {
+    if (e && e.code === '23503') return json(res, 400, { ok: false, error: 'unknown pharmacy_id or counter_id' });
+    throw e;
+  }
+}
+
+async function printerDelete(ctx) {
+  const { res, store, params } = ctx;
+  const r = await store.deletePrinter(params.id);
+  if (!r || !r.deleted) return json(res, 404, { ok: false, error: 'not found' });
+  return json(res, 200, { ok: true, ...r });
+}
+
+// POST /printers/report — a DEVICE route: the counter Pi posts what it polled on the
+// pharmacy LAN. Authenticated as the device, and the pharmacy is resolved from the
+// counter that owns that Pi, so a Pi can never write printers into another site.
+async function printersReport(ctx) {
+  const { res, store, device, body } = ctx;
+  if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
+  const p = parseJsonBody(body);
+  if (!p) return json(res, 400, { ok: false, error: 'bad json' });
+  if (!Array.isArray(p.printers)) return json(res, 400, { ok: false, error: 'printers must be an array' });
+  const counters = await store.listCounters();
+  const mine = (counters || []).find((c) => c.pi_device_id === device.id);
+  if (!mine) return json(res, 409, { ok: false, error: 'this device is not linked to a counter, so its pharmacy is unknown' });
+  return json(res, 200, { ok: true, ...(await store.reportPrinters(device.id, mine.pharmacy_id, p.printers)) });
+}
+
+// POST /wg-peers/report — the hub's collector posts `wg show dump`.
+async function wgPeersReport(ctx) {
+  const { res, store, body } = ctx;
+  const p = parseJsonBody(body);
+  if (!p) return json(res, 400, { ok: false, error: 'bad json' });
+  if (!Array.isArray(p.peers)) return json(res, 400, { ok: false, error: 'peers must be an array' });
+  return json(res, 200, { ok: true, ...(await store.reportWgPeers(p.peers)) });
+}
+
+async function wgPeersList(ctx) {
+  const { res, store } = ctx;
+  if (typeof store.listWgPeers !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  return json(res, 200, { ok: true, peers: await store.listWgPeers() });
+}
+
 // PATCH /devices/:serial  { customer?, site_name?, identity?, model?, wan_type? }
 // Operator-editable metadata. Its main job is letting the field app write across the
 // audited MikroTik→company link, since Vigilant cannot see that database — and a populated
@@ -1278,6 +1501,22 @@ module.exports = {
   tagsList,
   deviceTagsSet,
   deviceMetaSet,
+  pharmaciesList,
+  pharmacyGet,
+  pharmacyCreate,
+  pharmacyUpdate,
+  pharmacyDelete,
+  countersList,
+  counterCreate,
+  counterUpdate,
+  counterDelete,
+  counterEnrolPi,
+  wgPeersReport,
+  wgPeersList,
+  printersList,
+  printerUpsert,
+  printerDelete,
+  printersReport,
   tagRulesList,
   tagRulePreview,
   tagRuleCreate,
