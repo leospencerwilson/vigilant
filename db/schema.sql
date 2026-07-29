@@ -429,6 +429,36 @@ CREATE TABLE IF NOT EXISTS wg_peers (
 -- on `counters`). `pi_online` uses a 3-minute handshake window — WireGuard is
 -- silent when idle, but a Pi holding an RDP session handshakes well inside that,
 -- so a longer window would mask a Pi that has genuinely dropped.
+-- ── one-shot service actions for a thin client ───────────────────────────────
+-- Reboot and friends, requested from Watchman and collected on the Pi's next tick.
+--
+-- Delivery is AT-MOST-ONCE by design: pending_action is cleared the instant it is handed
+-- to the device, before the device acts on it. A reboot directive that survived delivery
+-- would be collected again by the Pi as it came back up, and the counter would reboot in a
+-- loop forever. Losing an action to a dropped response is recoverable by clicking again;
+-- a reboot loop on a pharmacy counter is not.
+ALTER TABLE counters ADD COLUMN IF NOT EXISTS pending_action     text;
+ALTER TABLE counters ADD COLUMN IF NOT EXISTS pending_action_by  text;
+ALTER TABLE counters ADD COLUMN IF NOT EXISTS pending_action_at  timestamptz;
+-- last_* is the audit trail: what was sent, and when it was picked up.
+ALTER TABLE counters ADD COLUMN IF NOT EXISTS last_action        text;
+ALTER TABLE counters ADD COLUMN IF NOT EXISTS last_action_by     text;
+ALTER TABLE counters ADD COLUMN IF NOT EXISTS last_action_at     timestamptz;
+
+-- ── which VM a thin client boots into ────────────────────────────────────────
+-- Chosen in Watchman and pushed to the Pi, instead of being baked into the kiosk
+-- launcher where changing it meant editing a file on the device.
+--
+-- Two columns rather than one: `boot_vmid` is the operator's CHOICE (the VM they picked
+-- out of discovered Proxmox inventory) and `boot_target` is the ADDRESS actually pushed.
+-- Keeping both means a VM that is rebuilt or renumbered surfaces as a disagreement,
+-- rather than silently sending a counter to whatever now answers on that address.
+ALTER TABLE counters ADD COLUMN IF NOT EXISTS boot_vmid       int;
+ALTER TABLE counters ADD COLUMN IF NOT EXISTS boot_target     text;
+ALTER TABLE counters ADD COLUMN IF NOT EXISTS boot_set_by     text;
+ALTER TABLE counters ADD COLUMN IF NOT EXISTS boot_set_at     timestamptz;
+ALTER TABLE counters ADD COLUMN IF NOT EXISTS boot_applied_at timestamptz;
+
 CREATE OR REPLACE VIEW counters_v AS
 SELECT c.id, c.pharmacy_id,
        p.code AS pharmacy_code, p.name AS pharmacy_name, p.idx AS pharmacy_idx, p.vlan,
@@ -465,7 +495,30 @@ SELECT c.id, c.pharmacy_id,
        -- Peripherals the agent actually found, kept separate from the operator's
        -- `peripherals` column so a detection gap never silently overwrites a human's
        -- assessment (and vice versa).
-       ds.raw -> 'peripherals' AS pi_peripherals_detected
+       ds.raw -> 'peripherals' AS pi_peripherals_detected,
+       -- Which VM this thin client is told to boot into, and whether the Pi has taken it.
+       -- Deliberately NOT joined to proxmox_vms for the VM's name: that table is created
+       -- later in this file, so a fresh bootstrap would fail on the forward reference.
+       -- The caller already loads discovered inventory for the picker and maps vmid->name.
+       c.boot_vmid, c.boot_target, c.boot_set_by, c.boot_set_at, c.boot_applied_at,
+       -- The Pi reports the target it is CONFIGURED with separately from the one it is
+       -- currently CONNECTED to, because those legitimately differ: on the Cloudflare
+       -- fallback the live target is 127.0.0.1:33389, so comparing the connected address
+       -- against the desired VM would show a permanent false mismatch on any site whose
+       -- WireGuard path is down.
+       ds.raw -> 'rdp' ->> 'configured_target' AS pi_configured_target,
+       CASE
+         WHEN c.boot_target IS NULL THEN 'unset'
+         WHEN ds.raw -> 'rdp' ->> 'configured_target' IS NULL THEN 'pending'
+         WHEN split_part(ds.raw -> 'rdp' ->> 'configured_target', ':', 1)
+              = split_part(c.boot_target, ':', 1) THEN 'applied'
+         ELSE 'pending'
+       END AS boot_state,
+       -- Appended for the same reason as everything above it: CREATE OR REPLACE VIEW can
+       -- only ADD columns at the END, so placing these next to the boot columns they relate
+       -- to fails with "cannot change name of view column".
+       c.pending_action, c.pending_action_by, c.pending_action_at,
+       c.last_action, c.last_action_by, c.last_action_at
   FROM counters c
   JOIN pharmacies p   ON p.id = c.pharmacy_id
   LEFT JOIN devices d ON d.id = c.pi_device_id

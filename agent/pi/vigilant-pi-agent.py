@@ -25,6 +25,7 @@ Two hard-won details:
     fast enough to justify it.
 """
 
+import glob
 import json
 import os
 import re
@@ -369,6 +370,50 @@ def cups_jobs():
     }
 
 
+def sysfs_card_reader():
+    """Find a USB smartcard reader by interface class rather than by product name.
+
+    Returns (present, name). `present` is None when sysfs cannot be read at all, so the
+    caller can fall back to lsusb instead of reporting a confident "absent".
+
+    USB class 0x0b is Chip/SmartCard. A combined device like the pilot's Dell keyboard
+    exposes class 03 (HID) on one interface and 0b on another, so the interface — not the
+    device — is what has to be inspected. CCID readers usually have NO kernel driver bound,
+    because pcscd drives them through libusb; absence of a driver is not a fault here.
+    """
+    try:
+        ifaces = glob.glob("/sys/bus/usb/devices/*/bInterfaceClass")
+    except Exception:
+        return None, None
+    if not ifaces:
+        return None, None
+    for path in sorted(ifaces):
+        try:
+            with open(path) as fh:
+                if fh.read().strip().lower() != "0b":
+                    continue
+        except Exception:
+            continue
+        # …:1.1 is an interface; its parent directory is the device holding the name files.
+        dev = os.path.dirname(path).rsplit(":", 1)[0]
+        parts = []
+        for part in ("manufacturer", "product"):
+            try:
+                with open(os.path.join(dev, part)) as fh:
+                    parts.append(fh.read().strip())
+            except Exception:
+                parts.append("")
+        vendor, product = parts[0], parts[1]
+        # Vendors routinely repeat themselves in the product string ("Dell" + "Dell Smart
+        # Card Reader Keyboard"), which reads as a typo in the UI.
+        if product and vendor and product.lower().startswith(vendor.lower()):
+            name = product
+        else:
+            name = " ".join(p for p in (vendor, product) if p)
+        return True, (name[:120] or None)
+    return False, None
+
+
 def peripherals(rdp_argv=""):
     """What is actually plugged into this counter.
 
@@ -381,12 +426,35 @@ def peripherals(rdp_argv=""):
     out = {}
     lsusb = run(["lsusb"]) if have("lsusb") else ""
 
-    # Smartcard: readers advertise USB class CCID, and the common NHS-approved vendors are
-    # recognisable by name when the class string is absent.
-    reader = bool(re.search(r"CCID|smart\s*card|Gemalto|Identiv|SCM Micro|OMNIKEY|HID Global|ACS\b|Cherry", lsusb, re.I))
-    out["smartcard_reader"] = "present" if reader else ("absent" if lsusb else "unknown")
-    pcscd = run(["systemctl", "is-active", "pcscd"]).strip()
-    out["smartcard_daemon"] = pcscd or "unknown"
+    # Smartcard reader: sysfs is authoritative — a USB interface with bInterfaceClass 0b is
+    # a Chip/SmartCard interface by definition. Name-matching lsusb is kept only as a
+    # fallback, because it both misses unbranded readers and false-positives on keyboards
+    # that merely say "SmartCard" (the pilot's Dell SK-3205 is exactly that combined device).
+    # Reading sysfs also needs no PC/SC client, so it works from this root systemd unit
+    # without a polkit grant, which enumerating readers via pcscd would require.
+    reader, reader_name = sysfs_card_reader()
+    if reader is None:
+        matched = re.search(r"CCID|smart\s*card|Gemalto|Identiv|SCM Micro|OMNIKEY|HID Global|ACS\b|Cherry", lsusb, re.I)
+        out["smartcard_reader"] = "present" if matched else ("absent" if lsusb else "unknown")
+    else:
+        out["smartcard_reader"] = "present" if reader else "absent"
+    if reader_name:
+        out["smartcard_reader_name"] = reader_name
+
+    # pcscd is SOCKET-ACTIVATED: systemd holds /run/pcscd/pcscd.comm and only spawns the
+    # daemon when a client connects, so `is-active: inactive` is the normal idle state and
+    # alerting on it would fire every time nobody is using a card. What actually matters is
+    # whether it can be started on demand, so the socket is reported as the healthy case and
+    # a missing unit is distinguished from one that is installed but broken — `is-active`
+    # alone answers "inactive" for a package that was never installed.
+    if run(["systemctl", "show", "-p", "LoadState", "--value", "pcscd"]).strip() == "not-found":
+        out["smartcard_daemon"] = "absent"
+    elif run(["systemctl", "is-active", "pcscd"]).strip() == "active":
+        out["smartcard_daemon"] = "active"
+    elif run(["systemctl", "is-enabled", "pcscd.socket"]).strip() == "enabled":
+        out["smartcard_daemon"] = "socket-ready"
+    else:
+        out["smartcard_daemon"] = "inactive"
     # Whether the kiosk is configured to pass it through at all.
     out["smartcard_redirected"] = "/smartcard" in rdp_argv
 
@@ -429,6 +497,29 @@ def wg_state():
     return peers or None
 
 
+# ── which VM this thin client boots into ────────────────────────────────────
+# Watchman owns the choice; this file is the handoff to the kiosk launcher, which re-reads
+# it on every reconnect. A file rather than an env var so the value is visible to anyone
+# looking at the device, and so nothing needs restarting to read it.
+#
+# Under /var/lib rather than /etc for two reasons: it is server-managed state rather than
+# hand-edited configuration (which is what /var/lib is FOR), and this unit runs with
+# ProtectSystem=full, which mounts /etc read-only inside the service's namespace.
+TARGET_FILE = "/var/lib/wcn/rdp-target"
+
+
+def read_configured_target():
+    """The target this Pi is SET UP to use — reported separately from the one it is
+    currently connected to, because those legitimately differ: on the Cloudflare fallback
+    the live target is 127.0.0.1:33389, so comparing the connected address against the
+    chosen VM would show a permanent false mismatch on any site whose WireGuard is down."""
+    try:
+        with open(TARGET_FILE) as fh:
+            return fh.read().strip() or None
+    except Exception:
+        return None
+
+
 def rdp_session():
     """The whole point of the counter: is the kiosk RDP session actually up, and pointed at
     the right server? A Pi that is online, warm and tunnelled but has no session is still a
@@ -455,8 +546,12 @@ def rdp_session():
         # (which contains /u: and /p:).
         flags = " ".join(f for f in ("/smartcard", "/printer", "/drive", "/clipboard")
                          if f in last_argv)
-        return {"running": True, "client": proc, "target": target, "redirect": flags or None}
-    return {"running": False, "client": None, "target": None, "redirect": None}
+        return {"running": True, "client": proc, "target": target, "redirect": flags or None,
+                "configured_target": read_configured_target()}
+    # Reported even when nothing is running: "configured for VM x but not connected" is a
+    # more useful state than a row of nulls.
+    return {"running": False, "client": None, "target": None, "redirect": None,
+            "configured_target": read_configured_target()}
 
 
 # ── printers ────────────────────────────────────────────────────────────────
@@ -785,11 +880,89 @@ def post(url, token, path, body, timeout=15):
         return r.status, r.read().decode()[:400]
 
 
+def apply_boot_target(boot):
+    """Adopt the VM Watchman says this thin client should boot into.
+
+    The value is validated to a bare IPv4:port before it is written, because the launcher
+    interpolates it into BOTH /dev/tcp/<host>/<port> and xfreerdp's /v: argument. A target
+    carrying shell metacharacters would otherwise be a command-injection route from the
+    monitoring server into every counter in the estate, so this is a hard allowlist rather
+    than an escape.
+
+    Applying restarts the kiosk session, which reconnects in about 8 seconds. Switching
+    which VM a counter uses is a deliberate act, so it is done immediately rather than
+    deferred — but it IS a visible interruption to anyone mid-transaction.
+    """
+    if not isinstance(boot, dict):
+        return
+    target = boot.get("target")
+    if not isinstance(target, str):
+        return
+    target = target.strip()
+    if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}", target):
+        print(f"vigilant-pi-agent: refusing malformed boot target {target!r}", flush=True)
+        return
+    if read_configured_target() == target:
+        return                      # already where we should be; nothing to disturb
+    try:
+        os.makedirs(os.path.dirname(TARGET_FILE), exist_ok=True)
+        with open(TARGET_FILE, "w") as fh:
+            fh.write(target + "\n")
+        # The launcher runs as the kiosk user and has to read this.
+        os.chmod(TARGET_FILE, 0o644)
+    except Exception as e:
+        print(f"vigilant-pi-agent: cannot write {TARGET_FILE}: {e}", flush=True)
+        return
+    print(f"vigilant-pi-agent: boot target -> {target}, restarting kiosk", flush=True)
+    run(["systemctl", "restart", "getty@tty1"], timeout=25)
+
+
+# The service actions this device will carry out, and the command for each. The server
+# sends only a NAME which is looked up here — it never sends a command line — so a
+# compromised or mistaken server cannot turn this into arbitrary execution on a counter.
+# An unrecognised name is logged and ignored.
+ACTIONS = {
+    "reboot": ["systemctl", "reboot"],
+    # Cheaper than a reboot and fixes most "the screen is stuck" calls: drops the RDP
+    # session and reconnects in about 8 seconds.
+    "restart-kiosk": ["systemctl", "restart", "getty@tty1"],
+    "restart-agent": ["systemctl", "restart", "vigilant-agent"],
+}
+
+
+def run_action(name):
+    """Carry out a one-shot action the server handed us.
+
+    The server has ALREADY cleared it before sending, so this runs at most once per
+    request — deliberately, because a reboot directive that survived delivery would be
+    collected again as the Pi came back up and the counter would reboot forever.
+    """
+    if not isinstance(name, str):
+        return
+    cmd = ACTIONS.get(name.strip())
+    if not cmd:
+        print(f"vigilant-pi-agent: ignoring unknown action {name!r}", flush=True)
+        return
+    print(f"vigilant-pi-agent: service action '{name}' -> {' '.join(cmd)}", flush=True)
+    run(cmd, timeout=25)
+
+
 def tick(conf, do_printers):
     """One report. Returns the interval the SERVER asked for, if it gave one."""
     url, token = conf["VIGILANT_URL"], conf["VIGILANT_TOKEN"]
     status, body = post(url, token, "/telemetry", build_payload(conf))
     print(f"telemetry {status} {body}", flush=True)
+
+    # Kept in its own guard: a malformed or unexpected boot directive must not stop the
+    # interval negotiation below, or a bad push would also desynchronise the poll cadence.
+    try:
+        parsed = json.loads(body)
+        apply_boot_target(parsed.get("boot"))
+        # Deliberately after the boot target: if both arrive on the same tick, the device
+        # should already be pointed at the right VM before it is restarted or rebooted.
+        run_action(parsed.get("action"))
+    except Exception as e:
+        print(f"vigilant-pi-agent: directive ignored ({type(e).__name__})", flush=True)
 
     if do_printers:
         printers = collect_printers(conf)

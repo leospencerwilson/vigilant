@@ -85,7 +85,10 @@ function makePgStore(poolOrConfig) {
     return one(
       // d.identity is selected so the telemetry handler can tell whether the agent's
       // reported /system identity has actually CHANGED, and skip the write when it hasn't.
-      `SELECT d.id, d.serial, d.identity, d.poll_interval_s, d.poll_until, d.agent_version
+      // d.kind is selected so the telemetry handler can tell a counter Pi from a router
+      // without a second query — it decides whether a boot-target directive applies.
+      `SELECT d.id, d.serial, d.identity, d.poll_interval_s, d.poll_until, d.agent_version,
+              d.kind
          FROM enrollment_tokens t
          JOIN devices d ON d.id = t.device_id
         WHERE t.token_hash = $1
@@ -1739,6 +1742,102 @@ function makePgStore(poolOrConfig) {
     return updated ? getCounter(counterId) : null;
   }
 
+  // Queue a one-shot service action. Overwrites any undelivered one rather than building a
+  // backlog: the operator's most recent intent is the only one that makes sense to run.
+  async function setCounterAction(id, f) {
+    const r = f || {};
+    const updated = await one(
+      `UPDATE counters SET pending_action = $2, pending_action_by = $3, pending_action_at = now()
+        WHERE id = $1 RETURNING id`,
+      [id, r.action, nz(r.by)]
+    );
+    return updated ? getCounter(id) : null;
+  }
+
+  // Hand over the pending action AND clear it in the same statement.
+  //
+  // The clear is the whole point: a reboot directive still pending when the Pi came back up
+  // would be collected again, and the counter would reboot forever. RHS expressions see the
+  // pre-UPDATE row, so last_action captures what is being handed out.
+  async function takeCounterAction(deviceId) {
+    return one(
+      `UPDATE counters SET
+         pending_action = NULL,
+         last_action    = pending_action,
+         last_action_by = pending_action_by,
+         last_action_at = now()
+       WHERE pi_device_id = $1 AND pending_action IS NOT NULL
+       RETURNING last_action AS action`,
+      [deviceId]
+    );
+  }
+
+  // ── which VM a thin client boots into ──────────────────────────────────────
+  // The operator picks a VM; the ADDRESS is resolved HERE rather than in the browser, so
+  // the UI cannot push a counter at an address the platform's own numbering disagrees
+  // with. Resolution follows the only two conventions the gateway actually implements:
+  // the PMR server at .10 (pharmacies.server_ip), and counter desktop n at .20+n.
+  //
+  // A vmid matching neither is REFUSED rather than guessed at — it means the VM was
+  // discovered but never registered to this pharmacy, which is the step being skipped.
+  async function setCounterBootTarget(id, f) {
+    const r = f || {};
+    const updated = await one(
+      `WITH ctx AS (
+         SELECT c.id, c.pharmacy_id, p.idx, p.server_ip, p.srv_vmid
+           FROM counters c JOIN pharmacies p ON p.id = c.pharmacy_id
+          WHERE c.id = $1
+       ), resolved AS (
+         SELECT ctx.id,
+                CASE WHEN ctx.srv_vmid = $2 THEN ctx.server_ip
+                     WHEN sib.id IS NOT NULL THEN '10.' || ctx.idx || '.0.' || (20 + sib.n)
+                END AS ip
+           FROM ctx
+           LEFT JOIN counters sib ON sib.pharmacy_id = ctx.pharmacy_id AND sib.vmid = $2
+       )
+       UPDATE counters c SET
+         boot_vmid   = $2,
+         boot_target = resolved.ip || ':3389',
+         boot_set_by = $3,
+         boot_set_at = now(),
+         -- Cleared deliberately: until the Pi confirms the NEW target it has not applied it,
+         -- and leaving the old timestamp would read as "already done".
+         boot_applied_at = NULL
+       FROM resolved
+       WHERE c.id = resolved.id AND resolved.ip IS NOT NULL
+       RETURNING c.id`,
+      [id, r.vmid, nz(r.by)]
+    );
+    return updated ? getCounter(id) : null;
+  }
+
+  // What to tell this Pi on its next tick, plus the confirmation stamp.
+  //
+  // The stamp is computed from the state row the telemetry handler has ALREADY written, so
+  // this needs nothing from the payload. Guarded on boot_applied_at IS NULL so the hot path
+  // writes once per change rather than on every 30 s tick.
+  //
+  // Compares the CONFIGURED target, never the connected one: a Pi on the Cloudflare
+  // fallback is connected to 127.0.0.1:33389, which would never match a chosen VM.
+  async function getCounterBootDirective(deviceId) {
+    await q(
+      `UPDATE counters c SET boot_applied_at = now()
+         FROM device_state ds
+        WHERE ds.device_id = c.pi_device_id
+          AND c.pi_device_id = $1
+          AND c.boot_applied_at IS NULL
+          AND c.boot_target IS NOT NULL
+          AND split_part(ds.raw -> 'rdp' ->> 'configured_target', ':', 1)
+              = split_part(c.boot_target, ':', 1)`,
+      [deviceId]
+    );
+    return one(
+      `SELECT boot_vmid AS vmid, boot_target AS target
+         FROM counters WHERE pi_device_id = $1 AND boot_target IS NOT NULL`,
+      [deviceId]
+    );
+  }
+
   // ── observed WireGuard state, reported by a collector on the hub ───────────
   async function reportWgPeers(peers) {
     const list = Array.isArray(peers) ? peers : [];
@@ -1980,6 +2079,10 @@ function makePgStore(poolOrConfig) {
     updateCounter,
     deleteCounter,
     linkCounterPi,
+    setCounterBootTarget,
+    setCounterAction,
+    takeCounterAction,
+    getCounterBootDirective,
     reportWgPeers,
     listWgPeers,
     listTags,

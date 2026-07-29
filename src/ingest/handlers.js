@@ -426,6 +426,24 @@ async function telemetryIngest(ctx) {
     if (confirmed && confirmed.id) confirm = confirmed.id;
   }
 
+  // 10c. which VM this thin client should boot into. Only counter Pis carry one, so the
+  // lookup stays off the router hot path entirely. The desired target is sent on EVERY
+  // tick rather than only on change: that makes it self-healing, so a launcher edited by
+  // hand on the device is corrected back to what Watchman says.
+  let boot = null;
+  if (device.kind === 'counter-pi' && typeof store.getCounterBootDirective === 'function') {
+    const want = await store.getCounterBootDirective(device.id);
+    if (want && want.target) boot = { target: want.target, vmid: want.vmid };
+  }
+
+  // 10d. a one-shot service action, if the operator queued one. Collected at most once —
+  // see takeCounterAction for why a surviving reboot directive would be a loop.
+  let action = null;
+  if (device.kind === 'counter-pi' && typeof store.takeCounterAction === 'function') {
+    const taken = await store.takeCounterAction(device.id);
+    if (taken && taken.action) action = taken.action;
+  }
+
   // 11. respond with the documented control shape. agent_version is the CURRENT
   // server-side script version (so a device on an older version self-updates via the
   // bootstrap); fall back to config then to the device's recorded version.
@@ -448,6 +466,10 @@ async function telemetryIngest(ctx) {
   // Only include "confirm" when there IS an affirmative server confirmation, so the agent's
   // string-extracting parser never finds a spurious key.
   if (confirm) response.confirm = confirm;
+  // Same reasoning as "confirm": absent rather than null, so the agent's parser cannot
+  // read a spurious key.
+  if (boot) response.boot = boot;
+  if (action) response.action = action;
   return json(res, 200, response);
 }
 
@@ -1249,6 +1271,63 @@ async function counterUpdate(ctx) {
   return json(res, 200, { ok: true, counter: updated });
 }
 
+// The actions a thin client will carry out. An allowlist, not a command channel: the server
+// sends a NAME and the agent maps it to a command locally, so nothing here can ever become
+// arbitrary execution on a pharmacy counter.
+const PI_ACTIONS = ['reboot', 'restart-kiosk', 'restart-agent'];
+
+// POST /counters/:id/action  { action }
+async function counterAction(ctx) {
+  const { res, store, log, body, params } = ctx;
+  const p = parseJsonBody(body);
+  if (!p) return json(res, 400, { ok: false, error: 'bad json' });
+  const action = typeof p.action === 'string' ? p.action.trim() : '';
+  if (!PI_ACTIONS.includes(action)) {
+    return json(res, 400, { ok: false, error: `action must be one of ${PI_ACTIONS.join(', ')}` });
+  }
+  const counter = await store.getCounter(params.id);
+  if (!counter) return json(res, 404, { ok: false, error: 'counter not found' });
+  if (!counter.pi_device_id) {
+    return json(res, 409, { ok: false, error: 'this counter has no thin client enrolled, so there is nothing to send the action to' });
+  }
+  const by = typeof p.by === 'string' && p.by.trim() ? p.by.trim() : 'watchman';
+  const updated = await store.setCounterAction(params.id, { action, by });
+  if (!updated) return json(res, 404, { ok: false, error: 'not found' });
+  log.warn('pmr: service action queued for thin client', { counter: params.id, action, by });
+  return json(res, 200, { ok: true, counter: updated });
+}
+
+// POST /counters/:id/boot-target  { vmid }
+// Which VM this counter's thin client boots into, chosen in Watchman instead of by editing
+// the kiosk launcher on the device. The address is resolved server-side from the vmid; an
+// unregistered VM is refused rather than guessed at.
+async function counterSetBootTarget(ctx) {
+  const { res, store, log, body, params } = ctx;
+  const p = parseJsonBody(body);
+  if (!p) return json(res, 400, { ok: false, error: 'bad json' });
+  const vmid = Number(p.vmid);
+  if (!Number.isInteger(vmid) || vmid <= 0) {
+    return json(res, 400, { ok: false, error: 'vmid must be a positive integer' });
+  }
+  const counter = await store.getCounter(params.id);
+  if (!counter) return json(res, 404, { ok: false, error: 'counter not found' });
+
+  const by = typeof p.by === 'string' && p.by.trim() ? p.by.trim() : 'watchman';
+  const updated = await store.setCounterBootTarget(params.id, { vmid, by });
+  if (!updated) {
+    return json(res, 409, {
+      ok: false,
+      error: `vm ${vmid} is not registered to ${counter.pharmacy_code} as either its PMR server or one of its counter desktops, so its address is unknown — register it first`,
+    });
+  }
+  if (!updated.pi_device_id) {
+    // Worth saying out loud: the choice is stored, but nothing will collect it yet.
+    log.info('pmr: boot target set on a counter with no Pi enrolled', { counter: params.id, vmid });
+  }
+  log.info('pmr: boot target set', { counter: params.id, vmid, target: updated.boot_target });
+  return json(res, 200, { ok: true, counter: updated });
+}
+
 async function counterDelete(ctx) {
   const { res, store, params } = ctx;
   const r = await store.deleteCounter(params.id);
@@ -1535,6 +1614,8 @@ module.exports = {
   countersList,
   counterCreate,
   counterUpdate,
+  counterSetBootTarget,
+  counterAction,
   counterDelete,
   counterEnrolPi,
   wgPeersReport,

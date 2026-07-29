@@ -318,6 +318,21 @@ function createServer({ store, config: cfg }) {
         ctx.body = await readBody(req);
         return handlers.counterEnrolPi(ctx);
       }
+      const mCounterAction = /^\/counters\/([^/]+)\/action$/.exec(pathname);
+      if (mCounterAction && method === 'POST') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mCounterAction[1]) };
+        ctx.body = await readBody(req);
+        return handlers.counterAction(ctx);
+      }
+      // Boot target BEFORE /counters/:id, same specificity reason as enrol-pi.
+      const mCounterBoot = /^\/counters\/([^/]+)\/boot-target$/.exec(pathname);
+      if (mCounterBoot && method === 'POST') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mCounterBoot[1]) };
+        ctx.body = await readBody(req);
+        return handlers.counterSetBootTarget(ctx);
+      }
       const mCounter = /^\/counters\/([^/]+)$/.exec(pathname);
       if (mCounter && (method === 'PUT' || method === 'PATCH')) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });

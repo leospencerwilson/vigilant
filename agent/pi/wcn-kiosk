@@ -1,0 +1,83 @@
+#!/bin/bash
+# Fullscreen RDP session to pmr-rx54554-srv. Two transports, preferred first:
+#
+#   1. WireGuard  — direct to 10.1.0.10:3389 over wg0 (peer 10.255.0.10/32).
+#                   ~20 ms RTT. Production path per network-design.md.
+#   2. Cloudflare — 127.0.0.1:33389, an `access tcp` proxy authenticated with an
+#                   Access service token. ~12 ms extra and a proxy hop, but needs
+#                   no router change, so it is the fallback and the only option at
+#                   a site where UDP cannot be forwarded.
+#
+# Loops forever, re-evaluating the transport each time, so the desktop returns by
+# itself after a server reboot, a link drop, or a user logging off.
+#
+# Printing: the Pi's CUPS queue `brother-hl8260` (driverless IPP to the Brother at
+# 192.168.88.221) is redirected into the session. Print jobs never cross either
+# transport — CUPS delivers on the site LAN.
+#
+# Smartcard: the Dell SK-3205 keyboard's integrated CCID reader (413c:2101) is redirected
+# so NHS Spine authentication can happen inside the hosted session. Unlike printing, this
+# DOES cross the transport — every APDU round-trips to the PMR server, so smartcard login
+# is the one operation whose feel depends on the tunnel rather than the LAN.
+# Requires pcscd on the Pi; the kiosk's tty1 seat0 session is what authorises it to pcscd.
+#
+# Credentials: /etc/wcn-rdp.creds (root 0640). FreeRDP masks the password in `ps`.
+set -u
+. /etc/wcn-rdp.creds
+
+# Which VM this counter boots into is chosen in Watchman and pushed here by the Vigilant
+# agent; this file is the handoff. DEFAULT_DIRECT is the fallback for a Pi that has never
+# been told (or whose file was lost), and keeps the pre-Watchman behaviour of going straight
+# to the PMR server. Re-read on every reconnect, so a pushed change needs no edit here.
+TARGET_FILE="/var/lib/wcn/rdp-target"
+DEFAULT_DIRECT="10.1.0.10:3389"
+FALLBACK="127.0.0.1:33389"
+
+xset s off; xset -dpms; xset s noblank      # a counter screen must never blank
+
+read_direct() {
+    # Anything that is not a bare IPv4:port is IGNORED rather than used. This value is
+    # interpolated into /dev/tcp/<host>/<port> and into xfreerdp's /v:, so accepting
+    # arbitrary text here would turn the monitoring server into a command-injection route
+    # onto every counter. The agent validates too; this is the second lock on the same door.
+    if [ -r "$TARGET_FILE" ]; then
+        t=$(tr -d ' \t\r\n' < "$TARGET_FILE")
+        case "$t" in
+            *[!0-9.:]* | "") ;;                 # malformed — fall through to the default
+            *) echo "$t"; return ;;
+        esac
+    fi
+    echo "$DEFAULT_DIRECT"
+}
+
+pick_transport() {
+    d=$(read_direct)
+    h=${d%%:*}
+    p=${d##*:}
+    if (exec 3<>/dev/tcp/"$h"/"$p") 2>/dev/null; then echo "$d"; return; fi
+    if (exec 3<>/dev/tcp/127.0.0.1/33389) 2>/dev/null; then echo "$FALLBACK"; return; fi
+    echo ""
+}
+
+while true; do
+    TARGET=$(pick_transport)
+    while [ -z "$TARGET" ]; do sleep 3; TARGET=$(pick_transport); done
+    echo "$(date -Is) connecting via $TARGET" >> /var/log/wcn-kiosk.log
+
+    xfreerdp3 \
+        /v:"$TARGET" \
+        /u:"$RDP_USER" \
+        /p:"$RDP_PASS" \
+        /cert:ignore \
+        /f \
+        +auto-reconnect /auto-reconnect-max-retries:0 \
+        /network:auto \
+        +clipboard \
+        /printer:brother-hl8260,"MS Publisher Imagesetter",default \
+        /smartcard \
+        -themes -wallpaper \
+        /bpp:16 \
+        /log-level:WARN 2>>/var/log/wcn-kiosk.log
+
+    sleep 3
+done
