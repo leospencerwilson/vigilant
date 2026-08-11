@@ -21,6 +21,11 @@
 # is the one operation whose feel depends on the tunnel rather than the LAN.
 # Requires pcscd on the Pi; the kiosk's tty1 seat0 session is what authorises it to pcscd.
 #
+# Session options (smartcard / printing / clipboard / colour depth / screen blanking) are
+# chosen in Watchman and pushed here by the Vigilant agent as /var/lib/wcn/kiosk.conf.
+# Everything below falls back to the behaviour this script had before it could read that
+# file, so an absent or corrupt one can never leave a thin client unable to start a session.
+#
 # Credentials: /etc/wcn-rdp.creds (root 0640). FreeRDP masks the password in `ps`.
 set -u
 . /etc/wcn-rdp.creds
@@ -32,8 +37,6 @@ set -u
 TARGET_FILE="/var/lib/wcn/rdp-target"
 DEFAULT_DIRECT="10.1.0.10:3389"
 FALLBACK="127.0.0.1:33389"
-
-xset s off; xset -dpms; xset s noblank      # a counter screen must never blank
 
 read_direct() {
     # Anything that is not a bare IPv4:port is IGNORED rather than used. This value is
@@ -59,10 +62,124 @@ pick_transport() {
     echo ""
 }
 
+# --- kiosk.conf handling: parse, validate, build flags -----------------------------------
+# Kept as one self-contained block of functions so it can be extracted and unit-tested
+# without running the session loop.
+KIOSK_CONF="/var/lib/wcn/kiosk.conf"
+
+# The defaults ARE this script's previous hardcoded behaviour: smartcard on, printing on,
+# clipboard on, 16bpp, never blank. Every fallback path lands here, because a thin client
+# that will not start a session is a closed pharmacy counter — far worse than one running
+# with the wrong colour depth.
+DEF_SMARTCARD=1
+DEF_PRINTER=1
+DEF_CLIPBOARD=1
+DEF_BPP=16
+DEF_BLANK=0
+
+conf_get() {
+    # conf_get KEY -> the raw value of the last matching KEY= line, or nothing.
+    #
+    # The file is PARSED, never sourced. Its contents come from the monitoring server via the
+    # agent, and `.` would EXECUTE anything that ended up in there — the same reasoning as
+    # read_direct's allowlist above. The agent validates before writing and every validator
+    # below checks again, because this is the side that turns the value into xfreerdp argv.
+    [ -r "$KIOSK_CONF" ] || return 0
+    local key="$1" line out=""
+    # `|| [ -n "$line" ]` so a final line with no trailing newline (a truncated write) is
+    # still considered rather than silently dropped.
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line//[[:space:]]/}          # values are digits only, so this is safe
+        case "$line" in
+            "$key="*) out=${line#*=}; out=${out%%#*} ;;
+        esac
+    done < "$KIOSK_CONF"
+    printf '%s' "$out"
+}
+
+conf_bool() {
+    # conf_bool KEY DEFAULT -> 1 or 0. Only the exact strings 1 and 0 are accepted;
+    # "true", "yes", "" and anything else fall back to the default rather than being guessed.
+    case "$(conf_get "$1")" in
+        1) echo 1 ;;
+        0) echo 0 ;;
+        *) echo "$2" ;;
+    esac
+}
+
+conf_bpp() {
+    # A closed enum, not a range: FreeRDP takes other depths but only these three are offered
+    # in Watchman, and widening the set here would let a value the UI cannot produce through.
+    case "$(conf_get RDP_BPP)" in
+        16) echo 16 ;;
+        24) echo 24 ;;
+        32) echo 32 ;;
+        *) echo "$DEF_BPP" ;;
+    esac
+}
+
+conf_blank_min() {
+    # 0..120 inclusive. Rejects empty, negative, non-numeric and out-of-range values, so
+    # nothing that has not passed a numeric check ever reaches the `xset` arithmetic below.
+    local v
+    v=$(conf_get BLANK_AFTER_MIN)
+    case "$v" in
+        "" | *[!0-9]*) echo "$DEF_BLANK"; return ;;
+    esac
+    if [ "$v" -le 120 ]; then echo "$v"; else echo "$DEF_BLANK"; fi
+}
+
+read_settings() {
+    SMARTCARD=$(conf_bool RDP_SMARTCARD "$DEF_SMARTCARD")
+    PRINTER=$(conf_bool RDP_PRINTER "$DEF_PRINTER")
+    CLIPBOARD=$(conf_bool RDP_CLIPBOARD "$DEF_CLIPBOARD")
+    BPP=$(conf_bpp)
+    BLANK=$(conf_blank_min)
+}
+
+apply_blanking() {
+    # 0 means NEVER blank, which is what every counter does today: a screen that has gone
+    # black looks like a dead thin client to the person standing at it. Non-zero blanks after
+    # N minutes and puts DPMS on the same timer, so the panel actually sleeps.
+    if [ "$1" = 0 ]; then
+        xset s off; xset -dpms; xset s noblank
+    else
+        local s=$(( $1 * 60 ))
+        xset s "$s" "$s"; xset +dpms; xset dpms "$s" "$s" "$s"
+    fi
+}
+
+build_opts() {
+    # The conditional half of the xfreerdp command line. An all-defaults (or missing)
+    # kiosk.conf reproduces exactly the flags this script used to hardcode, in the same
+    # relative order; /bpp: is emitted from here rather than after -themes/-wallpaper, which
+    # FreeRDP does not care about.
+    OPTS=()
+    # Explicitly negated rather than omitted, so the result does not depend on whichever
+    # default this FreeRDP build was compiled with.
+    if [ "$CLIPBOARD" = 1 ]; then OPTS+=( +clipboard ); else OPTS+=( -clipboard ); fi
+    # Device redirections have no negative form: off means the flag is absent. The queue name
+    # and its arguments are byte-identical to the pre-settings version — the printer is
+    # driverless IPP and those two extra fields are what makes it work.
+    if [ "$PRINTER" = 1 ]; then
+        OPTS+=( /printer:brother-hl8260,"MS Publisher Imagesetter",default )
+    fi
+    if [ "$SMARTCARD" = 1 ]; then OPTS+=( /smartcard ); fi
+    OPTS+=( /bpp:"$BPP" )
+}
+# --- end kiosk.conf handling -------------------------------------------------------------
+
 while true; do
+    # Re-read on every pass, exactly like the target: a setting pushed from Watchman is then
+    # picked up by the next reconnect even if the agent's kiosk restart never landed.
+    read_settings
+    apply_blanking "$BLANK"
+    build_opts
+
     TARGET=$(pick_transport)
     while [ -z "$TARGET" ]; do sleep 3; TARGET=$(pick_transport); done
-    echo "$(date -Is) connecting via $TARGET" >> /var/log/wcn-kiosk.log
+    # No credential is ever logged; OPTS holds only redirection and display switches.
+    echo "$(date -Is) connecting via $TARGET [${OPTS[*]} blank:${BLANK}m]" >> /var/log/wcn-kiosk.log
 
     xfreerdp3 \
         /v:"$TARGET" \
@@ -72,11 +189,8 @@ while true; do
         /f \
         +auto-reconnect /auto-reconnect-max-retries:0 \
         /network:auto \
-        +clipboard \
-        /printer:brother-hl8260,"MS Publisher Imagesetter",default \
-        /smartcard \
+        "${OPTS[@]}" \
         -themes -wallpaper \
-        /bpp:16 \
         /log-level:WARN 2>>/var/log/wcn-kiosk.log
 
     sleep 3

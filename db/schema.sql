@@ -358,7 +358,7 @@ CREATE TABLE IF NOT EXISTS pharmacies (
     idx          int         NOT NULL UNIQUE CHECK (idx BETWEEN 1 AND 154),
     name         text        NOT NULL,
     pmr_system   text        NOT NULL DEFAULT 'proscript'
-                             CHECK (pmr_system IN ('proscript', 'titan', 'other')),
+                             CHECK (pmr_system IN ('proscript', 'pharmacy_manager', 'nexphase', 'analyst', 'titan', 'rxweb', 'other')),
     status       text        NOT NULL DEFAULT 'planned'
                              CHECK (status IN ('planned', 'building', 'live', 'suspended', 'decommissioned')),
     proxmox_node text,
@@ -373,12 +373,48 @@ CREATE TABLE IF NOT EXISTS pharmacies (
     gateway_ip text GENERATED ALWAYS AS ('10.' || idx || '.0.1') STORED,
     server_ip  text GENERATED ALWAYS AS ('10.' || idx || '.0.10') STORED,
     dhcp_from  text GENERATED ALWAYS AS ('10.' || idx || '.0.100') STORED,
-    dhcp_to    text GENERATED ALWAYS AS ('10.' || idx || '.0.149') STORED
+    dhcp_to    text GENERATED ALWAYS AS ('10.' || idx || '.0.254') STORED
 );
+
+
+
+-- Widen the DHCP pool to the top of the /24 (.100-.254); see derive() in the UI.
+DO $mig$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'vigilant' AND table_name = 'pharmacies'
+       AND column_name = 'dhcp_to' AND generation_expression LIKE '%.0.149%'
+  ) THEN
+    ALTER TABLE pharmacies DROP COLUMN dhcp_to;
+    ALTER TABLE pharmacies ADD COLUMN dhcp_to text
+      GENERATED ALWAYS AS ('10.' || idx || '.0.254') STORED;
+  END IF;
+END $mig$;
+
+
+-- pmr_system vocabulary refresh: widen to the major UK community-pharmacy PMR systems. The inline CHECK
+-- only applies to fresh installs, so the live constraint is rebuilt here. Safe to
+-- re-run: DROP IF EXISTS then ADD lands on the same constraint each time.
+ALTER TABLE pharmacies DROP CONSTRAINT IF EXISTS pharmacies_pmr_system_check;
+ALTER TABLE pharmacies ADD CONSTRAINT pharmacies_pmr_system_check CHECK (pmr_system IN ('proscript', 'pharmacy_manager', 'nexphase', 'analyst', 'titan', 'rxweb', 'other'));
 
 -- ── counters ─────────────────────────────────────────────────────────────────
 -- One counter = one Windows desktop VM + one Pi thin client on its own WireGuard
 -- tunnel. One row because they are provisioned, replaced and retired together.
+-- ── link to the CRM site this pharmacy IS ────────────────────────────────────
+-- The configurator lists every site in the CRM and offers to create the ones that have no
+-- Vigilant record yet, which needs an explicit link rather than matching on name: sites get
+-- renamed, and two branches of one group can share a name. Nullable because pharmacies
+-- created before this existed have no link, and inventing one by guessing would be worse
+-- than admitting it is unknown.
+--
+-- Not a foreign key: the CRM lives in a different database (Supabase), so this is a soft
+-- reference. UNIQUE so one site cannot be built twice.
+ALTER TABLE pharmacies ADD COLUMN IF NOT EXISTS crm_site_id text;
+CREATE UNIQUE INDEX IF NOT EXISTS pharmacies_crm_site_idx ON pharmacies (crm_site_id)
+    WHERE crm_site_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS counters (
     id            bigserial   PRIMARY KEY,
     pharmacy_id   bigint      NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -409,6 +445,71 @@ CREATE TABLE IF NOT EXISTS counters (
     UNIQUE (pharmacy_id, n)
 );
 CREATE INDEX IF NOT EXISTS counters_pharmacy_idx ON counters (pharmacy_id);
+
+-- ── which VMs a site's thin clients may use ──────────────────────────────────
+-- Extra VMs attached to a site by hand. Most sites need none: the PMR server and each
+-- counter's desktop are already known, and their addresses follow the platform's numbering.
+-- This table is for anything else a site legitimately exposes.
+--
+-- `ip` is stored rather than derived because Proxmox discovery cannot see VM addresses — it
+-- reports vmid, node, VLAN tag and MACs, and nothing more. Guessing an address for an
+-- arbitrary VM would put a counter in front of whatever happens to answer on it.
+CREATE TABLE IF NOT EXISTS pharmacy_vms (
+    pharmacy_id bigint      NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    vmid        int         NOT NULL,
+    ip          text        NOT NULL,
+    label       text,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (pharmacy_id, vmid)
+);
+
+-- THE definition of what a site's thin clients can be pointed at. Both the picker in
+-- Watchman and the server-side resolver read this one view, so the dropdown cannot offer a
+-- choice the server would then refuse — which it previously did, listing every VM on the
+-- site's VLAN while accepting only the registered ones.
+CREATE OR REPLACE VIEW pharmacy_vms_v AS
+-- Every VM a site's thin clients can be pointed at. A pharmacy_vms row overrides the DERIVED
+-- address for the same vmid, so .10 / .20+n are defaults, not fixed. 'source' records how the
+-- VM is linked (server / desktop / attached) so the UI can unassign any of them uniformly.
+-- Leading columns (pharmacy_id, vmid, ip, role) are unchanged so CREATE OR REPLACE accepts
+-- the appended source / counter_id / address_overridden.
+SELECT p.id AS pharmacy_id, p.srv_vmid AS vmid,
+       COALESCE(o.ip, p.server_ip) AS ip,
+       'PMR server' AS role,
+       'server' AS source,
+       NULL::bigint AS counter_id,
+       (o.ip IS NOT NULL) AS address_overridden
+  FROM pharmacies p
+  LEFT JOIN pharmacy_vms o ON o.pharmacy_id = p.id AND o.vmid = p.srv_vmid
+ WHERE p.srv_vmid IS NOT NULL
+UNION ALL
+SELECT c.pharmacy_id, c.vmid,
+       COALESCE(o.ip, '10.' || p.idx || '.0.' || (20 + c.n)),
+       'thin client ' || c.n,
+       'desktop',
+       c.id,
+       (o.ip IS NOT NULL)
+  FROM counters c
+  JOIN pharmacies p ON p.id = c.pharmacy_id
+  LEFT JOIN pharmacy_vms o ON o.pharmacy_id = c.pharmacy_id AND o.vmid = c.vmid
+ WHERE c.vmid IS NOT NULL
+UNION ALL
+-- extra attached VMs = pharmacy_vms rows that are NOT overrides of the server/a desktop
+SELECT v.pharmacy_id, v.vmid, v.ip, COALESCE(v.label, 'attached'),
+       'attached', NULL::bigint, false
+  FROM pharmacy_vms v
+  JOIN pharmacies p ON p.id = v.pharmacy_id
+ WHERE v.vmid IS DISTINCT FROM p.srv_vmid
+   AND NOT EXISTS (SELECT 1 FROM counters c WHERE c.pharmacy_id = v.pharmacy_id AND c.vmid = v.vmid);
+
+-- 'probe' provenance: the Pi found something listening on a printer port during a LAN
+-- sweep but could not identify it. Deliberately distinct from snmp/ipp, which mean the
+-- device actually answered a printer protocol.
+DO $$ BEGIN
+  ALTER TABLE printers DROP CONSTRAINT IF EXISTS printers_discovered_via_check;
+  ALTER TABLE printers ADD CONSTRAINT printers_discovered_via_check
+    CHECK (discovered_via IN ('snmp', 'ipp', 'cups', 'manual', 'probe'));
+END $$;
 
 -- ── observed WireGuard peer state on the hub (VM 300) ────────────────────────
 -- Kept separate from `counters` so live telemetry never overwrites intended
@@ -459,12 +560,34 @@ ALTER TABLE counters ADD COLUMN IF NOT EXISTS boot_set_by     text;
 ALTER TABLE counters ADD COLUMN IF NOT EXISTS boot_set_at     timestamptz;
 ALTER TABLE counters ADD COLUMN IF NOT EXISTS boot_applied_at timestamptz;
 
+-- ── editable per-thin-client options ────────────────────────────────────────
+-- The persistent settings channel: session options the kiosk launcher reads (smartcard,
+-- printer redirection, clipboard, colour depth, screen blanking) and agent options the
+-- agent applies to its own loop (report interval, printer/discovery cadence).
+--
+-- jsonb rather than a column each because the set is expected to grow, and because the
+-- server merges (`settings || $new`) so saving one field cannot wipe the others.
+--
+-- ONLY stored values live here — NOT the defaults. The effective value is computed
+-- server-side in src/shared/counterSettings.js and pushed on every telemetry tick, so an
+-- empty '{}' means "all defaults" and there is exactly one place a default is written down.
+-- The keys are a CLOSED whitelist validated before anything is stored: these values end up
+-- in a file the Pi's kiosk launcher sources and in xfreerdp argv, so no free text exists in
+-- this version at all.
+ALTER TABLE counters ADD COLUMN IF NOT EXISTS settings jsonb NOT NULL DEFAULT '{}'::jsonb;
+
 CREATE OR REPLACE VIEW counters_v AS
 SELECT c.id, c.pharmacy_id,
        p.code AS pharmacy_code, p.name AS pharmacy_name, p.idx AS pharmacy_idx, p.vlan,
        c.n, c.label, c.status, c.vmid, c.vm_hostname,
        '10.' || p.idx || '.0.' || (20 + c.n)     AS vm_ip,
-       '10.255.' || p.idx || '.' || c.n || '/32' AS pi_tunnel_ip,
+       -- OBSERVED from the WireGuard hub, not derived. This was previously computed as
+       -- 10.255.<pharmacy idx>.<counter n>, a convention the estate does not actually
+       -- follow: the pilot Pi answers on 10.255.0.10/32 while that formula produced
+       -- 10.255.1.2/32, and because nothing compared the two, the UI displayed an address
+       -- no device had. NULL when the peer has never handshaked, which is the honest
+       -- answer for a client that is not on the VPN yet.
+       w.allowed_ips AS pi_tunnel_ip,
        c.pi_device_id, c.pi_hostname, c.pi_model, c.pi_public_key, c.pi_enrolled_at,
        c.peripherals, c.notes,
        d.serial       AS pi_serial,
@@ -518,7 +641,35 @@ SELECT c.id, c.pharmacy_id,
        -- only ADD columns at the END, so placing these next to the boot columns they relate
        -- to fails with "cannot change name of view column".
        c.pending_action, c.pending_action_by, c.pending_action_at,
-       c.last_action, c.last_action_by, c.last_action_at
+       c.last_action, c.last_action_by, c.last_action_at,
+       -- Appended, and it must stay appended (see the note above): CREATE OR REPLACE VIEW
+       -- can only ADD columns at the END.
+       --
+       -- The STORED per-thin-client options only. Defaults are NOT merged in here: they
+       -- live once, server-side, in src/shared/counterSettings.js, and merging them in SQL
+       -- too would be a second copy to keep in step.
+       c.settings,
+       -- What the agent says it has ACTUALLY applied, straight from its telemetry. Kept
+       -- separate from c.settings for the same reason as pi_peripherals_detected: the
+       -- difference between the two IS the interesting signal (a thin client that has not
+       -- picked up a change, or a kiosk still running the old session options).
+       ds.raw -> 'settings_applied' AS pi_settings_applied,
+       -- ── health signals, appended (CREATE OR REPLACE VIEW cannot insert mid-list) ──
+       -- Populated for thin clients only once temperature fell back to cpu_temperature: a Pi
+       -- has no board sensor, so the RouterOS-shaped `temperature` was always null here.
+       ds.temperature                             AS pi_temp_c,
+       -- Undervoltage/throttling LATCHES until reboot, so the since-boot flags are as
+       -- important as the current ones — a counter that browned out earlier has a PSU fault
+       -- that will recur, and only the latched bit still shows it.
+       (ds.raw -> 'throttling' ->> 'undervoltage_now')::boolean        AS pi_undervolt_now,
+       (ds.raw -> 'throttling' ->> 'undervoltage_since_boot')::boolean AS pi_undervolt_ever,
+       (ds.raw -> 'throttling' ->> 'throttled_now')::boolean           AS pi_throttled_now,
+       -- How an SD card actually fails: a rising error count first, read-only at the end.
+       (ds.raw -> 'storage_errors' ->> 'count')::int                   AS pi_sd_errors,
+       (ds.raw ->> 'rootfs_readonly')::boolean                         AS pi_rootfs_ro,
+       ds.raw -> 'failed_units'                                        AS pi_failed_units,
+       ds.raw -> 'storage'                                             AS pi_storage,
+       ds.raw -> 'wifi_link'                                           AS pi_wifi_link
   FROM counters c
   JOIN pharmacies p   ON p.id = c.pharmacy_id
   LEFT JOIN devices d ON d.id = c.pi_device_id
@@ -862,5 +1013,160 @@ BEGIN
 EXCEPTION WHEN OTHERS THEN
   RAISE NOTICE 'vigilant: RLS/grants step skipped (%) — apply manually on the Supabase DB if needed', SQLERRM;
 END $$;
+
+-- Deliberately NOT added to the grant loop above and NOT published to Realtime: relay_requests
+-- holds the base64 bodies of whatever an engineer proxied, and site_devices_v/relay_sessions
+-- are the allowlist itself. Both are reachable only through the token-gated API, never by a
+-- frontend select.
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- SITE LAN INVENTORY + THE RELAY REVERSE CHANNEL
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- ── which Vigilant devices belong to a site ───────────────────────────────────
+-- ONE definition, read by the inventory API (GET /sites/:code/devices) AND by the relay's
+-- allowlist, so a target the picker can offer is exactly a target the server will accept.
+-- Previously each caller passed its own list of serials (see /printers/lan?serials=), which
+-- means the client decides what "this site" is — unusable for an allowlist.
+--
+-- Three links, because these are the only ones that genuinely exist today:
+--   thin-client  a pharmacy's counters name their Pi's devices row (counters.pi_device_id).
+--   site-name    a MikroTik whose site_name CONTAINS the site code. strpos(), never LIKE:
+--                a code must never be interpretable as a wildcard pattern.
+--   serial       the ~348 monitored sites that have NO pharmacies row. There the router IS
+--                the site, keyed by its own serial. Inventory has to work for those — a Pi
+--                is what a site needs to be REACHED, not to be seen.
+CREATE OR REPLACE VIEW site_devices_v AS
+SELECT p.code       AS site_code,
+       p.id         AS pharmacy_id,
+       c.pi_device_id AS device_id,
+       'thin-client' AS link
+  FROM pharmacies p
+  JOIN counters c ON c.pharmacy_id = p.id
+ WHERE c.pi_device_id IS NOT NULL
+UNION
+SELECT p.code, p.id, d.id, 'site-name'
+  FROM pharmacies p
+  JOIN devices d ON d.site_name IS NOT NULL
+                AND strpos(lower(d.site_name), lower(p.code)) > 0
+ -- Routers only. A site's own Pis are already the thin-client arm, and their site_name
+ -- ("RX54554 counter 1") contains the code too, which would list every Pi twice.
+ WHERE d.kind = 'mikrotik'
+UNION
+SELECT d.serial, NULL::bigint, d.id, 'serial'
+  FROM devices d
+ WHERE d.kind = 'mikrotik';
+
+-- ── relay sessions ───────────────────────────────────────────────────────────
+-- A time-boxed permission for ONE Pi to proxy HTTP to ONE address:port on its own site LAN.
+-- Nothing here can be reached from the datacentre: the hub's forward chain is policy-drop
+-- except WireGuard→RDP, so the Pi dials out and this row is what it is allowed to fetch.
+--
+-- The row is the authority the Pi is handed, and the Pi re-checks the target against it, so a
+-- compromised server still cannot aim a Pi at an address no session named.
+CREATE TABLE IF NOT EXISTS relay_sessions (
+    id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    device_id     uuid        NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    -- Resolved from site_devices_v at creation and RECORDED, not re-derived: the audit trail
+    -- must say which site this was authorised against even after inventory changes.
+    site_code     text,
+    target_ip     text        NOT NULL,
+    target_port   int         NOT NULL,
+    opened_by     text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    expires_at    timestamptz NOT NULL,
+    closed_at     timestamptz,
+    closed_reason text,
+    -- Last time the Pi actually held a long poll open, so a UI can tell "no Pi is listening"
+    -- from "the Pi is listening and the printer is not answering".
+    last_poll_at  timestamptz
+);
+-- One live session per device, enforced STRUCTURALLY rather than by a check-then-insert:
+-- creating a second session closes the first, and two operators clicking at once would
+-- otherwise both pass the check and leave two live sessions on one Pi.
+CREATE UNIQUE INDEX IF NOT EXISTS relay_sessions_one_live_idx
+    ON relay_sessions (device_id) WHERE closed_at IS NULL;
+CREATE INDEX IF NOT EXISTS relay_sessions_expiry_idx ON relay_sessions (expires_at)
+    WHERE closed_at IS NULL;
+
+-- ── the queued requests that cross the channel ───────────────────────────────
+-- WHY A TABLE AND NOT PROCESS MEMORY: the ingest runs as a 3-worker cluster sharing one
+-- listening socket (docker-compose.override.yml, INGEST_WORKERS=3). The browser's GET and the
+-- Pi's long poll therefore land on DIFFERENT processes about two thirds of the time, and an
+-- in-process queue would silently 504 most page loads. Postgres is the only state the cluster
+-- shares.
+--
+-- Bodies are base64 TEXT because readBody() accumulates a string and would corrupt binary —
+-- the same reason the wire contract is base64 — so the bytes are never decoded server-side.
+CREATE TABLE IF NOT EXISTS relay_requests (
+    id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id    uuid        NOT NULL REFERENCES relay_sessions(id) ON DELETE CASCADE,
+    -- FIFO across the Pi's pool of workers. A page's assets are queued in the order the
+    -- browser asked for them; serving them out of order would delay the document itself.
+    seq           bigserial   NOT NULL,
+    method        text        NOT NULL,
+    path          text        NOT NULL,
+    headers       jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    body_b64      text,
+    state         text        NOT NULL DEFAULT 'queued'
+                              CHECK (state IN ('queued', 'claimed', 'done')),
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    claimed_at    timestamptz,
+    replied_at    timestamptz,
+    status        int,
+    resp_headers  jsonb,
+    resp_body_b64 text
+);
+-- The claim query is the hot one: the oldest unanswered row for this session, SKIP LOCKED so
+-- the Pi's three workers never collide. Partial on "not answered yet", which is both states the
+-- claim can select — 'queued', and a 'claimed' read whose 10 s visibility window has lapsed
+-- (see claimRelayRequest). Dropped and recreated rather than CREATE IF NOT EXISTS so a database
+-- carrying the earlier queued-only definition converges on this one.
+DROP INDEX IF EXISTS relay_requests_claim_idx;
+CREATE INDEX IF NOT EXISTS relay_requests_claim_idx
+    ON relay_requests (session_id, seq) WHERE state <> 'done';
+CREATE INDEX IF NOT EXISTS relay_requests_created_idx ON relay_requests (created_at);
+
+-- ── thin-client branding (FLEET-WIDE, exactly one row) ───────────────────────
+-- The boot splash, the console MOTD/issue art and the kiosk pre-connect line, for EVERY thin
+-- client in the estate. There is deliberately no device_id and no site column: branding was
+-- decided fleet-wide with NO per-site override, which is what keeps this one flat row instead
+-- of a resolution order with a precedence bug waiting in it.
+--
+-- `id` is pinned to 1 by the CHECK so a second row is impossible rather than merely unlikely —
+-- every writer upserts ON CONFLICT (id) and every reader selects WHERE id = 1, so a stray
+-- second row would silently split the fleet's branding in two.
+--
+-- The splash is `bytea`, not a file on disk: the ingest runs as a 3-worker cluster sharing one
+-- listening socket (see relay_requests for the same constraint), so a PNG written to a
+-- container filesystem by one worker is invisible to the other two. Postgres is the only state
+-- they share. Uploads arrive as base64 in JSON for the same reason relay bodies do — readBody()
+-- accumulates the request into a STRING, which mangles raw PNG bytes.
+--
+-- WHAT IS DELIBERATELY ABSENT: there is no column here for kernel verbosity (`quiet`,
+-- `logo.nologo`) or anything else in /boot/firmware/cmdline.txt. That file is the one thing on a
+-- Pi with NO remote recovery — a typo means the device does not boot, so no SSH, no agent, no
+-- tunnel, and somebody drives to a pharmacy with an SD card reader. It is written ONCE at image
+-- bake time (agent/pi/build-image.sh) and must never become a pushable setting.
+CREATE TABLE IF NOT EXISTS branding (
+    id            smallint    PRIMARY KEY DEFAULT 1 CHECK (id = 1),   -- exactly one row, fleet-wide
+    motd          text,
+    issue         text,
+    kiosk_message text,
+    splash        bytea,
+    splash_sha256 text,
+    splash_width  int,
+    splash_height int,
+    -- Separate from the row's updated_at ON PURPOSE. updated_at moves whenever ANY field
+    -- changes, so reusing it for the splash would tell the editor "the image changed" every
+    -- time an operator only fixed a typo in the MOTD. The contract's splash.updated_at has to
+    -- mean the image, so it gets its own stamp. NULL when no splash has ever been uploaded.
+    splash_updated_at timestamptz,
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    updated_by    text
+);
+-- Converge a database that received an earlier revision of this table (the column was added
+-- after the first cut of the DDL). ADD COLUMN IF NOT EXISTS keeps the file re-runnable.
+ALTER TABLE branding ADD COLUMN IF NOT EXISTS splash_updated_at timestamptz;
 
 COMMIT;

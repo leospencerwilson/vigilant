@@ -104,9 +104,31 @@ log, never crash.
   "agent_version": 3,              // current agent script version; if device's is older, bootstrap re-fetches
   "job": null | {                   // present only if an APPROVED config job is pending for this device
     "id":"uuid","sha256":"…","url":"https://…/config/<id>.rsc","confirm_window_s":300
+  },
+
+  // The keys below are OMITTED unless they apply, never sent as null: the RouterOS agent
+  // parses this response with a string scanner, so a present-but-empty key is not free.
+  "confirm": "uuid",                // an APPLIED job: cancels the agent's rollback timer
+  "boot":    { "target":"10.1.0.10:3389", "vmid":301 },   // kind='counter-pi' only
+  "action":  "reboot",              // kind='counter-pi' only; delivered AT MOST ONCE
+
+  // kind='counter-pi' only. The EFFECTIVE per-thin-client settings: the operator's stored
+  // values merged over the server-side defaults, so the agent ships no defaults of its own
+  // and cannot drift from the UI. Sent on EVERY tick (self-healing, like "boot"); the agent
+  // restarts the kiosk only when the file it renders actually changes. Keys are a CLOSED
+  // whitelist — see src/shared/counterSettings.js, which is also the only validator.
+  "settings": {
+    "smartcard": true, "printer_redirect": true, "clipboard": true,   // kiosk session
+    "bpp": 16, "blank_after_min": 0,                                  // 0 = never blank
+    "report_interval_s": 30, "printer_every": 15, "discover_every": 8 // agent loop; 0 = off
   }
 }
 ```
+
+The agent reports back what it has ACTUALLY applied as `settings_applied` in its payload.
+Nothing needs to parse it: the whole raw body is persisted to `device_state.raw`, which
+`counters_v` surfaces as `pi_settings_applied` so the UI can show drift against the stored
+values. A payload without the key is valid and is never rejected.
 
 ## Store interface (`store.js`)
 

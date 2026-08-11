@@ -31,6 +31,16 @@
 //   POST /speedtest/result              device agent's done/failed finaliser
 //   GET  /devices/:serial/speedtests    admin  list recent speedtests
 //   POST /devices/:serial/speedtests    admin  request an active speedtest
+//   GET  /branding                      field  fleet-wide thin-client branding record
+//   PUT  /branding                      admin  set motd / issue / kiosk_message
+//   PUT  /branding/splash               admin  upload the boot splash PNG (base64 in JSON)
+//   DELETE /branding/splash             admin  drop the boot splash
+//   GET  /branding/splash               field|device  the splash PNG bytes
+//   GET  /sites/:code/devices           field  site LAN inventory (printer|phone|other + ports)
+//   POST /relay/sessions                field  open a LAN-relay session on a thin client
+//   GET  /relay/:id/next                device long-poll: next queued request (204 / 410)
+//   POST /relay/:id/reply               device the answer to one relayed request
+//   GET|POST /relay/:id/p/*             field  browser-facing proxy through the thin client
 
 const http = require('node:http');
 const crypto = require('node:crypto');
@@ -102,6 +112,19 @@ function authField(req, cfg) {
   const tok = bearer(req);
   if (!tok || !cfg.fieldEnrollToken) return false;
   return timingSafeEqual(tok, cfg.fieldEnrollToken);
+}
+
+// Field auth for the RELAY PROXY only, which is loaded by an <iframe> and by that page's own
+// subresources — neither can carry an Authorization header. RFC 6750 §2.3 defines exactly this
+// fallback, so the token may arrive as ?access_token=. Kept to this one route family: every
+// other endpoint is called by code that can set a header, and a token in a URL is visible in
+// referrers and proxy logs. The handler strips the parameter before anything is forwarded.
+function authFieldOrQueryToken(req, cfg, url) {
+  if (authField(req, cfg)) return true;
+  const tok = (url.searchParams.get('access_token') || '').trim();
+  if (!tok) return false;
+  if (cfg.enrollToken && timingSafeEqual(tok, cfg.enrollToken)) return true;
+  return !!cfg.fieldEnrollToken && timingSafeEqual(tok, cfg.fieldEnrollToken);
 }
 
 // CORS so browser frontends (wc_field) can call the API directly. Auth is a Bearer token (no
@@ -301,6 +324,117 @@ function createServer({ store, config: cfg }) {
         return handlers.pharmacyDelete(ctx);
       }
 
+      if (method === 'GET' && pathname === '/printers/lan') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.lanPrinters(ctx);
+      }
+      const mPrinterTest = /^\/printers\/([^/]+)\/test-print$/.exec(pathname);
+      if (mPrinterTest && method === 'POST') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPrinterTest[1]) };
+        return handlers.printerTestPrint(ctx);
+      }
+      // Site VM list — before /pharmacies/:id so the suffix is not swallowed.
+      const mPhVmOne = /^\/pharmacies\/([^/]+)\/vms\/(\d+)$/.exec(pathname);
+      if (mPhVmOne && method === 'DELETE') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPhVmOne[1]), vmid: mPhVmOne[2] };
+        return handlers.pharmacyVmDetach(ctx);
+      }
+      const mPhVms = /^\/pharmacies\/([^/]+)\/vms$/.exec(pathname);
+      if (mPhVms && method === 'GET') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPhVms[1]) };
+        return handlers.pharmacyVmsList(ctx);
+      }
+      if (mPhVms && method === 'POST') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPhVms[1]) };
+        ctx.body = await readBody(req);
+        return handlers.pharmacyVmAttach(ctx);
+      }
+      // Zero-touch thin-client provisioning. Self-enrol is gated by the SHARED bootstrap
+      // token (SELF_ENROL_TOKEN), not the estate master — a leak can only mint an unclaimed
+      // device. Unclaimed-list and adopt are estate-admin.
+      // Device-authenticated agent download. Placed with the other DEVICE routes: it uses the
+      // device bearer token, not the admin token.
+      if (method === 'GET' && pathname === '/agent/pi-script') {
+        const dev = await authDevice(req, store);
+        if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.device = dev;
+        return handlers.piAgentScript(ctx);
+      }
+      // POST /screen — thin client uploads its screen thumbnail (device token, not admin).
+      if (method === 'POST' && pathname === '/screen') {
+        const dev = await authDevice(req, store);
+        if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.device = dev;
+        ctx.body = await readBody(req);
+        return handlers.postScreen(ctx);
+      }
+      // ── fleet-wide thin-client branding ────────────────────────────────────
+      // ONE record for the whole estate — no serial and no site code appears in any of these
+      // paths, because there is no per-site override by decision.
+      //
+      // /branding/splash is registered BEFORE /branding. These are exact-string comparisons so
+      // they cannot actually collide, but keeping the more specific path first matches how the
+      // rest of this dispatch is ordered and survives someone later loosening either match.
+      if (method === 'GET' && pathname === '/branding/splash') {
+        // Deliberately TWO credentials on one route. The editor preview carries the field token;
+        // every thin-client agent fetches the same bytes with its own DEVICE token when its
+        // telemetry reply showed a splash_sha256 it does not have. Splitting this into two routes
+        // would mean two copies of the same read, and minting a shared fetch secret for the
+        // fleet would be strictly worse than the per-device token each Pi already holds.
+        if (!authField(req, cfg)) {
+          const dev = await authDevice(req, store);
+          if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
+          ctx.device = dev;
+        }
+        return handlers.brandingGetSplash(ctx);
+      }
+      if (method === 'PUT' && pathname === '/branding/splash') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return handlers.brandingPutSplash(ctx);
+      }
+      if (method === 'DELETE' && pathname === '/branding/splash') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.brandingDeleteSplash(ctx);
+      }
+      // Read is authField — the same read-only credential the Watchman UI already uses for logs,
+      // history and screen thumbnails, so the editor needs no new secret to populate its form.
+      if (method === 'GET' && pathname === '/branding') {
+        if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.brandingGet(ctx);
+      }
+      // Writes are authAdmin: this changes what every thin client in the estate displays.
+      // PATCH is accepted alongside PUT because the body is a PARTIAL update (only the keys
+      // present are written), which is what a caller reaching for PATCH would expect anyway.
+      if ((method === 'PUT' || method === 'PATCH') && pathname === '/branding') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return handlers.brandingPutText(ctx);
+      }
+
+      if (method === 'POST' && pathname === '/enrol/self') {
+        const tok = bearer(req);
+        if (!cfg.selfEnrolToken || !tok || !timingSafeEqual(tok, cfg.selfEnrolToken)) {
+          return json(res, 401, { ok: false, error: 'unauthorized' });
+        }
+        ctx.body = await readBody(req);
+        return handlers.selfEnrol(ctx);
+      }
+      if (method === 'GET' && pathname === '/pis/unclaimed') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return handlers.unclaimedPisList(ctx);
+      }
+      const mAdopt = /^\/pis\/([^/]+)\/adopt$/.exec(pathname);
+      if (mAdopt && method === 'POST') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mAdopt[1]) };
+        ctx.body = await readBody(req);
+        return handlers.adoptPi(ctx);
+      }
       if (method === 'GET' && pathname === '/counters') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         return handlers.countersList(ctx);
@@ -324,6 +458,19 @@ function createServer({ store, config: cfg }) {
         ctx.params = { id: decodeURIComponent(mCounterAction[1]) };
         ctx.body = await readBody(req);
         return handlers.counterAction(ctx);
+      }
+      // Support screen sharing. BEFORE /counters/:id for the same specificity reason.
+      const mCounterSupport = /^\/counters\/([^/]+)\/support$/.exec(pathname);
+      if (mCounterSupport && method === 'POST') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mCounterSupport[1]) };
+        ctx.body = await readBody(req);
+        return handlers.counterSupportStart(ctx);
+      }
+      if (mCounterSupport && method === 'GET') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mCounterSupport[1]) };
+        return handlers.counterSupportStatus(ctx);
       }
       // Boot target BEFORE /counters/:id, same specificity reason as enrol-pi.
       const mCounterBoot = /^\/counters\/([^/]+)\/boot-target$/.exec(pathname);
@@ -393,6 +540,62 @@ function createServer({ store, config: cfg }) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
         return handlers.wgPeersReport(ctx);
+      }
+
+      // ── site LAN inventory ─────────────────────────────────────────────────
+      // GET /sites/:code/devices — what a site's own telemetry says is on its LAN, classified
+      // into printer/phone/other with the admin ports to try. authField, not authAdmin: this is
+      // a read of data the Watchman UI already shows, and it is what the relay picker lists.
+      const mSiteDevices = /^\/sites\/([^/]+)\/devices$/.exec(pathname);
+      if (method === 'GET' && mSiteDevices) {
+        if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { code: decodeURIComponent(mSiteDevices[1]) };
+        return handlers.siteDevices(ctx);
+      }
+
+      // ── LAN relay (long-poll reverse channel through a thin client) ─────────
+      // Nothing here may originate towards a Pi — the hub's forward chain forbids it — so the
+      // Pi collects work by holding /next open and posts answers back to /reply. See
+      // handlers.js for the protocol and why each timeout is the number it is.
+      if (method === 'POST' && pathname === '/relay/sessions') {
+        if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return handlers.relaySessionCreate(ctx);
+      }
+      // DEVICE routes — the Pi's own bearer, not an operator's token.
+      const mRelayNext = /^\/relay\/([^/]+)\/next$/.exec(pathname);
+      if (method === 'GET' && mRelayNext) {
+        const dev = await authDevice(req, store);
+        if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.device = dev;
+        ctx.params = { id: decodeURIComponent(mRelayNext[1]) };
+        return handlers.relayNext(ctx);
+      }
+      const mRelayReply = /^\/relay\/([^/]+)\/reply$/.exec(pathname);
+      if (method === 'POST' && mRelayReply) {
+        const dev = await authDevice(req, store);
+        if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.device = dev;
+        ctx.params = { id: decodeURIComponent(mRelayReply[1]) };
+        ctx.body = await readBody(req);
+        return handlers.relayReply(ctx);
+      }
+      // Browser-facing proxy. The trailing path is captured RAW (not decoded): it is handed
+      // straight to the device, and decoding it here would corrupt an escaped query or path
+      // segment the device's own web server expects verbatim.
+      const mRelayProxy = /^\/relay\/([^/]+)\/p(\/.*)?$/.exec(pathname);
+      if ((method === 'GET' || method === 'POST') && mRelayProxy) {
+        // NO bearer here on purpose — the session id IS the credential (see relayProxy,
+        // which rejects an unknown, closed or expired one with 404/410). An <iframe> cannot
+        // attach an Authorization header, and crucially nor can the subresource fetches the
+        // framed page makes: a relative `style.css` arrives here as /relay/<id>/p/style.css
+        // with nothing attached, so requiring a token meant only a single self-contained
+        // document could ever render. The session is a capability — UUIDv4, <=10 min, one
+        // live per device, pinned to one allowlisted ip:port, audited at creation — which is
+        // a narrower thing to hold than the field key this replaces.
+        ctx.params = { id: decodeURIComponent(mRelayProxy[1]), path: mRelayProxy[2] || '/' };
+        if (method === 'POST') ctx.body = await readBody(req);
+        return handlers.relayProxy(ctx);
       }
 
       // ── tags & smart tags (admin) ──────────────────────────────────────────
@@ -493,6 +696,15 @@ function createServer({ store, config: cfg }) {
         if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { serial: decodeURIComponent(mHist[1]) };
         return handlers.deviceHistory(ctx);
+      }
+      // GET /devices/:serial/screen — the thumbnail as an image, for the thin-client list.
+      // authField, not authAdmin: this is the same read-only credential the Watchman UI
+      // already uses for logs and history, so the <img> needs no new secret.
+      const mScreen = /^\/devices\/([^/]+)\/screen$/.exec(pathname);
+      if (method === 'GET' && mScreen) {
+        if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { serial: decodeURIComponent(mScreen[1]) };
+        return handlers.deviceScreen(ctx);
       }
       // GET /devices/:serial/logs?q=&topic=&limit= — filtered 30-day log history.
       const mLogs = /^\/devices\/([^/]+)\/logs$/.exec(pathname);

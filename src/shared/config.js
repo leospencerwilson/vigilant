@@ -48,6 +48,12 @@ const config = Object.freeze({
   // master token. Leave unset to disable. A leaked field key can at most create device rows /
   // read a device's detail.
   fieldEnrollToken: process.env.FIELD_ENROLL_TOKEN || "",
+  // Shared secret baked into the thin-client base image. Lets a fresh Pi REGISTER
+  // itself (POST /enrol/self) and be issued a per-device token. It can only create an
+  // UNCLAIMED counter-pi device — which does nothing until an operator adopts it onto a
+  // site — so a leak of this token cannot reach any existing device or site. Rotate
+  // independently of the estate master token.
+  selfEnrolToken: process.env.SELF_ENROL_TOKEN || "",
   // CORS allow-list for browser callers. '*' (default) echoes any origin (safe here: auth is a
   // bearer token, not cookies). Set a comma-separated list to lock it to the wc_field origin(s).
   corsAllowOrigins: process.env.CORS_ALLOW_ORIGINS || "*",

@@ -334,6 +334,8 @@ function normalize(raw) {
     // null = "keep previous"; an array (incl. []) is a full snapshot.
     wifi: normalizeWifi(p.wifi),
     wifi_clients: normalizeWifiClients(p.wifi_clients),
+    // The field whose absence from this list disabled log collection entirely.
+    logs: normalizeLogs(p.logs),
     // CHUNKED TELEMETRY: did the raw payload carry a system/core block? When false this is a
     // detail-only chunk and the handler must NOT overwrite device_state with nulls — it only
     // bumps last_seen_at. Computed from raw-key presence (see hasCoreFields), NOT from the
@@ -342,6 +344,35 @@ function normalize(raw) {
     has_core: parseBool(p.partial) === true ? false : coreHere,
   };
 
+  return out;
+}
+
+// Agent log lines: [{ time, topics, message }, …] — exactly the shape device_logs stores and
+// the log view reads, so no translation is needed anywhere downstream.
+//
+// Returns null (not []) when the agent sent nothing. appendDeviceLogs treats an empty batch as
+// "nothing to add", and logs only ever accumulate — there is no snapshot-replace semantics here
+// like there is for wifi or mac_hosts, so the null/[] distinction carries no extra meaning and
+// null is the cheaper signal.
+function normalizeLogs(logs) {
+  if (!Array.isArray(logs)) return null;
+  const out = [];
+  for (const e of logs) {
+    if (!e || typeof e !== "object") continue;
+    const message = e.message != null ? String(e.message) : "";
+    if (!message.trim()) continue; // a line with no message is just noise in the log view
+    out.push({
+      // An agent that could not parse a timestamp sends "". Kept as "" rather than coerced to
+      // null, because it forms part of the (device_id, log_time, message) dedupe key that stops
+      // the agent's deliberately overlapping re-sends from duplicating rows.
+      time: e.time != null ? String(e.time).slice(0, 64) : "",
+      topics: (e.topics != null ? String(e.topics) : "agent").slice(0, 120),
+      message: message.slice(0, 400),
+    });
+    // Bounded so a single bad tick cannot flood a 30-day table. appendDeviceLogs caps at 100
+    // too; this cap governs what we build in memory before handing it over.
+    if (out.length >= 200) break;
+  }
   return out;
 }
 

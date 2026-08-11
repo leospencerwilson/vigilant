@@ -99,8 +99,13 @@ function makePgStore(poolOrConfig) {
 
   async function getDeviceBySerial(serial) {
     return one(
+      // `kind` is selected for the same reason getDeviceByToken selects it: a caller that
+      // resolves a device by serial has to be able to tell a RouterOS box from a thin client
+      // before acting on it (the relay only works through a Pi, config-push only through a
+      // router), and without it every such caller needs a second query.
       `SELECT id, serial, identity, site_name, customer, model, ros_version, wan_type,
-              tags, expected, poll_interval_s, poll_until, agent_version, enrolled_at, notes
+              tags, expected, poll_interval_s, poll_until, agent_version, enrolled_at, notes,
+              kind
          FROM devices
         WHERE serial = $1`,
       [serial]
@@ -187,9 +192,10 @@ function makePgStore(poolOrConfig) {
           temperature, voltage, public_ip, ros_version, firmware, default_route,
           pppoe_running, ppp_sessions, dhcp_leases, conn_count, lte_signal,
           cpu_temperature, board_temperature, fan1_speed, fan2_speed, write_sect_total,
-          firmware_current, firmware_upgrade, ntp_synced, netwatch_down, last_seen_at, raw)
+          firmware_current, firmware_upgrade, ntp_synced, netwatch_down, last_seen_at, raw,
+          recent_logs)
        VALUES ($1,COALESCE($2,'unknown'),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-               $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,COALESCE($28, now()),$29)
+               $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,COALESCE($28, now()),$29,$30)
        ON CONFLICT (device_id) DO UPDATE SET
          status            = EXCLUDED.status,
          uptime_s          = EXCLUDED.uptime_s,
@@ -218,7 +224,12 @@ function makePgStore(poolOrConfig) {
          ntp_synced        = EXCLUDED.ntp_synced,
          netwatch_down     = EXCLUDED.netwatch_down,
          last_seen_at      = EXCLUDED.last_seen_at,
-         raw               = EXCLUDED.raw`,
+         raw               = EXCLUDED.raw,
+         -- COALESCE, not EXCLUDED. A thin client reports every 60 s but only carries
+         -- log lines when it has some; taking EXCLUDED unconditionally would blank the
+         -- stored set on the very next quiet tick, which is precisely the bug this
+         -- column was added to fix. Last known logs persist until newer ones arrive.
+         recent_logs       = COALESCE(EXCLUDED.recent_logs, device_state.recent_logs)`,
       [
         deviceId,
         s.status,
@@ -249,6 +260,7 @@ function makePgStore(poolOrConfig) {
         nz(s.netwatch_down),
         s.last_seen_at || null,
         s.raw != null ? JSON.stringify(s.raw) : null,
+        s.recent_logs != null ? JSON.stringify(s.recent_logs) : null,
       ]
     );
   }
@@ -599,6 +611,136 @@ function makePgStore(poolOrConfig) {
         placeholders(8, 'now()')
       );
     });
+  }
+
+
+  // ── thin-client screen thumbnails ───────────────────────────────────────────
+  // One row per device, overwritten every capture. See device_screens' comment: this is
+  // patient-visible screen content, so there is deliberately no history and no second copy.
+  async function upsertDeviceScreen(deviceId, shot) {
+    const s = shot || {};
+    await q(
+      `INSERT INTO device_screens (device_id, captured_at, width, height, mime, bytes)
+       VALUES ($1, COALESCE($2, now()), $3, $4, COALESCE($5, 'image/jpeg'), $6)
+       ON CONFLICT (device_id) DO UPDATE SET
+         captured_at = EXCLUDED.captured_at,
+         width       = EXCLUDED.width,
+         height      = EXCLUDED.height,
+         mime        = EXCLUDED.mime,
+         bytes       = EXCLUDED.bytes`,
+      [deviceId, s.capturedAt || null, nz(s.width), nz(s.height), s.mime || null, s.bytes]
+    );
+  }
+
+  async function getDeviceScreen(deviceId) {
+    return one(
+      `SELECT captured_at, width, height, mime, bytes FROM device_screens WHERE device_id = $1`,
+      [deviceId]
+    );
+  }
+
+  // Short retention is a privacy control, not housekeeping: a thumbnail of a counter is only
+  // worth keeping while it is current, and a stale one is both misleading and PHI at rest.
+  async function pruneDeviceScreens() {
+    const r = await q(`DELETE FROM device_screens WHERE captured_at < now() - interval '6 hours'`, []);
+    return { pruned: r.rowCount || 0 };
+  }
+
+  // ── fleet-wide thin-client branding ─────────────────────────────────────────
+  // One row, id = 1, for the whole estate — see branding's comment in schema.sql for why
+  // there is no per-site variant. Every method below pins id = 1 rather than taking a key,
+  // so no caller can invent a second row.
+
+  // Metadata read. Deliberately does NOT select the `splash` blob: this is called on the
+  // TELEMETRY PATH for every thin-client tick, and dragging up to 2 MB of PNG out of the
+  // database several hundred times a minute to then throw it away is exactly the per-tick cost
+  // that has saturated this service before. octet_length() is computed in the database.
+  async function getBranding() {
+    return one(
+      `SELECT motd, issue, kiosk_message, splash_sha256, splash_width, splash_height,
+              octet_length(splash) AS splash_bytes, splash_updated_at, updated_at, updated_by
+         FROM branding
+        WHERE id = 1`,
+      []
+    );
+  }
+
+  // The blob itself, for GET /branding/splash only.
+  async function getBrandingSplash() {
+    return one(
+      `SELECT splash AS bytes, splash_sha256, splash_width, splash_height, splash_updated_at
+         FROM branding
+        WHERE id = 1 AND splash IS NOT NULL`,
+      []
+    );
+  }
+
+  /**
+   * Partial text update. `fields` carries only the keys the operator actually sent, so the
+   * CASE-per-column applies each one independently.
+   *
+   * Written as ONE upsert rather than read-modify-write on purpose: two operators saving
+   * different fields from the same Watchman page would otherwise each write back the other's
+   * stale value, and the loser's edit would vanish with no error anywhere.
+   */
+  async function updateBrandingText(fields, updatedBy) {
+    const f = fields || {};
+    const has = (k) => Object.prototype.hasOwnProperty.call(f, k);
+    await q(
+      `INSERT INTO branding (id, motd, issue, kiosk_message, updated_at, updated_by)
+       VALUES (1, $1, $3, $5, now(), $7)
+       ON CONFLICT (id) DO UPDATE SET
+         motd          = CASE WHEN $2 THEN $1 ELSE branding.motd END,
+         issue         = CASE WHEN $4 THEN $3 ELSE branding.issue END,
+         kiosk_message = CASE WHEN $6 THEN $5 ELSE branding.kiosk_message END,
+         updated_at    = now(),
+         updated_by    = $7`,
+      [
+        has('motd') ? f.motd : null,
+        has('motd'),
+        has('issue') ? f.issue : null,
+        has('issue'),
+        has('kiosk_message') ? f.kiosk_message : null,
+        has('kiosk_message'),
+        updatedBy != null ? updatedBy : 'unknown',
+      ]
+    );
+    return getBranding();
+  }
+
+  // Store a validated PNG. The caller has already checked the magic bytes, the size cap and
+  // read the dimensions out of the IHDR chunk — the store does not re-parse the image.
+  async function setBrandingSplash(shot, updatedBy) {
+    const s = shot || {};
+    await q(
+      `INSERT INTO branding (id, splash, splash_sha256, splash_width, splash_height,
+                             splash_updated_at, updated_at, updated_by)
+       VALUES (1, $1, $2, $3, $4, now(), now(), $5)
+       ON CONFLICT (id) DO UPDATE SET
+         splash            = EXCLUDED.splash,
+         splash_sha256     = EXCLUDED.splash_sha256,
+         splash_width      = EXCLUDED.splash_width,
+         splash_height     = EXCLUDED.splash_height,
+         splash_updated_at = now(),
+         updated_at        = now(),
+         updated_by        = EXCLUDED.updated_by`,
+      [s.bytes, s.sha256 || null, nz(s.width), nz(s.height), updatedBy != null ? updatedBy : 'unknown']
+    );
+    return getBranding();
+  }
+
+  // Remove the splash but keep the text branding. splash_sha256 going to NULL is the signal
+  // the agent reads to put the stock theme back, so all four splash columns must clear
+  // together — a stale sha with no bytes would make the agent fetch a 404 forever.
+  async function clearBrandingSplash(updatedBy) {
+    await q(
+      `UPDATE branding
+          SET splash = NULL, splash_sha256 = NULL, splash_width = NULL, splash_height = NULL,
+              splash_updated_at = NULL, updated_at = now(), updated_by = $1
+        WHERE id = 1`,
+      [updatedBy != null ? updatedBy : 'unknown']
+    );
+    return getBranding();
   }
 
   // Append device log lines to the 30-day history. PK (device_id, log_time, message) dedups
@@ -1647,11 +1789,12 @@ function makePgStore(poolOrConfig) {
   async function createPharmacy(f) {
     const r = f || {};
     return one(
-      `INSERT INTO pharmacies (code, idx, name, pmr_system, status, proxmox_node, srv_vmid, go_live_on, notes)
-       VALUES ($1,$2,$3,COALESCE($4,'proscript'),COALESCE($5,'planned'),$6,$7,$8,$9)
+      `INSERT INTO pharmacies (code, idx, name, pmr_system, status, proxmox_node, srv_vmid, go_live_on, notes, crm_site_id)
+       VALUES ($1,$2,$3,COALESCE($4,'proscript'),COALESCE($5,'planned'),$6,$7,$8,$9,$10)
        RETURNING *`,
       [String(r.code || '').trim().toUpperCase(), r.idx, String(r.name || '').trim(),
-       nz(r.pmr_system), nz(r.status), nz(r.proxmox_node), nz(r.srv_vmid), nz(r.go_live_on), nz(r.notes)]
+       nz(r.pmr_system), nz(r.status), nz(r.proxmox_node), nz(r.srv_vmid), nz(r.go_live_on), nz(r.notes),
+       nz(r.crm_site_id)]
     );
   }
 
@@ -1772,6 +1915,136 @@ function makePgStore(poolOrConfig) {
     );
   }
 
+  // Printers a site's MikroTik(s) have already SEEN on the LAN, straight from mac_hosts —
+  // no sweep, no Pi. The router reports its DHCP/ARP tables every slow tick and Vigilant
+  // already resolves OUI vendors, so a printer is discovered the moment it gets a lease.
+  //
+  // A printer is identified two ways, either sufficient:
+  //   * OUI vendor — the manufacturer of a printer NIC is a printer maker.
+  //   * hostname prefix — vendors' factory-default network names (Brother BRN…, HP NPI…,
+  //     Ricoh RNP…, Kyocera KM…, Epson/Canon by name). Catches a printer whose OUI is an
+  //     embedded-NIC vendor the OUI table renders generically.
+  // Kept as ONE definition so the "is it a printer" rule lives in a single place.
+  const PRINTER_VENDOR_RE = '(brother|hewlett|packard|hp inc|canon|epson|lexmark|kyocera|ricoh|xerox|zebra|dymo|\\yoki\\y|konica|minolta|sharp|toshiba tec|star micronics|bixolon|pantum|develop)';
+  const PRINTER_HOST_RE   = '^(brn|npi|epson|canon|km[0-9]|rnp|lex|kyo|star|bixolon|pos-?printer|hpe?[0-9])';
+
+  async function listLanPrinters(serials) {
+    const list = Array.isArray(serials) ? serials.filter(Boolean) : [];
+    if (!list.length) return [];
+    return rows(
+      `SELECT d.serial,
+              mh.mac,
+              host(mh.ip)      AS ip,
+              mh.hostname,
+              mh.vendor,
+              mh.last_seen_at,
+              -- Already a monitored printer at this site? Compared by address so a LAN find
+              -- and a configured queue for the same box are not shown as two things.
+              EXISTS (SELECT 1 FROM printers p WHERE p.address = host(mh.ip)) AS registered
+         FROM mac_hosts mh
+         JOIN devices d ON d.id = mh.device_id
+        WHERE d.serial = ANY($1)
+          AND mh.ip IS NOT NULL
+          AND (mh.vendor ~* $2 OR (mh.hostname IS NOT NULL AND mh.hostname ~* $3))
+        ORDER BY d.serial, mh.ip`,
+      [list, PRINTER_VENDOR_RE, PRINTER_HOST_RE]
+    );
+  }
+
+  async function getPrinter(id) {
+    return one(`SELECT * FROM printers WHERE id = $1`, [id]);
+  }
+
+  // Queue an action against whichever counter owns this Pi. Printers are dispatched by
+  // DEVICE rather than by counter because printers.reported_by names the Pi that can reach
+  // the printer, and that is the only machine on the pharmacy LAN that can print to it.
+  async function setCounterActionForDevice(deviceId, f) {
+    const r = f || {};
+    return one(
+      `UPDATE counters SET pending_action = $2, pending_action_by = $3, pending_action_at = now()
+        WHERE pi_device_id = $1 RETURNING id`,
+      [deviceId, r.action, nz(r.by)]
+    );
+  }
+
+  // The VMs this site's thin clients may be pointed at, joined to discovered inventory so
+  // the caller gets names and power state without a second query. LEFT JOIN because a VM
+  // that is registered but has not been discovered yet is still a legitimate choice.
+  // Thin-client Pis that have called home but are not yet adopted onto a site — a device of
+  // kind 'counter-pi' that no counter points at. This is the "out of the box, phoned in,
+  // waiting to be claimed" list.
+  async function listUnclaimedPis() {
+    return rows(
+      `SELECT d.id, d.serial, d.identity, d.model, d.enrolled_at,
+              ds.status, ds.last_seen_at,
+              ds.raw ->> 'primary_ip' AS lan_ip
+         FROM devices d
+         LEFT JOIN device_state ds ON ds.device_id = d.id
+        WHERE d.kind = 'counter-pi'
+          AND NOT EXISTS (SELECT 1 FROM counters c WHERE c.pi_device_id = d.id)
+        ORDER BY ds.last_seen_at DESC NULLS LAST`,
+      []
+    );
+  }
+
+  // Adopt an unclaimed Pi: create a thin-client slot on the site at the next free number and
+  // link the (already self-enrolled) device to it. The device keeps the token it got at
+  // self-enrol — adoption only gives it a home, it does not re-issue credentials.
+  async function adoptPi(deviceId, pharmacyId, label) {
+    const counter = await one(
+      `INSERT INTO counters (pharmacy_id, n, label, status)
+       SELECT $1, gs.n, $2, 'building'
+         FROM generate_series(1, 79) AS gs(n)
+        WHERE NOT EXISTS (SELECT 1 FROM counters c WHERE c.pharmacy_id = $1 AND c.n = gs.n)
+        ORDER BY gs.n
+        LIMIT 1
+       RETURNING id`,
+      [pharmacyId, nz(label)]
+    );
+    if (!counter) return null;   // site already has all 79 slots
+    await q(
+      `UPDATE counters SET pi_device_id = $2, pi_enrolled_at = now() WHERE id = $1`,
+      [counter.id, deviceId]
+    );
+    return getCounter(counter.id);
+  }
+
+  async function listPharmacyVms(pharmacyId) {
+    return rows(
+      `SELECT v.vmid, v.ip, v.role, v.source, v.counter_id, v.address_overridden,
+              pv.name, pv.status, pv.node, pv.template
+         FROM pharmacy_vms_v v
+         LEFT JOIN proxmox_vms pv ON pv.vmid = v.vmid
+        WHERE v.pharmacy_id = $1
+        ORDER BY v.vmid`,
+      [pharmacyId]
+    );
+  }
+
+  // Attach an extra VM to a site. ON CONFLICT so re-attaching corrects the address instead
+  // of failing, which is what an operator fixing a typo expects.
+  async function attachPharmacyVm(pharmacyId, f) {
+    const r = f || {};
+    await q(
+      `INSERT INTO pharmacy_vms (pharmacy_id, vmid, ip, label)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (pharmacy_id, vmid) DO UPDATE SET ip = EXCLUDED.ip, label = EXCLUDED.label`,
+      [pharmacyId, r.vmid, String(r.ip || '').trim(), nz(r.label)]
+    );
+    return listPharmacyVms(pharmacyId);
+  }
+
+  async function detachPharmacyVm(pharmacyId, vmid) {
+    // Unified "remove from site": whatever links this VM to the site is severed. That is any
+    // explicit address (override or attached row), PLUS the assignment itself if the VM is
+    // the site's PMR server or a thin client's desktop. So Remove behaves the same on every
+    // row — the derived rows stop being read-only.
+    const del  = await q(`DELETE FROM pharmacy_vms WHERE pharmacy_id = $1 AND vmid = $2`, [pharmacyId, vmid]);
+    const srv  = await q(`UPDATE pharmacies SET srv_vmid = NULL WHERE id = $1 AND srv_vmid = $2`, [pharmacyId, vmid]);
+    const desk = await q(`UPDATE counters SET vmid = NULL WHERE pharmacy_id = $1 AND vmid = $2`, [pharmacyId, vmid]);
+    return { detached: (del.rowCount || 0) + (srv.rowCount || 0) + (desk.rowCount || 0) };
+  }
+
   // ── which VM a thin client boots into ──────────────────────────────────────
   // The operator picks a VM; the ADDRESS is resolved HERE rather than in the browser, so
   // the UI cannot push a counter at an address the platform's own numbering disagrees
@@ -1784,16 +2057,15 @@ function makePgStore(poolOrConfig) {
     const r = f || {};
     const updated = await one(
       `WITH ctx AS (
-         SELECT c.id, c.pharmacy_id, p.idx, p.server_ip, p.srv_vmid
-           FROM counters c JOIN pharmacies p ON p.id = c.pharmacy_id
-          WHERE c.id = $1
+         SELECT c.id, c.pharmacy_id FROM counters c WHERE c.id = $1
        ), resolved AS (
-         SELECT ctx.id,
-                CASE WHEN ctx.srv_vmid = $2 THEN ctx.server_ip
-                     WHEN sib.id IS NOT NULL THEN '10.' || ctx.idx || '.0.' || (20 + sib.n)
-                END AS ip
+         -- Reads pharmacy_vms_v, the SAME list the picker offers, so a choice that appears
+         -- in the dropdown always resolves here. A vmid outside the site's list yields no
+         -- row and the UPDATE below matches nothing, which the caller reports as a refusal.
+         SELECT ctx.id, v.ip
            FROM ctx
-           LEFT JOIN counters sib ON sib.pharmacy_id = ctx.pharmacy_id AND sib.vmid = $2
+           LEFT JOIN pharmacy_vms_v v
+                  ON v.pharmacy_id = ctx.pharmacy_id AND v.vmid = $2
        )
        UPDATE counters c SET
          boot_vmid   = $2,
@@ -1809,6 +2081,65 @@ function makePgStore(poolOrConfig) {
       [id, r.vmid, nz(r.by)]
     );
     return updated ? getCounter(id) : null;
+  }
+
+  // Back to the default (boot the site's PMR server). Clears the RESOLVED address too, not
+  // just the chosen vmid — leaving a stale boot_target would keep being pushed to the device
+  // and the UI would still show it as the answer.
+  async function clearCounterBootTarget(id, by) {
+    const updated = await one(
+      `UPDATE counters SET
+         boot_vmid = NULL, boot_target = NULL, boot_set_by = $2, boot_set_at = now(),
+         boot_applied_at = NULL
+       WHERE id = $1 RETURNING id`,
+      [id, nz(by)]
+    );
+    return updated ? getCounter(id) : null;
+  }
+
+  // ── editable per-thin-client options ───────────────────────────────────────
+  // MERGE (jsonb ||), never replace. The modal can save a single field, and a whole-object
+  // write would silently wipe every other setting on the row — on a live site that shows up
+  // as smartcards or printing "turning themselves off", with nothing in the audit trail.
+  //
+  // Validation is deliberately NOT here. It happens once, in shared/counterSettings.js,
+  // before this is called (and again on the Pi, and again in the launcher). Callers must
+  // never pass unvalidated input: this writes straight into a column the device consumes.
+  // The support-session block the PI reported, straight off its last telemetry. Read from
+  // device_state.raw rather than a column: it is device-reported, short-lived state, and adding
+  // a column for it would mean a migration every time the agent reports one more field.
+  async function getDeviceSupportVnc(deviceId) {
+    const { rows } = await pool.query(
+      `SELECT raw -> 'support_vnc' AS sv FROM device_state WHERE device_id = $1`, [deviceId],
+    );
+    return (rows[0] && rows[0].sv) || null;
+  }
+
+  // Append-only. Deliberately NOT a foreign key onto counters: the point of an audit trail is
+  // that it outlives the row it describes being edited or deleted.
+  async function recordSupportSession(r) {
+    await pool.query(
+      `INSERT INTO support_sessions (counter_id, pi_serial, pharmacy_code, actor, minutes)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [r.counter_id || null, r.pi_serial || null, r.pharmacy_code || null, r.actor || null, r.minutes || null],
+    );
+  }
+
+  async function setCounterSettings(id, settings) {
+    const updated = await one(
+      `UPDATE counters SET settings = counters.settings || $2::jsonb
+        WHERE id = $1 RETURNING id`,
+      [id, JSON.stringify(settings || {})]
+    );
+    return updated ? getCounter(id) : null;
+  }
+
+  // The STORED settings for whichever counter owns this Pi. Defaults are merged in by the
+  // caller (server-side, one place), so this returns only what an operator has actually
+  // chosen. Null for a Pi that has phoned home but is not adopted onto a counter yet —
+  // which the caller treats as "all defaults" rather than as an error.
+  async function getCounterSettingsForDevice(deviceId) {
+    return one(`SELECT settings FROM counters WHERE pi_device_id = $1`, [deviceId]);
   }
 
   // What to tell this Pi on its next tick, plus the confirmation stamp.
@@ -1835,6 +2166,277 @@ function makePgStore(poolOrConfig) {
       `SELECT boot_vmid AS vmid, boot_target AS target
          FROM counters WHERE pi_device_id = $1 AND boot_target IS NOT NULL`,
       [deviceId]
+    );
+  }
+
+  // ── site LAN inventory ─────────────────────────────────────────────────────
+  // Every host a site's routers have SEEN on its LAN, plus any printer a Pi registered that
+  // no router reports (a printer behind a switch on a segment the MikroTik does not bridge
+  // still needs to be listable). Site membership comes from site_devices_v, so this and the
+  // relay allowlist can never disagree about what "this site" contains.
+  //
+  // DISTINCT ON (ip) because mac_hosts is keyed (device_id, interface, mac): one host that
+  // roamed between two ports, or is seen by two routers, is several rows and one device. The
+  // most recently seen row wins. Classification is NOT done here — it is one shared JS table
+  // (shared/lanDevices.js) so the API and any future consumer share the rule.
+  //
+  // Capped: the busiest site in the estate reports ~1,570 hosts, so 2000 returns every real
+  // site whole while a runaway L2 table cannot hand the UI an unbounded list.
+  const SITE_HOSTS_CAP = 2000;
+
+  async function listSiteHosts(siteCode) {
+    const code = siteCode == null ? '' : String(siteCode);
+    if (!code) return [];
+    return rows(
+      `WITH site AS (
+         SELECT DISTINCT site_code, pharmacy_id FROM site_devices_v WHERE site_code = $1
+       ), lan AS (
+         SELECT DISTINCT ON (host(mh.ip))
+                host(mh.ip)  AS ip,
+                mh.mac::text AS mac,
+                mh.hostname,
+                mh.comment,
+                mh.vendor,
+                mh.last_seen_at,
+                'mac_hosts'  AS source
+           FROM mac_hosts mh
+           JOIN site_devices_v sd ON sd.device_id = mh.device_id
+          WHERE sd.site_code = $1
+            AND mh.ip IS NOT NULL
+          ORDER BY host(mh.ip), mh.last_seen_at DESC
+       ), registered AS (
+         -- A printer row is identity an operator or an SNMP sweep established; it is a
+         -- legitimate target even when no router has ARPed it.
+         SELECT pr.address AS ip,
+                NULL::text AS mac,
+                pr.name    AS hostname,
+                pr.notes   AS comment,
+                COALESCE(pr.make, 'printer') AS vendor,
+                pr.last_seen_at,
+                'printers' AS source
+           FROM printers pr
+          WHERE pr.pharmacy_id IN (SELECT pharmacy_id FROM site WHERE pharmacy_id IS NOT NULL)
+            AND pr.address IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM lan WHERE lan.ip = pr.address)
+       )
+       SELECT * FROM lan
+       UNION ALL
+       SELECT * FROM registered
+       LIMIT $2`,
+      [code, SITE_HOSTS_CAP]
+    );
+  }
+
+  // Does this site exist at all? Distinguishes "no such site" (404) from "a site with nothing
+  // on its LAN yet" (200 with an empty list) — a Pi enrolled before its router reported.
+  async function siteExists(siteCode) {
+    const code = siteCode == null ? '' : String(siteCode);
+    if (!code) return null;
+    return one(
+      `SELECT sd.site_code, max(sd.pharmacy_id) AS pharmacy_id, count(*) AS devices
+         FROM site_devices_v sd
+        WHERE sd.site_code = $1
+        GROUP BY sd.site_code`,
+      [code]
+    );
+  }
+
+  // ── relay: allowlist ───────────────────────────────────────────────────────
+  // THE gate. A target is legal only if it ALREADY appears for this Pi's own site, either as
+  // a host its routers have seen (mac_hosts) or as a registered printer. Free-text addresses
+  // are impossible by construction — there is no branch that trusts the caller's string.
+  //
+  // Returns { site_code, source } when allowed, else null. A Pi that no counter has adopted
+  // has no site, so it resolves to nothing and every target is refused.
+  async function findRelayTarget(deviceId, ip) {
+    if (!isUuid(deviceId)) return null;
+    const addr = ip == null ? '' : String(ip);
+    if (!addr) return null;
+    return one(
+      `WITH site AS (
+         -- Prefer the pharmacy link: a Pi is at its counter's site. The serial/site-name arms
+         -- of the view can also match a device, so order deterministically rather than
+         -- letting the planner choose which site a Pi belongs to.
+         SELECT sd.site_code, sd.pharmacy_id
+           FROM site_devices_v sd
+          WHERE sd.device_id = $1
+          ORDER BY (sd.pharmacy_id IS NULL), sd.site_code
+          LIMIT 1
+       ), hit AS (
+         -- host(mh.ip) rather than an inet cast: the address is compared as TEXT so no
+         -- malformed input can reach a cast and raise 22P02 out of the allowlist check.
+         SELECT 'mac_hosts' AS source
+           FROM mac_hosts mh
+           JOIN site_devices_v sd ON sd.device_id = mh.device_id
+           JOIN site s ON s.site_code = sd.site_code
+          WHERE mh.ip IS NOT NULL AND host(mh.ip) = $2
+         UNION ALL
+         SELECT 'printers'
+           FROM printers pr
+           JOIN site s ON s.pharmacy_id = pr.pharmacy_id
+          WHERE pr.address = $2
+       )
+       SELECT s.site_code, (SELECT source FROM hit LIMIT 1) AS source
+         FROM site s`,
+      [deviceId, addr]
+    );
+  }
+
+  // ── relay: sessions ────────────────────────────────────────────────────────
+  // Creating a session REPLACES any live one for that device, in one transaction, because the
+  // partial unique index allows exactly one. Replacing rather than refusing is deliberate: an
+  // engineer who reloads the panel must not be locked out for the rest of the TTL by their own
+  // abandoned session.
+  async function createRelaySession(f = {}) {
+    return tx(async (client) => {
+      await client.query(
+        `UPDATE relay_sessions SET closed_at = now(), closed_reason = 'replaced'
+          WHERE device_id = $1 AND closed_at IS NULL`,
+        [f.device_id]
+      );
+      const r = await client.query(
+        `INSERT INTO relay_sessions
+           (device_id, site_code, target_ip, target_port, opened_by, expires_at)
+         VALUES ($1,$2,$3,$4,$5, now() + make_interval(secs => $6::int))
+         RETURNING id, device_id, site_code, target_ip, target_port, opened_by,
+                   created_at, expires_at`,
+        [f.device_id, nz(f.site_code), f.target_ip, f.target_port, nz(f.opened_by), f.ttl_s]
+      );
+      return r.rows[0];
+    });
+  }
+
+  async function getRelaySession(id) {
+    if (!isUuid(id)) return null;
+    return one(
+      `SELECT id, device_id, site_code, target_ip, target_port, opened_by,
+              created_at, expires_at, closed_at, closed_reason, last_poll_at,
+              (closed_at IS NULL AND expires_at > now()) AS live
+         FROM relay_sessions WHERE id = $1`,
+      [id]
+    );
+  }
+
+  // What to tell this Pi on its next telemetry reply. Sent EVERY tick while the session is
+  // live, exactly like the boot target and settings, and for the same reason: it is then
+  // self-healing. Unlike a queued reboot this is safe to repeat — re-learning a session the Pi
+  // already holds is a no-op, whereas a once-only handover lost to a dropped response would
+  // strand the operator for the whole TTL.
+  async function getRelayDirective(deviceId) {
+    if (!isUuid(deviceId)) return null;
+    return one(
+      `SELECT id AS session_id, target_ip, target_port, expires_at
+         FROM relay_sessions
+        WHERE device_id = $1 AND closed_at IS NULL AND expires_at > now()`,
+      [deviceId]
+    );
+  }
+
+  async function closeRelaySession(id, reason) {
+    if (!isUuid(id)) return null;
+    return one(
+      `UPDATE relay_sessions SET closed_at = now(), closed_reason = $2
+        WHERE id = $1 AND closed_at IS NULL RETURNING id`,
+      [id, nz(reason)]
+    );
+  }
+
+  // Records that the Pi is actually holding the channel open. Called once per long poll (not
+  // per DB poll inside it), so this is one write per 25 s per worker, not one per 150 ms.
+  async function touchRelaySession(id) {
+    if (!isUuid(id)) return;
+    await q(`UPDATE relay_sessions SET last_poll_at = now() WHERE id = $1`, [id]);
+  }
+
+  // Housekeeping, run opportunistically when a session is created rather than from the worker:
+  // the relay is used a handful of times a day, so a cron for it would be more moving parts
+  // than the thing it tidies. Replies are already deleted as the browser collects them
+  // (takeRelayReply), so this only mops up what a disconnected browser abandoned.
+  async function pruneRelay() {
+    await q(
+      `UPDATE relay_sessions SET closed_at = now(), closed_reason = 'expired'
+        WHERE closed_at IS NULL AND expires_at <= now()`
+    );
+    // 15 minutes > the 10-minute session TTL, so this can never delete a request that a live
+    // session might still be answering.
+    await q(`DELETE FROM relay_requests WHERE created_at < now() - interval '15 minutes'`);
+    await q(`DELETE FROM relay_sessions WHERE created_at < now() - interval '7 days'`);
+  }
+
+  // ── relay: the request/reply queue ─────────────────────────────────────────
+  // Enqueue only against a LIVE session: the INSERT ... SELECT returns no row for a closed or
+  // expired one, which the caller turns into 410 without a second round trip (and without a
+  // check-then-insert window in which the session could expire).
+  async function enqueueRelayRequest(sessionId, r = {}) {
+    if (!isUuid(sessionId)) return null;
+    return one(
+      `INSERT INTO relay_requests (session_id, method, path, headers, body_b64)
+       SELECT s.id, $2, $3, $4::jsonb, $5
+         FROM relay_sessions s
+        WHERE s.id = $1 AND s.closed_at IS NULL AND s.expires_at > now()
+       RETURNING id`,
+      [sessionId, r.method, r.path, JSON.stringify(r.headers || {}), nz(r.body_b64)]
+    );
+  }
+
+  // Hand the oldest queued request to whichever of the Pi's pool workers asked first.
+  // FOR UPDATE SKIP LOCKED is the point: three workers claiming concurrently each get a
+  // different row instead of serialising or double-fetching one.
+  //
+  // A claim also EXPIRES after 10 seconds, which makes delivery at-least-once for reads: a Pi
+  // whose long poll died between claiming and replying (a 4G site blipping) would otherwise
+  // leave one asset unanswered and the page half-rendered. 10 s is longer than any healthy LAN
+  // fetch and shorter than the browser's 30 s ceiling, so a redelivery still has time to land.
+  // If both attempts do answer, the second reply hits 409 — the row is already 'done'.
+  //
+  // GET/HEAD only, deliberately. Redelivering a POST would resubmit a form the operator sent
+  // once: a printer login, or a "restart the print engine" button. A lost POST stays lost and
+  // the browser is told so.
+  async function claimRelayRequest(sessionId) {
+    if (!isUuid(sessionId)) return null;
+    return one(
+      `UPDATE relay_requests r
+          SET state = 'claimed', claimed_at = now()
+        WHERE r.id = (
+          SELECT id FROM relay_requests
+           WHERE session_id = $1
+             AND (state = 'queued'
+                  OR (state = 'claimed'
+                      AND method IN ('GET', 'HEAD')
+                      AND claimed_at < now() - interval '10 seconds'))
+           ORDER BY seq
+           FOR UPDATE SKIP LOCKED
+           LIMIT 1
+        )
+       RETURNING r.id AS request_id, r.method, r.path, r.headers, r.body_b64`,
+      [sessionId]
+    );
+  }
+
+  // Scoped by session_id as well as request id so one device's token can never answer another
+  // session's request, and by state='claimed' so a reply cannot be replayed.
+  async function replyRelayRequest(sessionId, requestId, f = {}) {
+    if (!isUuid(sessionId) || !isUuid(requestId)) return null;
+    return one(
+      `UPDATE relay_requests
+          SET state = 'done', replied_at = now(),
+              status = $3, resp_headers = $4::jsonb, resp_body_b64 = $5
+        WHERE id = $2 AND session_id = $1 AND state = 'claimed'
+        RETURNING id`,
+      [sessionId, requestId, f.status, JSON.stringify(f.headers || {}), nz(f.body_b64)]
+    );
+  }
+
+  // DELETE ... RETURNING: the browser reads a reply exactly once, and the row is gone the
+  // moment it does. That is what keeps this table at a handful of rows without a reaper, and
+  // it means a proxied response body is not left sitting in the database after delivery.
+  async function takeRelayReply(sessionId, requestId) {
+    if (!isUuid(sessionId) || !isUuid(requestId)) return null;
+    return one(
+      `DELETE FROM relay_requests
+        WHERE id = $2 AND session_id = $1 AND state = 'done'
+        RETURNING status, resp_headers AS headers, resp_body_b64 AS body_b64`,
+      [sessionId, requestId]
     );
   }
 
@@ -2079,10 +2681,36 @@ function makePgStore(poolOrConfig) {
     updateCounter,
     deleteCounter,
     linkCounterPi,
+    listLanPrinters,
+    getPrinter,
+    setCounterActionForDevice,
+    listUnclaimedPis,
+    adoptPi,
+    listPharmacyVms,
+    attachPharmacyVm,
+    detachPharmacyVm,
     setCounterBootTarget,
+    clearCounterBootTarget,
     setCounterAction,
     takeCounterAction,
     getCounterBootDirective,
+    setCounterSettings,
+    getDeviceSupportVnc,
+    recordSupportSession,
+    getCounterSettingsForDevice,
+    listSiteHosts,
+    siteExists,
+    findRelayTarget,
+    createRelaySession,
+    getRelaySession,
+    getRelayDirective,
+    closeRelaySession,
+    touchRelaySession,
+    pruneRelay,
+    enqueueRelayRequest,
+    claimRelayRequest,
+    replyRelayRequest,
+    takeRelayReply,
     reportWgPeers,
     listWgPeers,
     listTags,
@@ -2110,6 +2738,14 @@ function makePgStore(poolOrConfig) {
     upsertMacHosts,
     upsertWifiNetworks,
     upsertWirelessClients,
+    upsertDeviceScreen,
+    getDeviceScreen,
+    pruneDeviceScreens,
+    getBranding,
+    getBrandingSplash,
+    updateBrandingText,
+    setBrandingSplash,
+    clearBrandingSplash,
     appendDeviceLogs,
     getDeviceLogs,
     pruneDeviceLogs,

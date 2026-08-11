@@ -577,6 +577,28 @@ function makeMemStore(_config) {
     return out.slice(0, Math.max(0, limit));
   }
 
+  // ── fleet-wide thin-client branding ─────────────────────────────────────────
+  // No-op stubs. The mem store backs the unit/e2e suites, none of which exercise branding, and
+  // the handlers already tolerate an empty record (they render the all-null shape) — so an
+  // honest "nothing configured" is better here than a second in-memory implementation of the
+  // upsert semantics that could drift from store.pg.js. Present rather than absent so the
+  // `typeof store.x === 'function'` guards take the same branch under both stores.
+  async function getBranding() {
+    return null;
+  }
+  async function getBrandingSplash() {
+    return null;
+  }
+  async function updateBrandingText(/* fields, updatedBy */) {
+    return null;
+  }
+  async function setBrandingSplash(/* shot, updatedBy */) {
+    return null;
+  }
+  async function clearBrandingSplash(/* updatedBy */) {
+    return null;
+  }
+
   // ── audit ────────────────────────────────────────────────────────────────────
   async function appendAudit(actor, action, serial, details) {
     auditLog.push({
@@ -906,6 +928,53 @@ function makeMemStore(_config) {
     }
   }
 
+  // ── site inventory + relay (not implemented here) ───────────────────────────
+  // The mem store models the ROUTER telemetry contract, not the PMR layer (pharmacies,
+  // counters, printers) that site membership and the relay allowlist are derived from — the
+  // same reason listPharmacies and friends are absent. These stubs exist so the ingest's
+  // `typeof store.x === 'function'` guards see a function and answer 501 / "no site" instead
+  // of throwing: an empty inventory and a refused relay target are the SAFE answers, and a mem
+  // store must never accidentally authorise a proxy hop.
+  async function listSiteHosts() {
+    return [];
+  }
+  async function siteExists() {
+    return null;
+  }
+  async function findRelayTarget() {
+    return null;
+  }
+  async function createRelaySession() {
+    return null;
+  }
+  async function getRelaySession() {
+    return null;
+  }
+  async function getRelayDirective() {
+    return null;
+  }
+  async function closeRelaySession() {
+    return null;
+  }
+  async function touchRelaySession() {
+    /* nothing to record */
+  }
+  async function pruneRelay() {
+    /* nothing to prune */
+  }
+  async function enqueueRelayRequest() {
+    return null;
+  }
+  async function claimRelayRequest() {
+    return null;
+  }
+  async function replyRelayRequest() {
+    return null;
+  }
+  async function takeRelayReply() {
+    return null;
+  }
+
   // ── test/seed helpers (in addition to the Store interface) ──────────────────
   // Not part of the Store interface — exposed so tests can stand up fixtures directly
   // (e.g. push an approved config job, publish an agent script, define an alert rule)
@@ -1016,6 +1085,11 @@ function makeMemStore(_config) {
     upsertMacHosts,
     upsertWifiNetworks,
     upsertWirelessClients,
+    getBranding,
+    getBrandingSplash,
+    updateBrandingText,
+    setBrandingSplash,
+    clearBrandingSplash,
     appendDeviceLogs,
     getDeviceLogs,
     pruneDeviceLogs,
@@ -1058,6 +1132,19 @@ function makeMemStore(_config) {
     pruneHistory,
     pruneNeighbors,
     pruneMacHosts,
+    listSiteHosts,
+    siteExists,
+    findRelayTarget,
+    createRelaySession,
+    getRelaySession,
+    getRelayDirective,
+    closeRelaySession,
+    touchRelaySession,
+    pruneRelay,
+    enqueueRelayRequest,
+    claimRelayRequest,
+    replyRelayRequest,
+    takeRelayReply,
     // Test/seed convenience (not part of the Store interface): insert a config_jobs row
     // directly so config.test.js can stand up draft/approved jobs without SQL. Returns the
     // row (incl. its id). Mirrors seedDevice.

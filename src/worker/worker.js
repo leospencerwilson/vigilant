@@ -190,6 +190,8 @@ async function runOnce({ store, config, now }) {
   await store.pruneMacHosts(at, cfg.neighborTtlS);
   // 4b. device log history — 30-day retention
   if (typeof store.pruneDeviceLogs === 'function') await store.pruneDeviceLogs();
+  // Screen thumbnails expire far sooner than logs — see pruneDeviceScreens.
+  if (typeof store.pruneDeviceScreens === 'function') await store.pruneDeviceScreens();
 
   // 5. optional nightly config snapshots
   if (cfg.enableNightlySnapshot) {
