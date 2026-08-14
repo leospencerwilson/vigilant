@@ -175,6 +175,11 @@ BindReadOnlyPaths=-/home/westerncomms/.Xauthority:/run/wcn-xauth
 ReadWritePaths=-/etc/motd
 ReadWritePaths=-/etc/issue
 ReadWritePaths=-/usr/share/plymouth/themes/pix
+# The agent replaces its OWN binary when Watchman ships a new one (VIGILANT_AUTO_UPDATE=1
+# above), and that binary lives under /usr - which ProtectSystem=full mounts read-only
+# inside this namespace. Without this grant EVERY self-update fails with EROFS, silently,
+# while the agent otherwise looks perfectly healthy. Measured on a fresh install 2026-08-14.
+ReadWritePaths=-/usr/local/sbin
 
 [Install]
 WantedBy=multi-user.target
