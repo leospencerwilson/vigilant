@@ -750,6 +750,14 @@ AGENT_SETTINGS = {
     # an audit row, and a feature that needs a per-device push before it works would be
     # discovered as "the relay is broken" during the incident someone needed it for.
     "relay_enabled":     ("bool", True, None),
+    # Minutes to share this counter's LIVE screen for support. 0 = off, and off is the default:
+    # a counter mirrors its screen only because an operator just asked it to.
+    #
+    # A DURATION, not a deadline — it keeps this table's bool/int-only invariant, and the Pi then
+    # computes expiry from its OWN clock, so a device whose NTP has drifted cannot be handed a
+    # timestamp already past (never opens) or hours ahead (never closes). Capped server-side at
+    # 60; the range here is the second lock on the same door.
+    "support_vnc_min":   ("int", 0, (0, 60)),
 }
 
 # The KEY= name each session setting takes in kiosk.conf. Held separately from the wire
@@ -956,6 +964,12 @@ def apply_settings(settings):
     # revoked relay access is entitled to have the channel shut on this tick, not the next.
     if agent.get("relay_enabled") is False:
         relay_close(reason="disabled from Watchman")
+    # Torn down on THIS tick for the same reason as the relay: an operator who has just revoked
+    # support access is entitled to have the screen stop being shared now, not in 30 seconds.
+    # `== 0` and not `is False` — this one is an int, and a key that was NOT sent must not read
+    # as "disable" and kill a session an earlier tick legitimately started.
+    if agent.get("support_vnc_min") == 0:
+        support_vnc_stop(reason="disabled from Watchman")
     return changed, agent.get("report_interval_s")
 
 
@@ -1552,6 +1566,9 @@ def build_payload(conf):
         # else by fails schema validation and takes the WHOLE telemetry POST down with it, so a
         # new field gets a name nothing can already have claimed.
         "relay_session": relay_status(),
+        # Whether this counter is sharing its screen, and the per-session password Vigilant needs
+        # to sign a viewer token. Reported only while genuinely live.
+        "support_vnc": support_vnc_status(),
         # Detected, not asserted: proves presence, never that a peripheral works end to end.
         "peripherals": peripherals(rdp.get("redirect") or ""),
         # Counter-Pi specifics a router agent would have no reason to gather.
@@ -2148,6 +2165,219 @@ def run_action(name):
     print(f"vigilant-pi-agent: service action '{name}' -> {' '.join(cmd)}", flush=True)
     run(cmd, timeout=25)
 
+
+# ── support screen sharing ───────────────────────────────────────────────────
+# WHY x11vnc AND WHY DISPLAY :0. An engineer supporting a counter needs to see what the
+# pharmacist sees, and the pharmacist needs to see that happening. Attaching to the LIVE display
+# gives both for free: there is no second desktop, so the person at the counter watches the same
+# pixels and can be shown things. A separate virtual display would have made support covert,
+# which for a screen holding patient records is the wrong default.
+#
+# WHAT THIS IS NOT: reachable from the shop. x11vnc binds the WireGuard address ONLY, so the
+# sole route in is the hub — the one thing that can already reach this Pi. -noipv6 is not
+# optional: without it x11vnc ALSO binds [::] on every interface, and a Pi has link-local
+# addresses on eth0 and wlan0, so the port would be live on the pharmacy LAN. There is no host
+# firewall on these devices. The bind IS the control.
+SUPPORT_VNC_PORT = 5900
+SUPPORT_VNC_PASS = "/var/lib/wcn/vnc.pass"
+# The unit resolves the X auth file and the wg address itself at start time — neither can be a
+# literal here, and neither is visible from inside this process's namespace anyway.
+SUPPORT_VNC_UNIT = "wcn-support-vnc"
+# ON DISK, deliberately. This used to be a module-level dict, which desynchronised from
+# reality every time the agent restarted while the unit kept running: Watchman would then report
+# a password x11vnc had never loaded, and the operator got "password check failed". A file is
+# also what lets an EXPIRED request stay expired across a restart instead of re-sharing a
+# counter's screen every fifteen minutes for ever.
+SUPPORT_VNC_STATE = "/var/lib/wcn/support-vnc.state"
+
+
+def _support_state():
+    """{password, until, minutes, expired}. Missing or unreadable reads as "no session", which
+    is the safe direction: it can only ever cause a refusal, never an unintended share."""
+    try:
+        with open(SUPPORT_VNC_STATE) as fh:
+            d = json.load(fh)
+        return {"password": d.get("password"),
+                "until": float(d.get("until") or 0),
+                "minutes": int(d.get("minutes") or 0),
+                "expired": bool(d.get("expired"))}
+    except Exception:
+        return {"password": None, "until": 0.0, "minutes": 0, "expired": False}
+
+
+def _support_write(**kw):
+    """Merge and persist. Written via a temp file and os.replace so a torn read can never look
+    like a live session with half a password."""
+    st = _support_state()
+    st.update(kw)
+    tmp = SUPPORT_VNC_STATE + ".new"
+    with open(tmp, "w") as fh:
+        json.dump(st, fh)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SUPPORT_VNC_STATE)
+    return st
+
+
+def _support_forget():
+    try:
+        os.unlink(SUPPORT_VNC_STATE)
+    except OSError:
+        pass
+
+
+def wg_local_ip():
+    """This Pi's own address on wg0. Read from the interface, never derived: the estate does not
+    follow the 10.255.<idx>.<n> convention the schema once assumed, and a derived address that
+    no device answers on is a bug that hides until someone tries to connect."""
+    out = run(["ip", "-4", "-o", "addr", "show", "wg0"])
+    m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", out or "")
+    return m.group(1) if m else None
+
+
+def _support_xauth():
+    """The X authority file the RUNNING Xorg used. Read from /proc rather than assumed: on these
+    images /run/wcn-xauth is written empty, and guessing ~/.Xauthority is how screen capture
+    silently failed. No Xorg means nothing to share, which is not an error."""
+    pids = run(["pgrep", "-x", "Xorg"]).split()
+    if not pids:
+        return None
+    try:
+        with open("/proc/%s/cmdline" % pids[0], "rb") as fh:
+            argv = fh.read().split(b"\0")
+    except OSError:
+        return None
+    for i, a in enumerate(argv):
+        if a == b"-auth" and i + 1 < len(argv):
+            return argv[i + 1].decode("utf-8", "replace") or None
+    return None
+
+
+def support_vnc_running():
+    """Is OUR support unit active? Deliberately asks systemd about ONE named unit rather than
+    looking for x11vnc processes: these Pis also run an unrelated x11vnc.service that shadows the
+    display on localhost, and a name-based check made this feature kill it on every tick.
+
+    THIS DISTINCTION IS LOAD-BEARING. These Pis already run an x11vnc.service that shadows the
+    kiosk display on localhost, so a bare `pgrep x11vnc` is true when this feature owns nothing,
+    and acting on that answer means killing another service's process every tick while systemd
+    restarts it. We only ever manage the pid we started."""
+    return run(["systemctl", "is-active", SUPPORT_VNC_UNIT]).strip() == "active"
+
+
+def support_vnc_stop(reason="closed", expired=False):
+    """Idempotent, and surgical: kills only the process this feature started. NEVER pkill by
+    name — see support_vnc_running()."""
+    was = support_vnc_running()
+    if was:
+        run(["systemctl", "stop", SUPPORT_VNC_UNIT])
+    if expired:
+        # Remember WHICH request we served. Watchman re-sends the whole effective settings set on
+        # every tick, so without this the same `support_vnc_min` would start a new session the
+        # moment the last one ended — for ever. Cleared properly when Watchman sends 0, which the
+        # UI does when the operator closes the window.
+        _support_write(password=None, until=0.0, expired=True)
+    else:
+        _support_forget()
+    if was:
+        print("vigilant-pi-agent: support screen sharing stopped (%s)" % reason, flush=True)
+
+
+def _support_start(minutes, wg_ip):
+    """Start x11vnc on the live display for `minutes`, bound to the tunnel address only.
+
+    A FRESH PASSWORD EVERY SESSION, reported UPWARD in telemetry and never accepted downward:
+    the settings table is a closed bool/int whitelist and pushing a secret through it would make
+    it the first free-text value in a channel whose safety rests on there being none."""
+    # NOTE: the X auth file is NOT resolved here. This process runs with PrivateTmp=yes, so
+    # /tmp/serverauth.* is invisible to it; the unit does that resolution outside the namespace.
+    # EIGHT characters. VNC auth derives its DES key from the first 8 bytes and discards the
+    # rest, so a longer secret is not stronger — it is just a password whose tail is a lie.
+    # urandom+base64 rather than the secrets module: both are already imported.
+    password = base64.urlsafe_b64encode(os.urandom(6)).decode().rstrip("=")[:8]
+    try:
+        rc = subprocess.call(["x11vnc", "-storepasswd", password, SUPPORT_VNC_PASS],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        print("vigilant-pi-agent: x11vnc is not installed", flush=True)
+        return False
+    if rc != 0:
+        print("vigilant-pi-agent: could not store the support password", flush=True)
+        return False
+    try:
+        os.chmod(SUPPORT_VNC_PASS, 0o640)
+        shutil.chown(SUPPORT_VNC_PASS, group="westerncomms")
+    except OSError:
+        pass
+    support_vnc_stop(reason="restarting")
+    run(["systemctl", "start", SUPPORT_VNC_UNIT])
+    # VERIFY, do not assume. An earlier version logged "started" from the fact that spawning
+    # returned without raising, and reported success for two minutes while the server was in
+    # fact dying instantly. If the unit is not active, say so.
+    time.sleep(2)
+    if not support_vnc_running():
+        print("vigilant-pi-agent: support screen sharing FAILED to start "
+              "(journalctl -u %s)" % SUPPORT_VNC_UNIT, flush=True)
+        return False
+    # Recorded only once the unit is CONFIRMED up, so a failed start never leaves a state file
+    # claiming a live session with a password nothing is serving.
+    _support_write(password=password, until=time.time() + minutes * 60,
+                   minutes=minutes, expired=False)
+    print("vigilant-pi-agent: support screen sharing started on %s:%d for %d min"
+          % (wg_ip, SUPPORT_VNC_PORT, minutes), flush=True)
+    return True
+
+
+def support_vnc_tick():
+    """Reconcile what is running with what Watchman asked for. Every tick.
+
+    EXPIRY IS ENFORCED HERE, on this device, and that is the point: a support session ends
+    because the Pi decided the time was up — not because a server remembered to say so, and not
+    because someone closed a browser tab. Same reasoning as the relay's own local TTL."""
+    want = RUNTIME.get("support_vnc_min") or 0
+    st = _support_state()
+
+    if want <= 0:
+        # Only if WE have a session. Without this the branch fires on every tick of every Pi
+        # that happens to run an unrelated x11vnc, which is how this feature started killing
+        # x11vnc.service in a loop.
+        if st["until"] or st["expired"] or support_vnc_running():
+            support_vnc_stop(reason="turned off in Watchman")
+        return
+
+    # A CHANGED duration on a LIVE session: move the deadline and keep the password. Restarting
+    # here is what broke "30 minutes" — it rotated the secret Watchman was already showing.
+    if want != st["minutes"] and support_vnc_running() and not st["expired"]:
+        _support_write(minutes=want, until=time.time() + want * 60)
+        print("vigilant-pi-agent: support session duration now %d min "
+              "(same password, not restarted)" % want, flush=True)
+        return
+
+    # Already served this exact request. Waiting for Watchman to send 0 or a different value is
+    # what stops a counter re-sharing its screen every N minutes indefinitely.
+    if st["expired"] and want == st["minutes"]:
+        return
+
+    if st["until"] and time.time() >= st["until"]:
+        support_vnc_stop(reason="session expired", expired=True)
+        return
+
+    if not support_vnc_running():
+        _support_start(want, wg_local_ip())
+
+
+def support_vnc_status():
+    """For telemetry. The password rides UP only while a session is genuinely live, so Vigilant
+    can put it in the short-lived token it signs for the browser. It is a per-session secret for
+    a port only the hub can reach, and it dies with the session."""
+    st = _support_state()
+    if not (support_vnc_running() and st["until"] > time.time()):
+        return {"active": False}
+    return {
+        "active": True,
+        "port": SUPPORT_VNC_PORT,
+        "expires_in_s": int(st["until"] - time.time()),
+        "password": st["password"],
+    }
 
 # ── relay: reverse HTTP proxy onto the site LAN ──────────────────────────────
 # WHY IT IS SHAPED LIKE THIS. Nothing can dial IN to a Pi: the hub's forward chain is
@@ -2942,6 +3172,11 @@ def main():
         shot_every = RUNTIME.get("screenshot_every", 0)
         if shot_every > 0 and (n % shot_every == 0) and conf.get("VIGILANT_TOKEN"):
             send_screen(conf)
+        # EVERY tick, not on a multiple: this both starts a session an operator has just asked
+        # for and ENDS one whose time is up, and a counter that keeps sharing its screen for
+        # several minutes after expiry because the reconcile runs every 10th tick would make the
+        # duration a suggestion rather than a limit.
+        support_vnc_tick()
         # `not isinstance(got, bool)` is essential: bool subclasses int, so a False return
         # from a failed tick would otherwise be accepted as an interval, giving sleep(0) and
         # a hot retry loop against the ingest.
