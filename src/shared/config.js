@@ -54,11 +54,6 @@ const config = Object.freeze({
   // site — so a leak of this token cannot reach any existing device or site. Rotate
   // independently of the estate master token.
   selfEnrolToken: process.env.SELF_ENROL_TOKEN || "",
-  // Scoped read token for the PMR desktop gateway (VM 300). The gateway agent carries this to
-  // pull the rendered dnsmasq drop-ins (GET /gateway/dnsmasq). Read-only and single-purpose, so
-  // it can sit on the gateway without handing it the estate master token. The master admin token
-  // also authenticates the endpoint. Rotate independently.
-  gatewayPullToken: process.env.GATEWAY_PULL_TOKEN || "",
   // CORS allow-list for browser callers. '*' (default) echoes any origin (safe here: auth is a
   // bearer token, not cookies). Set a comma-separated list to lock it to the wc_field origin(s).
   corsAllowOrigins: process.env.CORS_ALLOW_ORIGINS || "*",

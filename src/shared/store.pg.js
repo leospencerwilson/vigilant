@@ -1812,54 +1812,33 @@ function makePgStore(poolOrConfig) {
 
   async function createPharmacy(f) {
     const r = f || {};
-    // The network columns are optional: any left NULL are filled from idx by the
-    // pharmacies_fill_net() trigger, so the common case still passes only code/idx/name.
-    // prefix_len is NOT NULL, so COALESCE it to the /27 default rather than passing NULL.
     return one(
-      `INSERT INTO pharmacies (code, idx, name, pmr_system, status, proxmox_node, srv_vmid, go_live_on, notes, crm_site_id,
-                               prefix_len, gateway_ip, server_ip, dhcp_from, dhcp_to, dns_servers, domain, lease_time, ntp_server)
-       VALUES ($1,$2,$3,COALESCE($4,'proscript'),COALESCE($5,'planned'),$6,$7,$8,$9,$10,
-               COALESCE($11,27),$12,$13,$14,$15,$16,$17,$18,$19)
+      `INSERT INTO pharmacies (code, idx, name, pmr_system, status, proxmox_node, srv_vmid, go_live_on, notes, crm_site_id)
+       VALUES ($1,$2,$3,COALESCE($4,'proscript'),COALESCE($5,'planned'),$6,$7,$8,$9,$10)
        RETURNING *`,
       [String(r.code || '').trim().toUpperCase(), r.idx, String(r.name || '').trim(),
        nz(r.pmr_system), nz(r.status), nz(r.proxmox_node), nz(r.srv_vmid), nz(r.go_live_on), nz(r.notes),
-       nz(r.crm_site_id),
-       nz(r.prefix_len), nz(r.gateway_ip), nz(r.server_ip), nz(r.dhcp_from), nz(r.dhcp_to),
-       nz(r.dns_servers), nz(r.domain), nz(r.lease_time), nz(r.ntp_server)]
+       nz(r.crm_site_id)]
     );
   }
 
   async function updatePharmacy(id, f) {
     const r = f || {};
-    // idx is deliberately NOT updatable: it derives the VLAN and the network address (10.idx.0.0),
-    // which are baked into every counter Pi's WireGuard AllowedIPs. Renumbering a pharmacy is a
-    // migration, not a field edit. prefix_len and the addressing DO update — but note that
-    // changing them here only moves the REGISTRY; the gateway's live dnsmasq/nftables follow
-    // from a config-push job (Phase 2), not from this write.
+    // idx is deliberately NOT updatable: it derives the VLAN and every address in the
+    // subnet, all of which are already live in nftables, dnsmasq and the VM configs.
+    // Renumbering a pharmacy is a migration, not a field edit.
     const updated = await one(
       `UPDATE pharmacies SET
          name = COALESCE($2, name), pmr_system = COALESCE($3, pmr_system),
          status = COALESCE($4, status), proxmox_node = COALESCE($5, proxmox_node),
          srv_vmid = COALESCE($6, srv_vmid), go_live_on = COALESCE($7, go_live_on),
-         notes = COALESCE($8, notes),
-         prefix_len  = COALESCE($9, prefix_len),
-         gateway_ip  = COALESCE($10, gateway_ip),
-         server_ip   = COALESCE($11, server_ip),
-         dhcp_from   = COALESCE($12, dhcp_from),
-         dhcp_to     = COALESCE($13, dhcp_to),
-         dns_servers = COALESCE($14, dns_servers),
-         domain      = COALESCE($15, domain),
-         lease_time  = COALESCE($16, lease_time),
-         ntp_server  = COALESCE($17, ntp_server)
+         notes = COALESCE($8, notes)
        WHERE id = $1 RETURNING *`,
       [id, nz(r.name), nz(r.pmr_system), nz(r.status), nz(r.proxmox_node),
-       nz(r.srv_vmid), nz(r.go_live_on), nz(r.notes),
-       nz(r.prefix_len), nz(r.gateway_ip), nz(r.server_ip), nz(r.dhcp_from), nz(r.dhcp_to),
-       nz(r.dns_servers), nz(r.domain), nz(r.lease_time), nz(r.ntp_server)]
+       nz(r.srv_vmid), nz(r.go_live_on), nz(r.notes)]
     );
-    // The per-site counter banner is set DIRECTLY (not COALESCE) so it can be CLEARED, and only
-    // when the caller actually includes it — so editing a pharmacy's name never wipes its banner.
-    // An empty message clears both fields; the level is validated here.
+    // Per-site counter banner set DIRECTLY (not COALESCE) so it can be CLEARED, and only when the
+    // caller includes it — so editing a pharmacy's name never wipes its banner. Empty clears both.
     if (Object.prototype.hasOwnProperty.call(r, 'banner_text')) {
       const text = (r.banner_text == null || String(r.banner_text).trim() === '')
         ? null : String(r.banner_text);

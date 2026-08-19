@@ -17,8 +17,6 @@ const crypto = require('node:crypto');
 
 const transform = require('../shared/transform');
 const telemetry = require('../shared/telemetry');
-// Renders a pharmacy's editable network settings into the dnsmasq drop-in the gateway applies.
-const pmrGateway = require('../shared/pmrGateway');
 // The one validator + the one copy of the per-thin-client defaults. Both the save path and
 // the telemetry push go through this module so the UI, the server and the Pi cannot drift.
 const { validateCounterSettings, effectiveCounterSettings } = require('../shared/counterSettings');
@@ -1692,42 +1690,6 @@ async function pharmacyGet(ctx) {
   return json(res, 200, { ok: true, pharmacy: p, counters });
 }
 
-// Validate the editable network settings before they reach the DB. Format + range + pool
-// ordering are checked here; subnet-containment against the site's own net is enforced in the
-// UI (which knows the index). `idx` is passed on create so the last octet can be range-checked
-// against the prefix; on update it is omitted (idx is immutable) and containment is skipped.
-const IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$/;
-const lastOctet = (ip) => Number(String(ip).split('.').pop());
-function validateNetFields(p, { idx } = {}) {
-  let prefix = null;
-  if (p.prefix_len !== undefined && p.prefix_len !== null && p.prefix_len !== '') {
-    prefix = Number(p.prefix_len);
-    if (!Number.isInteger(prefix) || prefix < 24 || prefix > 30) return 'prefix_len must be an integer 24–30';
-  }
-  const single = { gateway_ip: 'gateway_ip', server_ip: 'server_ip', dhcp_from: 'dhcp_from', dhcp_to: 'dhcp_to', ntp_server: 'ntp_server' };
-  for (const key of Object.keys(single)) {
-    const v = p[key];
-    if (v === undefined || v === null || v === '') continue;
-    if (!IPV4.test(String(v).trim())) return `${key} must be a valid IPv4 address`;
-  }
-  if (p.dns_servers !== undefined && p.dns_servers !== null && String(p.dns_servers).trim() !== '') {
-    const parts = String(p.dns_servers).split(',').map((s) => s.trim()).filter(Boolean);
-    if (!parts.length || parts.some((s) => !IPV4.test(s))) return 'dns_servers must be a comma-separated list of IPv4 addresses';
-  }
-  // Pool ordering and, when we can, containment in the /prefix.
-  const from = p.dhcp_from, to = p.dhcp_to;
-  if (from && to && IPV4.test(String(from)) && IPV4.test(String(to))) {
-    if (lastOctet(from) > lastOctet(to)) return 'dhcp_from must not be above dhcp_to';
-    if (prefix != null && idx != null) {
-      const max = Math.pow(2, 32 - prefix) - 1; // last usable octet within 10.200.idx.0/prefix
-      for (const [k, v] of [['dhcp_from', from], ['dhcp_to', to]]) {
-        if (String(v).startsWith(`10.200.${idx}.`) && lastOctet(v) > max) return `${k} (${v}) is outside 10.200.${idx}.0/${prefix}`;
-      }
-    }
-  }
-  return null;
-}
-
 async function pharmacyCreate(ctx) {
   const { res, store, body } = ctx;
   const p = parseJsonBody(body);
@@ -1738,12 +1700,10 @@ async function pharmacyCreate(ctx) {
   // up front — the DB CHECK would otherwise surface as a 500.
   const idx = Number(p.idx);
   if (!Number.isInteger(idx) || idx < 1 || idx > 154) {
-    return json(res, 400, { ok: false, error: 'idx must be an integer 1–154 (it derives vlan 100+idx and 10.200.idx.0/27)' });
+    return json(res, 400, { ok: false, error: 'idx must be an integer 1–154 (it derives vlan 100+idx and 10.idx.0.0/24)' });
   }
   if (p.pmr_system && !PMR_SYSTEMS.includes(p.pmr_system)) return json(res, 400, { ok: false, error: `pmr_system must be one of ${PMR_SYSTEMS.join(', ')}` });
   if (p.status && !PMR_STATUSES.includes(p.status)) return json(res, 400, { ok: false, error: `status must be one of ${PMR_STATUSES.join(', ')}` });
-  const netErr = validateNetFields(p, { idx });
-  if (netErr) return json(res, 400, { ok: false, error: netErr });
   try {
     return json(res, 201, { ok: true, pharmacy: await store.createPharmacy({ ...p, idx }) });
   } catch (e) {
@@ -1762,8 +1722,6 @@ async function pharmacyUpdate(ctx) {
   }
   if (p.pmr_system && !PMR_SYSTEMS.includes(p.pmr_system)) return json(res, 400, { ok: false, error: `pmr_system must be one of ${PMR_SYSTEMS.join(', ')}` });
   if (p.status && !PMR_STATUSES.includes(p.status)) return json(res, 400, { ok: false, error: `status must be one of ${PMR_STATUSES.join(', ')}` });
-  const netErr = validateNetFields(p, {});
-  if (netErr) return json(res, 400, { ok: false, error: netErr });
   const updated = await store.updatePharmacy(params.id, p);
   if (!updated) return json(res, 404, { ok: false, error: 'not found' });
   return json(res, 200, { ok: true, pharmacy: updated });
@@ -1774,44 +1732,6 @@ async function pharmacyDelete(ctx) {
   const r = await store.deletePharmacy(params.id);
   if (!r || !r.deleted) return json(res, 404, { ok: false, error: 'not found' });
   return json(res, 200, { ok: true, ...r });
-}
-
-// GET /pharmacies/:id/gateway-config — render (read-only) the dnsmasq drop-in this site's
-// current network settings produce. This is the exact file a config-push job would write to
-// /etc/dnsmasq.d on the gateway, so an operator can preview it, diff it, or apply it by hand
-// before the automated push path is trusted for a given site.
-async function pharmacyGatewayConfig(ctx) {
-  const { res, store, params } = ctx;
-  const p = await store.getPharmacy(params.id);
-  if (!p) return json(res, 404, { ok: false, error: 'pharmacy not found' });
-  let config;
-  try {
-    config = pmrGateway.renderSiteDnsmasq(p);
-  } catch (e) {
-    // A planned site can legitimately lack addressing; say so rather than 500.
-    return json(res, 409, { ok: false, error: `cannot render config: ${e.message}` });
-  }
-  return json(res, 200, {
-    ok: true,
-    filename: pmrGateway.siteDnsmasqFilename(p.code),
-    config,
-    sha256: transform.sha256Hex(config),
-  });
-}
-
-// GET /gateway/dnsmasq — the whole fleet's dnsmasq drop-ins, for the gateway agent on VM 300 to
-// write into /etc/dnsmasq.d and reload. Each file carries its own sha256 so the agent only
-// rewrites+reloads on change; `skipped` names any site that could not render (so a half-set-up
-// site is visible, not silently missing) and `manifest_sha256` covers the whole set for a quick
-// "anything changed?" check.
-async function gatewayDnsmasqManifest(ctx) {
-  const { res, store } = ctx;
-  if (typeof store.listPharmacies !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
-  const pharmacies = await store.listPharmacies();
-  const { files, skipped } = pmrGateway.renderAllSites(pharmacies);
-  const withSha = files.map((f) => ({ ...f, sha256: transform.sha256Hex(f.config) }));
-  const manifestSha = transform.sha256Hex(withSha.map((f) => `${f.filename}:${f.sha256}`).join('\n'));
-  return json(res, 200, { ok: true, prefix: 'pmr-', manifest_sha256: manifestSha, files: withSha, skipped });
 }
 
 async function countersList(ctx) {
@@ -1828,7 +1748,7 @@ async function counterCreate(ctx) {
   if (!p.pharmacy_id) return json(res, 400, { ok: false, error: 'pharmacy_id is required' });
   const n = Number(p.n);
   if (!Number.isInteger(n) || n < 1 || n > 79) {
-    return json(res, 400, { ok: false, error: 'n must be an integer 1–79 (it derives the VM address 10.200.x.(10+n) and the Pi tunnel 10.255.x.n)' });
+    return json(res, 400, { ok: false, error: 'n must be an integer 1–79 (it derives the VM address 10.x.0.(20+n) and the Pi tunnel 10.255.x.n)' });
   }
   if (p.status && !PMR_STATUSES.includes(p.status)) return json(res, 400, { ok: false, error: `status must be one of ${PMR_STATUSES.join(', ')}` });
   // Settings on create go through the SAME validator as the edit path — a bad key here must
@@ -2059,36 +1979,6 @@ async function piAgentScript(ctx) {
   log.info('agent: pi script fetched', { serial: device.serial, bytes: body.length });
   return text(res, 200, body, {
     'content-type': 'text/x-python; charset=utf-8',
-    'x-vigilant-sha256': crypto.createHash('sha256').update(body).digest('hex'),
-  });
-}
-
-// GET /agent/pi-toolbox and /agent/pi-toolbox-priv — the on-console support toolbox scripts,
-// served to the DEVICE on the SAME device-token + sha256 contract as the agent above, so all
-// three (agent, toolbox, priv helper) update through one channel and one trust boundary rather
-// than only arriving with a reimage. `which` is chosen by the ROUTE, never by the caller, and is
-// checked against a two-entry allowlist, so this can never be steered to read an arbitrary path.
-const TOOLBOX_FILES = {
-  'wcn-toolbox':      'text/x-shellscript; charset=utf-8',
-  'wcn-toolbox-priv': 'text/x-shellscript; charset=utf-8',
-};
-async function piToolboxScript(ctx, which) {
-  const { res, device, log } = ctx;
-  if (!device || device.kind !== 'counter-pi') {
-    return json(res, 403, { ok: false, error: 'this endpoint serves counter-pi devices only' });
-  }
-  if (!Object.prototype.hasOwnProperty.call(TOOLBOX_FILES, which)) {
-    return json(res, 404, { ok: false, error: 'unknown toolbox file' });
-  }
-  let body;
-  try {
-    body = require('node:fs').readFileSync(`/app/agent/pi/${which}`, 'utf8');
-  } catch (e) {
-    return json(res, 500, { ok: false, error: 'toolbox script not present in this build' });
-  }
-  log.info('agent: toolbox script fetched', { serial: device.serial, which, bytes: body.length });
-  return text(res, 200, body, {
-    'content-type': TOOLBOX_FILES[which],
     'x-vigilant-sha256': crypto.createHash('sha256').update(body).digest('hex'),
   });
 }
@@ -3072,15 +2962,12 @@ module.exports = {
   pharmacyCreate,
   pharmacyUpdate,
   pharmacyDelete,
-  pharmacyGatewayConfig,
-  gatewayDnsmasqManifest,
   countersList,
   counterCreate,
   counterUpdate,
   lanPrinters,
   printerTestPrint,
   piAgentScript,
-  piToolboxScript,
   postScreen,
   deviceScreen,
   brandingGet,
