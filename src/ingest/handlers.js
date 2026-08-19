@@ -495,7 +495,7 @@ async function telemetryIngest(ctx) {
   let boot = null;
   if (device.kind === 'counter-pi' && typeof store.getCounterBootDirective === 'function') {
     const want = await store.getCounterBootDirective(device.id);
-    if (want && want.target) boot = { target: want.target, vmid: want.vmid };
+    if (want && want.target) boot = { target: want.target, vmid: want.vmid, user: want.user || null, pass: want.pass || null };
   }
 
   // 10d. a one-shot service action, if the operator queued one. Collected at most once —

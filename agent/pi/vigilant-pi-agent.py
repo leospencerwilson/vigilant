@@ -838,6 +838,24 @@ def wg_state():
 # hand-edited configuration (which is what /var/lib is FOR), and this unit runs with
 # ProtectSystem=full, which mounts /etc read-only inside the service's namespace.
 TARGET_FILE = "/var/lib/wcn/rdp-target"
+USER_FILE = "/var/lib/wcn/rdp-user"   # per-counter RDP username; absent -> kiosk uses creds default
+PASS_FILE = "/var/lib/wcn/rdp-pass"   # per-counter RDP password; 0600, value NEVER logged
+
+
+def read_configured_user():
+    try:
+        with open(USER_FILE) as fh:
+            return fh.read().strip() or None
+    except Exception:
+        return None
+
+
+def read_configured_pass():
+    try:
+        with open(PASS_FILE) as fh:
+            return fh.read().rstrip("\n") or None
+    except Exception:
+        return None
 
 
 def read_configured_target():
@@ -879,11 +897,11 @@ def rdp_session():
         flags = " ".join(f for f in ("/smartcard", "/printer", "/drive", "/clipboard")
                          if f in last_argv)
         return {"running": True, "client": proc, "target": target, "redirect": flags or None,
-                "configured_target": read_configured_target()}
+                "configured_target": read_configured_target(), "configured_user": read_configured_user()}
     # Reported even when nothing is running: "configured for VM x but not connected" is a
     # more useful state than a row of nulls.
     return {"running": False, "client": None, "target": None, "redirect": None,
-            "configured_target": read_configured_target()}
+            "configured_target": read_configured_target(), "configured_user": read_configured_user()}
 
 
 # ── editable per-thin-client settings ───────────────────────────────────────
@@ -2055,20 +2073,53 @@ def apply_boot_target(boot):
     if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}", target):
         print(f"vigilant-pi-agent: refusing malformed boot target {target!r}", flush=True)
         return False
-    if read_configured_target() == target:
-        return False                # already where we should be; nothing to disturb
-    try:
-        os.makedirs(os.path.dirname(TARGET_FILE), exist_ok=True)
-        with open(TARGET_FILE, "w") as fh:
-            fh.write(target + "\n")
-        # The launcher runs as the kiosk user and has to read this.
-        os.chmod(TARGET_FILE, 0o644)
-    except Exception as e:
-        print(f"vigilant-pi-agent: cannot write {TARGET_FILE}: {e}", flush=True)
-        return False
-    print(f"vigilant-pi-agent: boot target -> {target}, restarting kiosk", flush=True)
-    run(["systemctl", "restart", "getty@tty1"], timeout=25)
-    return True
+
+    changed = False
+    if read_configured_target() != target:
+        try:
+            os.makedirs(os.path.dirname(TARGET_FILE), exist_ok=True)
+            with open(TARGET_FILE, "w") as fh:
+                fh.write(target + "\n")
+            os.chmod(TARGET_FILE, 0o644)
+            changed = True
+            print(f"vigilant-pi-agent: boot target -> {target}", flush=True)
+        except Exception as e:
+            print(f"vigilant-pi-agent: cannot write {TARGET_FILE}: {e}", flush=True)
+            return False
+
+    user = boot.get("user")
+    if isinstance(user, str) and user.strip():
+        user = user.strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", user):
+            print(f"vigilant-pi-agent: refusing malformed rdp user {user!r}", flush=True)
+        elif read_configured_user() != user:
+            try:
+                os.makedirs(os.path.dirname(USER_FILE), exist_ok=True)
+                with open(USER_FILE, "w") as fh:
+                    fh.write(user + "\n")
+                os.chmod(USER_FILE, 0o644)
+                changed = True
+                print(f"vigilant-pi-agent: rdp user -> {user}", flush=True)
+            except Exception as e:
+                print(f"vigilant-pi-agent: cannot write {USER_FILE}: {e}", flush=True)
+
+    passwd = boot.get("pass")
+    if isinstance(passwd, str) and passwd != "":
+        if read_configured_pass() != passwd:
+            try:
+                os.makedirs(os.path.dirname(PASS_FILE), exist_ok=True)
+                fd = os.open(PASS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(passwd + "\n")
+                changed = True
+                print("vigilant-pi-agent: rdp password updated", flush=True)
+            except Exception as e:
+                print(f"vigilant-pi-agent: cannot write {PASS_FILE}: {e}", flush=True)
+
+    if changed:
+        print("vigilant-pi-agent: restarting kiosk", flush=True)
+        run(["systemctl", "restart", "getty@tty1"], timeout=25)
+    return changed
 
 
 # ── fleet branding ──────────────────────────────────────────────────────────

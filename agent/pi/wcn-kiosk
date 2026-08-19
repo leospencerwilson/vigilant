@@ -37,6 +37,25 @@ set -u
 TARGET_FILE="/var/lib/wcn/rdp-target"
 DEFAULT_DIRECT="10.1.0.10:3389"
 FALLBACK="127.0.0.1:33389"
+USER_FILE="/var/lib/wcn/rdp-user"
+PASS_FILE="/var/lib/wcn/rdp-pass"
+read_user() {
+    if [ -r "$USER_FILE" ]; then
+        u=$(tr -d ' \t\r\n' < "$USER_FILE")
+        case "$u" in
+            "" | *[!A-Za-z0-9._-]*) ;;
+            *) printf '%s' "$u"; return ;;
+        esac
+    fi
+    printf '%s' "$RDP_USER"
+}
+read_pass() {
+    if [ -r "$PASS_FILE" ]; then
+        p=$(cat "$PASS_FILE")
+        [ -n "$p" ] && { printf '%s' "$p"; return; }
+    fi
+    printf '%s' "$RDP_PASS"
+}
 
 read_direct() {
     # Anything that is not a bare IPv4:port is IGNORED rather than used. This value is
@@ -205,6 +224,8 @@ while true; do
 
     TARGET=$(pick_transport)
     while [ -z "$TARGET" ]; do sleep 3; TARGET=$(pick_transport); done
+    RDP_USER_EFF=$(read_user)
+    RDP_PASS_EFF=$(read_pass)
     # No credential is ever logged; OPTS holds only redirection and display switches.
     echo "$(date -Is) connecting via $TARGET [${OPTS[*]} blank:${BLANK}m]" >> /var/log/wcn-kiosk.log
 
@@ -214,8 +235,8 @@ while true; do
     # resize is seamless rather than a reconnect.
     xfreerdp3 \
         /v:"$TARGET" \
-        /u:"$RDP_USER" \
-        /p:"$RDP_PASS" \
+        /u:"$RDP_USER_EFF" \
+        /p:"$RDP_PASS_EFF" \
         /cert:ignore \
         /size:"${SCREEN_W}x${SCREEN_H}" \
         /dynamic-resolution \

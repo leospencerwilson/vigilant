@@ -2213,7 +2213,8 @@ function makePgStore(poolOrConfig) {
       [deviceId]
     );
     return one(
-      `SELECT boot_vmid AS vmid, boot_target AS target
+      `SELECT boot_vmid AS vmid, boot_target AS target,
+              settings->>'rdp_user' AS "user", settings->>'rdp_pass' AS "pass"
          FROM counters WHERE pi_device_id = $1 AND boot_target IS NOT NULL`,
       [deviceId]
     );
