@@ -346,11 +346,21 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 CREATE INDEX IF NOT EXISTS devices_kind_idx ON devices (kind);
 
 -- ── pharmacies ───────────────────────────────────────────────────────────────
--- ADDRESSING IS DERIVED, NEVER TYPED. From systems/pmr-vpn/network-design.md, a
--- pharmacy index N gives: vlan 100+N, subnet 10.N.0.0/24, gateway 10.N.0.1,
--- PMR server 10.N.0.10, counter VM 10.N.0.(20+n), counter Pi 10.255.N.n/32.
--- Storing those would let them drift from the scheme the gateway's nftables and
--- dnsmasq config — and the provisioning scripts — already assume.
+-- ADDRESSING IS DERIVED-BY-DEFAULT, and OVERRIDABLE. From systems/pmr-vpn/network-design.md,
+-- a pharmacy index N gives: vlan 100+N, subnet 10.200.N.0/<prefix>, gateway 10.200.N.1,
+-- PMR server 10.200.N.10, counter VM 10.200.N.(base+n), counter Pi 10.255.N.n/32.
+-- The pharmacy LAN lives in 10.200.0.0/16 (index in the THIRD octet) so it can never collide
+-- with the 10.10.x.x VLAN/NHS space or the 10.255.x tunnel transit.
+-- vlan and the network address (10.200.N.0) still follow mechanically from the index and
+-- cannot be edited — they are baked into every counter Pi's WireGuard AllowedIPs. Everything
+-- else (subnet size, gateway, server, DHCP pool, DNS, domain, lease, NTP) is filled from the
+-- index by the pharmacies_fill_net() trigger but can be set per-site, so a site can diverge
+-- from the default plan without the schema pretending it never happens.
+--
+-- The default prefix is /27 (30 usable hosts) — a pharmacy LAN never reaches the ~25-device
+-- ceiling, so a whole /24 was 8x wasted space. Every site is /27: nothing is in production on
+-- the virtual desktops yet, so the netmig block below moves existing rows to /27 outright rather
+-- than preserving a legacy /24. A site can still be widened per-row (prefix_len is editable).
 CREATE TABLE IF NOT EXISTS pharmacies (
     id           bigserial   PRIMARY KEY,
     code         text        NOT NULL UNIQUE,          -- NHS/site code, e.g. 'RX54554'
@@ -368,38 +378,108 @@ CREATE TABLE IF NOT EXISTS pharmacies (
     created_at   timestamptz NOT NULL DEFAULT now(),
     updated_at   timestamptz NOT NULL DEFAULT now(),
 
-    vlan       int  GENERATED ALWAYS AS (100 + idx) STORED,
-    subnet     text GENERATED ALWAYS AS ('10.' || idx || '.0.0/24') STORED,
-    gateway_ip text GENERATED ALWAYS AS ('10.' || idx || '.0.1') STORED,
-    server_ip  text GENERATED ALWAYS AS ('10.' || idx || '.0.10') STORED,
-    dhcp_from  text GENERATED ALWAYS AS ('10.' || idx || '.0.100') STORED,
-    dhcp_to    text GENERATED ALWAYS AS ('10.' || idx || '.0.254') STORED,
+    -- prefix sizes the subnet; the network address is always 10.200.idx.0, so shrinking the
+    -- prefix only tightens how much of that /24-worth of space is in-network. /27 = .0–.31.
+    prefix_len  int  NOT NULL DEFAULT 27 CHECK (prefix_len BETWEEN 24 AND 30),
+    vlan        int  GENERATED ALWAYS AS (100 + idx) STORED,
+    subnet      text GENERATED ALWAYS AS ('10.200.' || idx || '.0/' || prefix_len) STORED,
+    -- Plain columns, filled from idx by pharmacies_fill_net() when left NULL (see below).
+    -- Editable so a site can override any single value; NULL them to fall back to the default.
+    gateway_ip  text,                                 -- .1 by default
+    server_ip   text,                                 -- .10 by default (PMR server)
+    dhcp_from   text,                                 -- /27 default .21
+    dhcp_to     text,                                 -- /27 default .30
+    dns_servers text,                                 -- comma-separated; DHCP option 6. Default: the gateway (dnsmasq resolves+forwards)
+    domain      text DEFAULT 'pmr.local',             -- DHCP option 15 / dnsmasq local domain, so pmr-<code>-srv resolves unqualified
+    lease_time  text DEFAULT '12h',                   -- dnsmasq dhcp-range lease
+    ntp_server  text,                                 -- DHCP option 42. Default: the gateway
     -- Per-site counter banner (set in the Site Configurator). Shown on every counter Pi at this
     -- site by wcn-banner, OVERRIDING any fleet-wide kiosk_message. Empty text = no site banner;
-    -- level (info|warning|alert) is validated in the app, not the DB.
+    -- level (info|warning|alert) is validated in the app, not the DB, so an ALTER on an existing
+    -- deployment stays a plain ADD COLUMN.
     banner_text  text,
     banner_level text
 );
 
--- Existing deployments: add the banner columns idempotently.
+-- Existing deployments: add the banner columns idempotently (the CREATE TABLE above is a no-op
+-- once the table exists).
 ALTER TABLE pharmacies ADD COLUMN IF NOT EXISTS banner_text  text;
 ALTER TABLE pharmacies ADD COLUMN IF NOT EXISTS banner_level text;
 
 
 
--- Widen the DHCP pool to the top of the /24 (.100-.254); see derive() in the UI.
-DO $mig$
+-- ── editable per-VLAN network settings + /27 everywhere (2026-08 migration) ──
+-- Turn the once-derived addressing into "derived default, editable override", and move the
+-- subnet from /24 to /27 for EVERY site. Nothing is in production on the virtual desktops yet,
+-- so there is no live gateway to keep in step and no reason to preserve a legacy /24 — existing
+-- rows are re-planned to /27 outright. Guarded on prefix_len so it runs exactly once; a fresh
+-- install already has the new shape from CREATE TABLE and skips the whole block.
+DO $netmig$
 BEGIN
-  IF EXISTS (
+  IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns
-     WHERE table_schema = 'vigilant' AND table_name = 'pharmacies'
-       AND column_name = 'dhcp_to' AND generation_expression LIKE '%.0.149%'
+     WHERE table_schema = 'vigilant' AND table_name = 'pharmacies' AND column_name = 'prefix_len'
   ) THEN
-    ALTER TABLE pharmacies DROP COLUMN dhcp_to;
-    ALTER TABLE pharmacies ADD COLUMN dhcp_to text
-      GENERATED ALWAYS AS ('10.' || idx || '.0.254') STORED;
+    -- server_ip (and vlan) are referenced by these views, so DROP COLUMN would be refused while
+    -- they exist. Drop them here and let the CREATE OR REPLACE VIEW statements later in this file
+    -- rebuild them against the new columns. Nothing nests on them, so no CASCADE is needed.
+    DROP VIEW IF EXISTS pharmacy_vms_v;
+    DROP VIEW IF EXISTS counters_v;
+
+    -- NOT NULL DEFAULT 27 backfills every existing row to /27 in one shot.
+    ALTER TABLE pharmacies ADD COLUMN prefix_len int NOT NULL DEFAULT 27;
+    ALTER TABLE pharmacies ADD CONSTRAINT pharmacies_prefix_len_check CHECK (prefix_len BETWEEN 24 AND 30);
+
+    -- subnet was GENERATED off a hard-coded /24; re-derive it from prefix_len.
+    ALTER TABLE pharmacies DROP COLUMN subnet;
+    ALTER TABLE pharmacies ADD  COLUMN subnet text
+      GENERATED ALWAYS AS ('10.200.' || idx || '.0/' || prefix_len) STORED;
+
+    -- the addressing columns were GENERATED (read-only); re-add as plain so they can be edited.
+    ALTER TABLE pharmacies DROP COLUMN gateway_ip; ALTER TABLE pharmacies ADD COLUMN gateway_ip text;
+    ALTER TABLE pharmacies DROP COLUMN server_ip;  ALTER TABLE pharmacies ADD COLUMN server_ip  text;
+    ALTER TABLE pharmacies DROP COLUMN dhcp_from;  ALTER TABLE pharmacies ADD COLUMN dhcp_from  text;
+    ALTER TABLE pharmacies DROP COLUMN dhcp_to;    ALTER TABLE pharmacies ADD COLUMN dhcp_to    text;
+
+    ALTER TABLE pharmacies ADD COLUMN dns_servers text;
+    ALTER TABLE pharmacies ADD COLUMN domain      text DEFAULT 'pmr.local';
+    ALTER TABLE pharmacies ADD COLUMN lease_time  text DEFAULT '12h';
+    ALTER TABLE pharmacies ADD COLUMN ntp_server  text;
+
+    -- /27 plan for every existing row: gw .1, server .10, DHCP .21–.30.
+    UPDATE pharmacies SET
+      gateway_ip  = '10.200.' || idx || '.1',
+      server_ip   = '10.200.' || idx || '.10',
+      dhcp_from   = '10.200.' || idx || '.21',
+      dhcp_to     = '10.200.' || idx || '.30',
+      dns_servers = COALESCE(dns_servers, '10.200.' || idx || '.1'),
+      domain      = COALESCE(domain, 'pmr.local'),
+      lease_time  = COALESCE(lease_time, '12h'),
+      ntp_server  = COALESCE(ntp_server, '10.200.' || idx || '.1');
   END IF;
-END $mig$;
+END $netmig$;
+
+-- Fill the editable addressing from the index whenever a value is left NULL — on INSERT and on
+-- UPDATE, so clearing a field back to NULL resets it to the /27 default. A value that is set
+-- survives untouched. This is the one place the default plan lives on the DB side; the UI's
+-- planFrom() mirrors it for the live preview.
+CREATE OR REPLACE FUNCTION pharmacies_fill_net() RETURNS trigger AS $fn$
+BEGIN
+  NEW.gateway_ip  := COALESCE(NEW.gateway_ip,  '10.200.' || NEW.idx || '.1');
+  NEW.server_ip   := COALESCE(NEW.server_ip,   '10.200.' || NEW.idx || '.10');
+  NEW.dhcp_from   := COALESCE(NEW.dhcp_from,   '10.200.' || NEW.idx || '.21');
+  NEW.dhcp_to     := COALESCE(NEW.dhcp_to,     '10.200.' || NEW.idx || '.30');
+  NEW.dns_servers := COALESCE(NEW.dns_servers, '10.200.' || NEW.idx || '.1');
+  NEW.ntp_server  := COALESCE(NEW.ntp_server,  '10.200.' || NEW.idx || '.1');
+  NEW.domain      := COALESCE(NEW.domain, 'pmr.local');
+  NEW.lease_time  := COALESCE(NEW.lease_time, '12h');
+  RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS pharmacies_fill_net_trg ON pharmacies;
+CREATE TRIGGER pharmacies_fill_net_trg BEFORE INSERT OR UPDATE ON pharmacies
+  FOR EACH ROW EXECUTE FUNCTION pharmacies_fill_net();
 
 
 -- pmr_system vocabulary refresh: widen to the major UK community-pharmacy PMR systems. The inline CHECK
@@ -427,7 +507,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS pharmacies_crm_site_idx ON pharmacies (crm_sit
 CREATE TABLE IF NOT EXISTS counters (
     id            bigserial   PRIMARY KEY,
     pharmacy_id   bigint      NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
-    -- Bounded so the derived VM octet (20+n) stays inside the .20–.99 counter band.
+    -- Bounded so the derived VM octet stays inside the counter band: 20+n (.21–.99) on a /24
+    -- site, 10+n (.11–.20) on a /27 site. The /27 band only has room for 10, but the DB cap
+    -- stays 79 for the /24 sites still in service; the UI caps per-site to what the prefix fits.
     n             int         NOT NULL CHECK (n BETWEEN 1 AND 79),
     label         text,
     status        text        NOT NULL DEFAULT 'planned'
@@ -478,7 +560,8 @@ CREATE TABLE IF NOT EXISTS pharmacy_vms (
 -- site's VLAN while accepting only the registered ones.
 CREATE OR REPLACE VIEW pharmacy_vms_v AS
 -- Every VM a site's thin clients can be pointed at. A pharmacy_vms row overrides the DERIVED
--- address for the same vmid, so .10 / .20+n are defaults, not fixed. 'source' records how the
+-- address for the same vmid, so the server (.10) and counter (20+n on /24, 10+n on /27) octets
+-- are defaults, not fixed. 'source' records how the
 -- VM is linked (server / desktop / attached) so the UI can unassign any of them uniformly.
 -- Leading columns (pharmacy_id, vmid, ip, role) are unchanged so CREATE OR REPLACE accepts
 -- the appended source / counter_id / address_overridden.
@@ -493,7 +576,7 @@ SELECT p.id AS pharmacy_id, p.srv_vmid AS vmid,
  WHERE p.srv_vmid IS NOT NULL
 UNION ALL
 SELECT c.pharmacy_id, c.vmid,
-       COALESCE(o.ip, '10.' || p.idx || '.0.' || (20 + c.n)),
+       COALESCE(o.ip, '10.200.' || p.idx || '.' || ((CASE WHEN p.prefix_len >= 27 THEN 10 ELSE 20 END) + c.n)),
        'thin client ' || c.n,
        'desktop',
        c.id,
@@ -611,7 +694,7 @@ CREATE OR REPLACE VIEW counters_v AS
 SELECT c.id, c.pharmacy_id,
        p.code AS pharmacy_code, p.name AS pharmacy_name, p.idx AS pharmacy_idx, p.vlan,
        c.n, c.label, c.status, c.vmid, c.vm_hostname,
-       '10.' || p.idx || '.0.' || (20 + c.n)     AS vm_ip,
+       '10.200.' || p.idx || '.' || ((CASE WHEN p.prefix_len >= 27 THEN 10 ELSE 20 END) + c.n)     AS vm_ip,
        -- OBSERVED from the WireGuard hub, not derived. This was previously computed as
        -- 10.255.<pharmacy idx>.<counter n>, a convention the estate does not actually
        -- follow: the pilot Pi answers on 10.255.0.10/32 while that formula produced
