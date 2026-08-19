@@ -1,0 +1,688 @@
+#!/bin/bash
+# WCN counter-Pi support toolbox — the "BIOS" for a thin client.
+#
+# A whiptail menu on the console for the person standing at a pharmacy counter. It exists for
+# the BOOTSTRAP HOLE: Watchman, noVNC and SSH all need the tunnel up, and the tunnel being down
+# is precisely when someone rings. Everything in here works with no network at all.
+#
+# TWO TIERS, and the split is deliberate:
+#   open  read-only status, plus recovery a person could achieve anyway by pulling the plug
+#         (restart the session, reboot) and the one change that gets a dark counter back on the
+#         network (join wifi, renew DHCP). No PIN — during an outage nobody on site has one.
+#   pin   anything that PERSISTS across a reboot, touches device identity, or can strand the
+#         device off-network. Support reads the number over the phone.
+#
+# The PIN is per-device (see wcn-toolbox-priv), because a static estate PIN spoken aloud at a
+# public counter is one overhear away from working at every site.
+#
+# THIS SCRIPT IS NEVER ROOT. It cannot act on its own: every privileged step is a named verb in
+# /usr/local/sbin/wcn-toolbox-priv, reached through a sudoers rule listing that one binary. The
+# reason is the boot chain it sits in — tty1 autologins westerncomms (NOPASSWD:ALL) and runs
+# getty -> .bash_profile -> startx -> wcn-kiosk. An escape from a menu on that tty would be a
+# root shell at a counter, next to /etc/wcn-rdp.creds and the WireGuard private key. Hence the
+# signal traps below, and hence no code path here that reaches a shell.
+#
+# Usage:
+#   wcn-toolbox                 the menu
+#   wcn-toolbox --boot-prompt   the 4-second "press F4" window, then the menu or a clean exit
+set -u
+
+TOOLBOX_VERSION="0.1.0"
+PRIV="/usr/local/sbin/wcn-toolbox-priv"
+KIOSK_LOG=/var/log/wcn-kiosk.log
+TARGET_FILE=/var/lib/wcn/rdp-target
+DEFAULT_DIRECT="10.1.0.10:3389"
+FALLBACK_PORT=33389
+WG_HUB="10.255.0.1"
+BACKTITLE="Western Communication  ·  thin-client support"
+LOGO=/usr/local/share/wcn/logo.ansi
+IDLE_S=300                        # an abandoned menu is a hidden till — always go back
+
+# Ctrl+C / Ctrl+Z / Ctrl+\ must not drop anyone to a prompt. This is the single most important
+# line in the file: without it the "support tool" is a root shell with extra steps.
+trap '' INT QUIT TSTP
+
+# ── theme ────────────────────────────────────────────────────────────────────
+# whiptail/newt reads NEWT_COLORS: a WCN palette (cyan on near-black) turns the default grey
+# boxes into something that reads as a product. Only the 16 console colours are named here,
+# because the physical counter is the Linux framebuffer VT and anything else is silently wrong
+# on exactly the screen that matters.
+export NEWT_COLORS='
+root=white,black
+border=brightcyan,black
+window=white,black
+shadow=black,black
+title=brightcyan,black
+button=black,brightcyan
+compactbutton=brightcyan,black
+actbutton=black,brightblue
+listbox=white,black
+actlistbox=black,brightcyan
+sellistbox=black,brightcyan
+textbox=white,black
+acttextbox=black,brightcyan
+entry=brightcyan,black
+checkbox=white,black
+actcheckbox=black,brightcyan
+label=brightcyan,black
+'
+
+# ── output hygiene ───────────────────────────────────────────────────────────
+# EVERYTHING rendered goes through this. SSIDs, printer names, log lines and dmesg are all
+# attacker- or vendor-controlled strings that reach a terminal, and a terminal interprets
+# escape sequences. Keep tab, newline and printable ASCII; drop the rest.
+san() { tr -cd '\11\12\40-\176'; }
+
+# Fixed-argv sudo, always non-interactive: a password prompt inside whiptail would hang the
+# menu with no way out.
+priv() { sudo -n "$PRIV" "$@" 2>/dev/null; }
+
+msg()  { whiptail --backtitle "$BACKTITLE" --title "$1" --msgbox "$2" "${3:-20}" "${4:-74}"; }
+yesno(){ whiptail --backtitle "$BACKTITLE" --title "$1" --yesno "$2" "${3:-12}" "${4:-70}"; }
+
+# ── splash ───────────────────────────────────────────────────────────────────
+# Shown once on entry: the WCN mark in console colour, the device name, and a one-line hint at
+# how to leave. It is the difference between "a grey config menu" and "our support console", and
+# it is where the brand actually lands on a counter. Skipped when there is no real terminal
+# (--report, a pipe), so it never corrupts machine-readable output.
+splash() {
+    [ -t 1 ] || return 0
+    local cols HOSTLINE
+    cols=$(tput cols 2>/dev/null || echo 80)
+    HOSTLINE="$(hostname)"
+    clear
+    echo
+    if [ -r "$LOGO" ]; then
+        # Centre each logo row on the visible width. The colour codes have zero display width,
+        # so pad against the plain-text length, not the byte length.
+        local pad plain
+        while IFS= read -r line; do
+            plain=$(printf '%s' "$line" | sed 's/\x1b\[[0-9;]*m//g')
+            pad=$(( (cols - ${#plain}) / 2 )); [ "$pad" -lt 0 ] && pad=0
+            printf '%*s%s\n' "$pad" '' "$line"
+        done < "$LOGO"
+    fi
+    printf '\n\033[96m%*s\033[0m\n' $(( (cols + 22) / 2 )) "WESTERN COMMUNICATION"
+    printf '\033[37m%*s\033[0m\n\n' $(( (cols + ${#HOSTLINE}) / 2 )) "$HOSTLINE"
+    printf '\033[90m%*s\033[0m\n' $(( (cols + 34) / 2 )) "thin-client support console  v$TOOLBOX_VERSION"
+    # A short, skippable beat so the mark is seen before the menu paints over it.
+    read -rsn1 -t 1.5 _ 2>/dev/null || true
+}
+
+# ── probes ───────────────────────────────────────────────────────────────────
+# Every probe is time-bounded. A menu that hangs because a gateway went away is worse than a
+# menu that says "no answer": the person is standing at a dead counter either way, but only one
+# of those lets them read the next line to support.
+# Host and port are passed as ARGUMENTS to the inner shell, not interpolated into its script.
+# rdp-target is agent-writable, so a value from the monitoring server reaches this line.
+probe_tcp() { timeout 3 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$1" "$2" >/dev/null 2>&1; }
+
+default_gw() { ip -4 route show default 2>/dev/null | awk '{print $3; exit}'; }
+
+rdp_target() {
+    # Mirrors wcn-kiosk's read_direct: anything not a bare IPv4:port is ignored rather than
+    # used, because this value is interpolated into a probe.
+    local t
+    if [ -r "$TARGET_FILE" ]; then
+        t=$(tr -d ' \t\r\n' < "$TARGET_FILE")
+        case "$t" in
+            *[!0-9.:]* | "") ;;
+            *) printf '%s' "$t"; return ;;
+        esac
+    fi
+    printf '%s' "$DEFAULT_DIRECT"
+}
+
+wg_handshake_age() {
+    # Seconds since the last handshake, or empty if the tunnel has never handshaked. WireGuard
+    # is silent by design, so "no handshake" is the only honest down signal.
+    local hs now
+    hs=$(priv wg-status | head -1 | awk '{print $2}')
+    case "$hs" in ""|0|*[!0-9]*) return 1 ;; esac
+    now=$(date +%s)
+    echo $(( now - hs ))
+}
+
+active_transport() {
+    # Which path the running session is ACTUALLY on. A counter silently parked on the Cloudflare
+    # hairpin is the condition under which smartcard login must never be judged, so this line has
+    # to be right rather than merely plausible.
+    #
+    # Ground truth is the live process, not the log. MEASURED on the pilot 2026-08-17: the last
+    # "connecting via" line said 127.0.0.1:33389 while the running session was direct on
+    # 10.1.0.10:3389. FreeRDP's +auto-reconnect re-establishes inside one invocation without the
+    # kiosk loop logging again, so the log records the FIRST choice of a session that may have
+    # moved on, and later reconnects append nothing. Fall back to the log only if no session is up.
+    local v
+    v=$(pgrep -a xfreerdp3 2>/dev/null | grep -o '/v:[0-9.]\+:[0-9]\+' | head -1)
+    if [ -n "$v" ]; then printf '%s' "${v#/v:}"; return; fi
+    grep 'connecting via' "$KIOSK_LOG" 2>/dev/null | tail -1 | sed -n 's/.*connecting via \([0-9.:]*\).*/\1/p'
+}
+
+# ── the status ladder ────────────────────────────────────────────────────────
+# Layered, never one red/green light. The docs are explicit that a down tunnel does not mean an
+# unreachable counter, and that one light lies. Each row is worded to be read down a phone.
+status_body() {
+    local out="" gw t age tgt th
+    local carrier="down" wifi="-"
+
+    [ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" = 1 ] && carrier="up"
+    wifi=$(nmcli -t -g GENERAL.CONNECTION device show wlan0 2>/dev/null | head -1)
+    [ -n "$wifi" ] || wifi="not joined"
+
+    out+="1. Cable        : ${carrier}"
+    [ "$carrier" = up ] && out+="   $(cat /sys/class/net/eth0/speed 2>/dev/null || echo '?')Mb" || true
+    out+="\n"
+    out+="2. Wi-Fi        : ${wifi}\n"
+
+    gw=$(default_gw)
+    if [ -z "$gw" ]; then
+        out+="3. Shop network : NO ROUTER - the Pi has no gateway\n"
+    elif timeout 4 ping -c1 -W2 "$gw" >/dev/null 2>&1; then
+        out+="3. Shop network : ok (router ${gw} answers)\n"
+    else
+        out+="3. Shop network : router ${gw} NOT answering\n"
+    fi
+
+    if probe_tcp 1.1.1.1 443; then
+        out+="4. Internet     : ok\n"
+    else
+        out+="4. Internet     : NO INTERNET - check the shop's broadband\n"
+    fi
+
+    if age=$(wg_handshake_age); then
+        if [ "$age" -lt 180 ]; then
+            out+="5. Secure link  : UP (last contact ${age}s ago)\n"
+        else
+            out+="5. Secure link  : STALE - last contact ${age}s ago\n"
+        fi
+    else
+        out+="5. Secure link  : DOWN - support can fix this remotely,\n"
+        out+="                  nothing to do at the counter\n"
+    fi
+
+    tgt=$(rdp_target)
+    if probe_tcp "${tgt%%:*}" "${tgt##*:}"; then
+        out+="6. Pharmacy PC  : reachable (${tgt})\n"
+    elif probe_tcp 127.0.0.1 "$FALLBACK_PORT"; then
+        out+="6. Pharmacy PC  : only via BACKUP link\n"
+        out+="                  (smartcards will not work until the main link is back)\n"
+    else
+        out+="6. Pharmacy PC  : NOT reachable\n"
+    fi
+
+    t=$(active_transport)
+    out+="\nSession is using : ${t:-no session yet}\n"
+
+    # Power and heat sit on the front page because undervoltage from a swapped-in phone charger
+    # is the classic silent cause of counter flakiness, and it is one a dispenser can fix.
+    th=$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2)
+    out+="Temperature      : $(vcgencmd measure_temp 2>/dev/null | cut -d= -f2)\n"
+    if [ "${th:-0x0}" != "0x0" ]; then
+        out+="Power/heat       : PROBLEM (${th}) - see System health\n"
+    else
+        out+="Power/heat       : ok\n"
+    fi
+    printf '%b' "$out" | san
+}
+
+screen_status() { msg "Counter status" "$(status_body)" 24 78; }
+
+# ── about ────────────────────────────────────────────────────────────────────
+# Grouped for dictation. No secrets in any tier: no PSK, no creds file, no service token, no
+# WireGuard private key — and not the Cloudflare fallback hostname either, while that ingress
+# still has no Access policy in front of it.
+screen_about() {
+    local serial model ip4 wip hn agent
+    serial=$(awk -F': ' '/^Serial/{print $2}' /proc/cpuinfo 2>/dev/null)
+    model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)
+    hn=$(hostname)
+    ip4=$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}')
+    wip=$(ip -4 -o addr show wlan0 2>/dev/null | awk '{print $4}')
+    agent=$(priv agent-installed | cut -c1-12)
+    msg "About this counter" "$(printf 'Read these to support:\n\n  Name    : %s\n  Serial  : %s\n\n  Wired   : %s\n  Wi-Fi   : %s\n  Tunnel  : %s\n\n  Board   : %s\n  System  : %s\n  Agent   : %s\n  Toolbox : %s\n  Up      : %s\n' \
+        "$hn" "${serial:-unknown}" "${ip4:-none}" "${wip:-none}" \
+        "$(ip -4 -o addr show wg0 2>/dev/null | awk '{print $4}' || echo none)" \
+        "${model:-unknown}" "$(sed -n 's/^PRETTY_NAME="\(.*\)"/\1/p' /etc/os-release)" \
+        "${agent:-unknown}" "$TOOLBOX_VERSION" "$(uptime -p 2>/dev/null)" | san)" 22 74
+}
+
+# ── system health ────────────────────────────────────────────────────────────
+# get_throttled is a bitmask and the low/high halves mean different things: bits 0-3 are NOW,
+# bits 16-19 are EVER SINCE BOOT. "Has occurred" is the one that catches the intermittent PSU,
+# so both halves are decoded rather than reduced to a single verdict.
+throttle_words() {
+    local th=$1 out=""
+    (( th & 0x1 ))     && out+="  * UNDERVOLTAGE NOW - the power supply is not coping\n"
+    (( th & 0x2 ))     && out+="  * CPU speed capped now\n"
+    (( th & 0x4 ))     && out+="  * Throttled now\n"
+    (( th & 0x8 ))     && out+="  * Soft temperature limit active now\n"
+    (( th & 0x10000 )) && out+="  * Undervoltage HAS happened since boot\n"
+    (( th & 0x20000 )) && out+="  * CPU speed HAS been capped since boot\n"
+    (( th & 0x40000 )) && out+="  * Throttling HAS happened since boot\n"
+    (( th & 0x80000 )) && out+="  * Soft temperature limit HAS been hit since boot\n"
+    [ -z "$out" ] && out="  none - power and heat are healthy\n"
+    printf '%b' "$out"
+}
+
+screen_health() {
+    local th thn advice="" sd
+    th=$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2); th=${th:-0x0}
+    thn=$(( th ))
+    (( thn & 0x10001 )) && advice+="\nUse the official Raspberry Pi power supply. A phone charger\nor a long/thin USB cable is the usual cause.\n"
+    (( thn & 0x8000C )) && advice+="\nCheck the vents are clear and the box is not in a cupboard.\n"
+    sd=$(cat /sys/block/mmcblk0/device/name 2>/dev/null)
+    msg "System health" "$(printf 'Temperature : %s\nCore volts  : %s\nThrottling  : %s\n%s\nMemory      : %s\nDisk        : %s used of %s\nSD card     : %s\nUptime      : %s\nClock       : %s\n%s' \
+        "$(vcgencmd measure_temp 2>/dev/null | cut -d= -f2)" \
+        "$(vcgencmd measure_volts core 2>/dev/null | cut -d= -f2)" \
+        "$th" "$(throttle_words "$thn")" \
+        "$(free -h | awk '/^Mem:/{print $3" used of "$2}')" \
+        "$(df -h / | awk 'NR==2{print $3}')" "$(df -h / | awk 'NR==2{print $2}')" \
+        "${sd:-unknown}" "$(uptime -p)" \
+        "$(date -Is)$( timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes || echo '  (NOT time-synced - a Pi has no battery clock)')" \
+        "$advice" | san)" 24 76
+}
+
+# ── device manager ───────────────────────────────────────────────────────────
+# "Is the card reader even plugged in" is the single most useful thing a phone call can
+# establish, and it is answerable with no network at all.
+screen_devices() {
+    local usb sc scname printers disp
+    usb=$(lsusb 2>/dev/null | sed 's/^Bus [0-9]* Device [0-9]*: ID //' | sed 's/^/  /')
+
+    # By INTERFACE CLASS 0b (CCID), not by VID:PID. The Dell SK-3205 at the pilot is a combined
+    # keyboard+reader whose bus path differs between Pi models and ports, so a hardcoded id
+    # would work on the bench and silently find nothing at a site.
+    sc="not detected"
+    for i in /sys/bus/usb/devices/*:*/bInterfaceClass; do
+        [ -r "$i" ] || continue
+        if [ "$(cat "$i" 2>/dev/null)" = "0b" ]; then sc="detected"; break; fi
+    done
+    # pcscd is socket-activated: is-active reads "inactive" on a healthy device, so the socket's
+    # enablement is the real signal. Getting this wrong sends engineers chasing a dead daemon.
+    scname="socket $(systemctl is-enabled pcscd.socket 2>/dev/null || echo unknown)"
+    printers=$(lpstat -p 2>/dev/null | sed 's/^/  /' | head -8)
+    disp=$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null | tr ',' 'x')
+
+    msg "Device manager" "$(printf 'Smartcard reader : %s  (%s)\nDisplay          : %s\n\nPrinter queues:\n%s\n\nPlugged in:\n%s\n' \
+        "$sc" "$scname" "${disp:-no display detected}" \
+        "${printers:-  none configured}" "${usb:-  none}" | san)" 24 78
+}
+
+# ── open actions ─────────────────────────────────────────────────────────────
+screen_wifi() {
+    local list ssid psk out rc
+    # nmcli -t escapes a colon INSIDE a value as "\:", so the field count is not fixed and a
+    # plain split on ":" corrupts any SSID containing one. Parse from the right instead —
+    # SECURITY and SIGNAL are the last two fields and never contain a colon — then rejoin and
+    # unescape everything before them. Strongest signal wins per SSID, and the tags must be
+    # unique or whiptail returns the wrong one.
+    list=$(priv wifi-scan | awk -F: '
+        NF >= 3 {
+            sec = $NF; sig = $(NF-1) + 0; ssid = $1
+            for (i = 2; i <= NF-2; i++) ssid = ssid ":" $i
+            gsub(/\\/, "", ssid)
+            if (ssid == "") next
+            if (!(ssid in best) || sig > best[ssid]) { best[ssid] = sig; how[ssid] = (sec == "" ? "open" : sec) }
+        }
+        END { for (s in best) printf "%s\t%d%%  %s\n", s, best[s], how[s] }' | sort -t$'\t' -k2 -rn | head -12)
+    [ -n "$list" ] || { msg "Wi-Fi" "No networks found.\n\nThe Pi's Wi-Fi may be off, or nothing is in range." 12 60; return; }
+
+    local args=() name detail
+    while IFS=$'\t' read -r name detail; do
+        [ -n "$name" ] || continue
+        args+=( "$name" "$detail" )
+    done <<< "$(printf '%s\n' "$list" | san)"
+
+    ssid=$(whiptail --backtitle "$BACKTITLE" --title "Join Wi-Fi" \
+        --menu "Pick the pharmacy's network:" 20 66 10 "${args[@]}" 3>&1 1>&2 2>&3) || return
+    psk=$(whiptail --backtitle "$BACKTITLE" --title "Join Wi-Fi" \
+        --passwordbox "Passphrase for:\n$ssid" 11 66 3>&1 1>&2 2>&3) || return
+
+    # The passphrase goes over a pipe, so it is never in argv (world-readable via /proc) and
+    # never in a log. rc is captured on the same line: a comment or any other statement between
+    # the assignment and the test would silently reset $?.
+    out=$(printf '%s\n' "$psk" | sudo -n "$PRIV" wifi-join "$ssid" 2>&1); rc=$?
+    psk=""
+    if [ "$rc" -eq 0 ]; then
+        msg "Wi-Fi" "$(printf '%s\n\nThis is a TEMPORARY change. Tell support so it can be made\npermanent - otherwise it is lost on the next rebuild.\n\nWired is still better than Wi-Fi for a counter.' \
+            "$(printf '%s' "$out" | san)")" 14 68
+    else
+        msg "Wi-Fi" "$(printf '%s' "$out" | san)" 12 66
+    fi
+}
+
+screen_network() {
+    local choice
+    while true; do
+        choice=$(whiptail --backtitle "$BACKTITLE" --title "Network" --menu "" 16 70 6 \
+            "1" "Show network details" \
+            "2" "Join a Wi-Fi network" \
+            "3" "Renew the address from the router (wired)" \
+            "4" "Back" 3>&1 1>&2 2>&3) || return
+        case "$choice" in
+            1) msg "Network details" "$(printf '%s\n\nRoutes:\n%s\n\nDNS:\n%s\n' \
+                   "$(ip -4 -o addr show 2>/dev/null | awk '{printf "  %-6s %s\n", $2, $4}')" \
+                   "$(ip -4 route show 2>/dev/null | sed 's/^/  /')" \
+                   "$(resolvectl dns 2>/dev/null | sed 's/^/  /' | head -6)" | san)" 22 74 ;;
+            2) screen_wifi ;;
+            3) msg "Renew address" "$(priv dhcp-renew eth0 | san)" 10 60 ;;
+            *) return ;;
+        esac
+    done
+}
+
+action_restart_session() {
+    yesno "Restart the screen" "The till screen will go blank for about 30 seconds\nand then come back.\n\nDo it now?" || return
+    priv kiosk-restart >/dev/null
+    msg "Restart the screen" "Reconnecting. If it does not come back in a minute,\nring support." 10 60
+}
+
+action_reboot() {
+    yesno "Restart this box" "The counter will be unavailable for about 90 seconds.\n\nRestart now?" || return
+    priv reboot
+}
+
+# ── the PIN gate ─────────────────────────────────────────────────────────────
+# Authorisation for ONE action, not a login: the gate is re-entered for each gated screen, so
+# an abandoned menu cannot be walked into. Verification happens in the root helper; the secret
+# never enters this process.
+gate() {
+    local pin out serial
+    serial=$(awk -F': ' '/^Serial/{print $2}' /proc/cpuinfo 2>/dev/null)
+    pin=$(whiptail --backtitle "$BACKTITLE" --title "Support PIN" \
+        --passwordbox "$(printf 'Ring support and read them this serial:\n\n    %s\n\nThen enter the PIN they give you.' "$serial")" \
+        14 64 3>&1 1>&2 2>&3) || return 1
+    out=$(printf '%s\n' "$pin" | sudo -n "$PRIV" auth 2>&1)
+    case "$out" in
+        OK*)     return 0 ;;
+        LOCKED*) msg "Support PIN" "Too many wrong attempts.\n\nLocked for $(printf '%s' "${out#LOCKED }" | san) seconds." 10 56; return 1 ;;
+        *)       msg "Support PIN" "That PIN is not right for this device." 8 56; return 1 ;;
+    esac
+}
+
+# ── PIN-tier screens ─────────────────────────────────────────────────────────
+screen_ipconfig() {
+    gate || return
+    local mode addr gw dns out
+    mode=$(whiptail --backtitle "$BACKTITLE" --title "Wired IP" --menu \
+        "How should the wired connection get its address?" 13 66 2 \
+        "dhcp"   "Automatic from the router (normal)" \
+        "static" "Fixed address set by hand" 3>&1 1>&2 2>&3) || return
+    if [ "$mode" = dhcp ]; then
+        out=$(priv net-dhcp eth0)
+    else
+        addr=$(whiptail --backtitle "$BACKTITLE" --title "Wired IP" --inputbox \
+            "Address with prefix, e.g. 192.168.1.50/24" 10 62 3>&1 1>&2 2>&3) || return
+        gw=$(whiptail --backtitle "$BACKTITLE" --title "Wired IP" --inputbox \
+            "Router (gateway) address" 10 62 3>&1 1>&2 2>&3) || return
+        dns=$(whiptail --backtitle "$BACKTITLE" --title "Wired IP" --inputbox \
+            "DNS servers, comma separated" 10 62 "1.1.1.1,8.8.8.8" 3>&1 1>&2 2>&3) || return
+        out=$(sudo -n "$PRIV" net-static eth0 "$addr" "$gw" "$dns" 2>&1)
+    fi
+    msg "Wired IP" "$(printf '%s' "$out" | san)" 12 64
+}
+
+screen_hostname() {
+    gate || return
+    local new out
+    new=$(whiptail --backtitle "$BACKTITLE" --title "Hostname" --inputbox \
+        "Device name (letters, digits and hyphens):" 10 60 "$(hostname)" 3>&1 1>&2 2>&3) || return
+    out=$(sudo -n "$PRIV" hostname-set "$new" 2>&1)
+    msg "Hostname" "$(printf '%s' "$out" | san)" 10 60
+}
+
+# The agent has no version string — it is identified by the sha256 of its own file, which is
+# also how the server decides whether an update is due. So this screen speaks in shas rather
+# than inventing a version number the rest of the system would not agree with.
+screen_agent() {
+    local inst rem prev auto pending state
+    inst=$(priv agent-installed); rem=$(priv agent-remote); prev=$(priv agent-prev)
+    auto=$(priv agent-autoupdate)
+    pending=$([ -e /run/vigilant-update-pending ] && echo "yes - auto-reverts if the agent stops reporting" || echo no)
+
+    case "$rem" in
+        "")         state="could not reach the server" ;;
+        ERROR*)     state="could not reach the server (${rem#ERROR })" ;;
+        MISMATCH)   state="SERVER INCONSISTENT - refusing to trust it" ;;
+        "$inst")    state="up to date" ;;
+        *)          state="UPDATE AVAILABLE" ;;
+    esac
+
+    local body
+    body=$(printf 'Service     : %s\nInstalled   : %s\nOn server   : %s\nStatus      : %s\nPrevious    : %s\nAuto-update : %s\nRevert armed: %s\n' \
+        "$(systemctl is-active vigilant-agent 2>/dev/null)" \
+        "${inst:0:12}" "${rem:0:24}" "$state" "${prev:0:12}" \
+        "${auto:-unknown}" "$pending" | san)
+
+    local choice
+    choice=$(whiptail --backtitle "$BACKTITLE" --title "Agent version" --menu "$body" 22 74 3 \
+        "1" "Check again" \
+        "2" "Install the server's version  (PIN)" \
+        "3" "Roll back to the previous one (PIN)" 3>&1 1>&2 2>&3) || return
+    case "$choice" in
+        1) screen_agent ;;
+        2) gate || return
+           msg "Agent update" "$(priv agent-update | san)" 14 70 ;;
+        3) gate || return
+           yesno "Roll back" "Restore the previous agent and restart it?" || return
+           msg "Agent rollback" "$(priv agent-rollback | san)" 12 66 ;;
+    esac
+}
+
+screen_fixit() {
+    gate || return
+    local choice out q
+    while true; do
+        choice=$(whiptail --backtitle "$BACKTITLE" --title "Fix-it actions" --menu "" 20 70 8 \
+            "1" "Restart the monitoring agent" \
+            "2" "Restart the backup-link tunnel" \
+            "3" "Reset the smartcard service" \
+            "4" "Send a test print" \
+            "5" "Clear stuck print jobs" \
+            "6" "Show the last session log" \
+            "7" "Back" 3>&1 1>&2 2>&3) || return
+        case "$choice" in
+            1) out=$(priv svc-restart vigilant-agent) ;;
+            2) out=$(priv svc-restart rdp-tunnel) ;;
+            3) out=$(priv pcscd-reset) ;;
+            4|5) q=$(lpstat -p 2>/dev/null | awk '{print $2}' | head -1)
+                 if [ -z "$q" ]; then out="no printer queues configured"
+                 elif [ "$choice" = 4 ]; then out=$(sudo -n "$PRIV" test-print "$q" 2>&1)
+                 else out=$(sudo -n "$PRIV" queue-clear "$q" 2>&1); fi ;;
+            6) msg "Session log" "$(priv log-tail)" 24 78; continue ;;
+            *) return ;;
+        esac
+        msg "Fix-it actions" "$(printf '%s' "${out:-done}" | san)" 10 64
+    done
+}
+
+# Leave the toolbox for the pharmacy desktop. Two situations, and the item means the right
+# thing in both:
+#   * The kiosk (X) is already running on tty1 — we are a second VT alongside it. Just switch
+#     the display back to it; the session was never interrupted.
+#   * No kiosk is running — we are the boot-time prompt, and the caller (.bash_profile) runs
+#     `exec startx` the moment this function returns. So all we do is leave the menu.
+kiosk_running() { pgrep -x xfreerdp3 >/dev/null 2>&1 || pgrep -x Xorg >/dev/null 2>&1; }
+
+boot_into_rdp() {
+    if kiosk_running; then
+        priv to-rdp >/dev/null 2>&1      # chvt back to the live session (needs root)
+        return 0                          # stay resident on this VT, hidden behind the session
+    fi
+    RETURN_TO_RDP=1                        # boot-time path: signal the loop to exit -> startx
+    return 0
+}
+
+# ── main menu ────────────────────────────────────────────────────────────────
+RETURN_TO_RDP=0
+main_menu() {
+    local choice rdplabel
+    splash
+    while true; do
+        # The exit label matches reality: "switch to" when the desktop is already up behind us,
+        # "start" when we are the boot prompt and leaving here launches it.
+        if kiosk_running; then rdplabel="Switch to the pharmacy desktop"; else rdplabel="Start the pharmacy desktop"; fi
+        # Wrapped in a timeout so an abandoned menu returns to the till by itself. Whiptail has
+        # no idle handling of its own, and a counter parked in a support screen is a closed till
+        # that looks like a working one.
+        #
+        # --foreground is REQUIRED, not optional: without it GNU timeout runs whiptail in its
+        # OWN process group so it can signal the whole group on expiry. That group is not the
+        # terminal's foreground group, so the moment whiptail reads a keypress it takes SIGTTIN
+        # and freezes to a black screen (state T). --foreground leaves whiptail in our group,
+        # keeping it able to read the console. MEASURED on the pilot 2026-08-17: the menu drew,
+        # then the first arrow key froze it, until this flag was added.
+        choice=$(timeout --foreground "$IDLE_S" whiptail --backtitle "$BACKTITLE" \
+            --title "  Support toolbox  " --menu "\n Use the arrow keys, then Enter. \n" 24 72 13 \
+            "1"  "  Counter status" \
+            "2"  "  About this counter" \
+            "3"  "  Network and Wi-Fi" \
+            "4"  "  System health" \
+            "5"  "  Device manager" \
+            "6"  "  Restart the screen" \
+            "7"  "  Restart this box" \
+            "8"  "  Wired IP settings          (PIN)" \
+            "9"  "  Hostname                   (PIN)" \
+            "10" "  Agent version" \
+            "11" "  Fix-it actions             (PIN)" \
+            "12" "  $rdplabel" 3>&1 1>&2 2>&3) \
+            || { boot_into_rdp; [ "$RETURN_TO_RDP" = 1 ] && return; continue; }
+        case "$choice" in
+            1) screen_status ;;    2) screen_about ;;
+            3) screen_network ;;   4) screen_health ;;
+            5) screen_devices ;;   6) action_restart_session ;;
+            7) action_reboot ;;    8) screen_ipconfig ;;
+            9) screen_hostname ;;  10) screen_agent ;;
+            11) screen_fixit ;;
+            12) boot_into_rdp; [ "$RETURN_TO_RDP" = 1 ] && return || splash ;;
+            *) boot_into_rdp; [ "$RETURN_TO_RDP" = 1 ] && return ;;
+        esac
+    done
+}
+
+# ── boot prompt ──────────────────────────────────────────────────────────────
+# Holding a key during firmware boot is not reliable on a Pi 3B — a USB keyboard often has not
+# enumerated yet. So the window is owned by a systemd unit ordered before the kiosk instead,
+# which is what commercial thin clients do too. It runs from .bash_profile on tty1 BEFORE
+# `exec startx`, so at this point no X server exists and nothing has grabbed the keyboard —
+# the one window in which the console keyboard is reliably ours. (While the kiosk's X is
+# running it holds an EVIOCGRAB on the keyboard and no other VT can read it, which is why the
+# toolbox is a boot-time mode and not a switch-to-anytime console.)
+#
+# VERIFIED on this console with dumpkeys: the Linux VT sends F1-F5 as ESC [ [ A .. ESC [ [ E,
+# so F4 is ESC [ [ D (NOT ESC [ [ S — an earlier guess that silently never matched). Terminals
+# claiming xterm send SS3 (ESC O P..S) or ESC [ 1 n ~ instead. We accept the whole top-row
+# function-key class rather than F4 alone: at a counter a fumbled F3/F5 should still open the
+# menu, and there is nothing else those keys could mean at a boot prompt. A plain arrow key is
+# ESC [ X (single bracket) and deliberately does NOT match. Any unrecognised key is ignored and
+# the countdown continues, so neither a stray press nor an unattended boot holds a counter
+# offline — it always falls through to the desktop when the timer expires.
+BOOT_WAIT_FILE=/etc/wcn/boot-wait          # optional single integer; default 5s
+
+# Centre one line on the console width. The width comes from the framebuffer console, which on a
+# 1080p panel is ~240 cols, not 80 — so leading padding must be COMPUTED, never hardcoded, or
+# everything but the (separately centred) logo ends up hard against the left edge. $2 is the
+# printable length of $1 with the colour codes removed, since those occupy no columns.
+COLS=80
+cline() {
+    local text="$1" width="$2" pad
+    pad=$(( (COLS - width) / 2 )); [ "$pad" -lt 0 ] && pad=0
+    printf '%*s%b\n' "$pad" '' "$text"
+}
+
+boot_prompt() {
+    [ -t 0 ] || return 1                    # no real console (e.g. --report over a pipe)
+    local secs k rest line plain pad
+    secs=$(cat "$BOOT_WAIT_FILE" 2>/dev/null)
+    case "$secs" in ""|*[!0-9]*) secs=5 ;; esac
+    COLS=$(tput cols 2>/dev/null || echo 80)
+
+    clear
+    echo
+    if [ -r "$LOGO" ]; then
+        while IFS= read -r line; do
+            plain=$(printf '%s' "$line" | sed 's/\x1b\[[0-9;]*m//g')
+            pad=$(( (COLS - ${#plain}) / 2 )); [ "$pad" -lt 0 ] && pad=0
+            printf '%*s%s\n' "$pad" '' "$line"
+        done < "$LOGO"
+    fi
+    echo
+    cline '\033[96mW E S T E R N   C O M M U N I C A T I O N\033[0m' 41
+    cline '\033[90mthin-client support console\033[0m' 27
+    echo
+
+    # The countdown line is rebuilt and re-centred each second. \r returns to column 0 and the
+    # whole (padded) line is reprinted, so it updates in place and stays centred.
+    local msg mlen
+    while [ "$secs" -gt 0 ]; do
+        mlen=$(( 34 + ${#secs} + 30 ))       # printable length of the assembled line below
+        pad=$(( (COLS - mlen) / 2 )); [ "$pad" -lt 0 ] && pad=0
+        printf '\r%*sStarting the pharmacy desktop in \033[96m%s\033[0m s     press \033[1;97mF4\033[0m for the support menu' \
+            "$pad" '' "$secs"
+        if IFS= read -rsn1 -t 1 k; then
+            if [ "$k" = $'\e' ]; then
+                IFS= read -rsn5 -t 0.3 rest
+                case "$rest" in
+                    '[['*)                       printf '\n'; return 0 ;;  # Linux VT F1-F5 (F4 = [[D)
+                    'OP'|'OQ'|'OR'|'OS')         printf '\n'; return 0 ;;  # xterm SS3 F1-F4
+                    '[11~'|'[12~'|'[13~'|'[14~') printf '\n'; return 0 ;;  # vt-style F1-F4
+                esac
+            fi
+            # any other key: ignore and keep counting; only a function key opens the menu
+        fi
+        secs=$(( secs - 1 ))
+    done
+    printf '\n'
+    return 1
+}
+
+# Plain-text dump of every read-only screen, no whiptail and no terminal needed. Two uses:
+# an engineer on SSH gets the same picture the person at the counter is reading out, and the
+# screen builders can be exercised in CI or over a pipe where a TUI cannot run.
+report() {
+    echo "== counter status =="; status_body; echo
+    echo "== about =="
+    printf 'name    : %s\nserial  : %s\nwired   : %s\nwifi    : %s\ntunnel  : %s\nagent   : %s\ntoolbox : %s\n' \
+        "$(hostname)" "$(awk -F': ' '/^Serial/{print $2}' /proc/cpuinfo 2>/dev/null)" \
+        "$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}')" \
+        "$(ip -4 -o addr show wlan0 2>/dev/null | awk '{print $4}')" \
+        "$(ip -4 -o addr show wg0 2>/dev/null | awk '{print $4}')" \
+        "$(priv agent-installed | cut -c1-12)" "$TOOLBOX_VERSION" | san
+    echo
+    echo "== health =="
+    local th; th=$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2)
+    printf 'temp    : %s\nvolts   : %s\nthrottle: %s\n%s' \
+        "$(vcgencmd measure_temp 2>/dev/null | cut -d= -f2)" \
+        "$(vcgencmd measure_volts core 2>/dev/null | cut -d= -f2)" \
+        "${th:-?}" "$(throttle_words "$(( ${th:-0} ))")" | san
+    echo
+    echo "== agent =="
+    printf 'installed : %s\nserver    : %s\nprevious  : %s\nautoupdate: %s\nservice   : %s\n' \
+        "$(priv agent-installed | cut -c1-12)" "$(priv agent-remote | cut -c1-24)" \
+        "$(priv agent-prev | cut -c1-12)" "$(priv agent-autoupdate)" \
+        "$(systemctl is-active vigilant-agent 2>/dev/null)" | san
+}
+
+# Launch the pharmacy desktop, replacing this process. Called at the end of the boot flow —
+# whether the timer expired, the user never pressed F4, or they chose "Start the pharmacy
+# desktop". startx must run as THIS session (its own controlling tty is tty1), so exec rather
+# than a child keeps X owning the console it was started from.
+start_desktop() { exec startx; }
+
+case "${1:-}" in
+    # The boot entry. .bash_profile `exec`s us, so we ARE the tty1 session leader and job
+    # control is off — which is REQUIRED: as a child of the interactive login shell instead,
+    # the whiptail inside a $(...) is not in the terminal's foreground process group, takes a
+    # SIGTTOU and freezes (black screen, whiptail stuck in state T). Owning the session is what
+    # keeps the menu in the foreground. When the menu is done we launch the desktop ourselves.
+    --boot)
+        if boot_prompt; then main_menu; fi
+        start_desktop
+        ;;
+    --boot-prompt) boot_prompt && main_menu ;;   # prompt only; caller launches the desktop
+    --report)      report ;;
+    --version)     echo "$TOOLBOX_VERSION" ;;
+    *)             main_menu ;;
+esac
+exit 0

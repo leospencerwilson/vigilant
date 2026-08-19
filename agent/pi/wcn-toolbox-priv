@@ -1,0 +1,440 @@
+#!/bin/bash
+# Privileged half of the WCN counter-Pi support toolbox. ROOT ONLY.
+#
+# The toolbox TUI (wcn-toolbox) runs UNPRIVILEGED and can do nothing on its own. Every action
+# that needs root is a named verb in here, invoked as `sudo -n wcn-toolbox-priv <verb> [args]`
+# from a sudoers rule that lists this one binary. That is the whole security model, and it
+# exists because of where this runs:
+#
+#   tty1 autologins `westerncomms`, who holds NOPASSWD:ALL, and the kiosk chain is
+#   getty -> .bash_profile -> startx -> wcn-kiosk. ANY escape from a menu on that tty is a
+#   root shell standing at a pharmacy counter, with /etc/wcn-rdp.creds and the WireGuard
+#   private key one `cat` away. So the TUI must never BE root, and must never be able to
+#   construct a command — it can only pick a verb from this file.
+#
+# Rules for every verb below, without exception:
+#   * fixed argv, never a shell string. Nothing here interpolates a caller value into `sh -c`.
+#   * arguments validated to a tight format BEFORE use, and rejected loudly if they miss.
+#   * secrets are read here and never printed — the PIN secret and the agent token stay root's.
+#   * anything that can hang (network, pcsc, cups) is wrapped in `timeout`, because this is
+#     called from a menu a person is standing in front of.
+set -u
+
+SECRET=/etc/wcn/toolbox.secret
+LOCK=/var/lib/wcn/toolbox.lock
+AGENT=/usr/local/sbin/vigilant-pi-agent
+AGENT_ENV=/etc/vigilant/agent.env
+KIOSK_LOG=/var/log/wcn-kiosk.log
+
+[ "$(id -u)" = 0 ] || { echo "wcn-toolbox-priv: must run as root" >&2; exit 90; }
+
+die() { echo "wcn-toolbox-priv: $*" >&2; exit 91; }
+
+# ── argument validators ──────────────────────────────────────────────────────
+# Deliberately strict. A value that does not match is a bug or an attack, and in both cases
+# the right answer is to refuse rather than to sanitise and continue.
+v_iface()  { case "$1" in eth0|wlan0) ;; *) die "bad interface: $1" ;; esac; }
+v_cidr()   { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || die "bad address: $1"; }
+v_ip()     { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "bad ip: $1"; }
+v_host()   { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || die "bad hostname: $1"; }
+v_queue()  { [[ "$1" =~ ^[A-Za-z0-9_.-]{1,63}$ ]] || die "bad queue: $1"; }
+# SSIDs are genuinely arbitrary bytes, so this is a length + printable-ASCII check rather than
+# a character allowlist. It is safe because the value only ever reaches nmcli as fixed argv.
+v_ssid()   { [ -n "$1" ] && [ "${#1}" -le 32 ] && [[ "$1" != *[$'\x00'-$'\x1f\x7f']* ]] || die "bad ssid"; }
+# Only units this toolbox is allowed to touch. Not a pattern — a list.
+v_unit()   {
+    case "$1" in
+        vigilant-agent|rdp-tunnel|wcn-card-watch|cups|wg-quick@wg0) ;;
+        *) die "unit not allowed: $1" ;;
+    esac
+}
+
+# ── auth ─────────────────────────────────────────────────────────────────────
+# The PIN is DERIVED, never stored: pin = HMAC-SHA256(estate secret, this board's serial),
+# reduced to 6 digits. Support (or Watchman) computes the same value for the serial the caller
+# reads off the About screen, so the number spoken over the phone is good for ONE device.
+# A static estate-wide PIN read aloud at a public counter is one eavesdrop away from working
+# at all 348 sites; this is the cheap fix for that.
+#
+# Verification happens HERE so the secret never enters the unprivileged TUI's memory or argv.
+# The candidate arrives on stdin for the same reason — argv is world-readable in /proc.
+#
+# Lockout state is on DISK, not in the process: reboot is the attacker's cheapest way to reset
+# a counter, and a Pi at a counter can be power-cycled by anyone standing at it.
+cmd_auth() {
+    [ -r "$SECRET" ] || die "no toolbox secret provisioned"
+    # The program is handed to python with -c, NOT piped in as `python3 - <<EOF`. With the
+    # heredoc form the PROGRAM is stdin, so by the time it runs stdin is exhausted, the
+    # candidate PIN is never read, and every attempt compares against an empty string — which
+    # fails closed and so looks exactly like a wrong PIN. Caught on the bench 2026-08-17.
+    local prog
+    prog=$(cat <<'PY'
+import hashlib, hmac, json, os, sys, time
+
+lock_path, secret_path = sys.argv[1], sys.argv[2]
+MAX_FAILS, LOCK_S = 5, 900
+
+def serial():
+    with open("/proc/cpuinfo") as fh:
+        for line in fh:
+            if line.startswith("Serial"):
+                return line.split(":", 1)[1].strip()
+    return ""
+
+try:
+    with open(lock_path) as fh:
+        state = json.load(fh)
+except Exception:
+    state = {"fails": 0, "until": 0}
+
+now = int(time.time())
+if state.get("until", 0) > now:
+    print(f"LOCKED {state['until'] - now}")
+    sys.exit(3)
+
+candidate = sys.stdin.readline().strip()
+secret = open(secret_path, "rb").read().strip()
+digest = hmac.new(secret, serial().encode(), hashlib.sha256).digest()
+expected = "%06d" % (int.from_bytes(digest[:4], "big") % 1000000)
+
+# compare_digest, not ==, so the failure time does not leak the correct prefix.
+if hmac.compare_digest(candidate, expected):
+    state = {"fails": 0, "until": 0}
+    ok = True
+else:
+    state["fails"] = state.get("fails", 0) + 1
+    if state["fails"] >= MAX_FAILS:
+        state = {"fails": 0, "until": now + LOCK_S}
+    ok = False
+
+os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+tmp = lock_path + ".new"
+with open(tmp, "w") as fh:
+    json.dump(state, fh)
+os.replace(tmp, lock_path)
+
+# Audited locally. The agent picks this log up as bounded counters, so a site being poked at
+# repeatedly is visible centrally instead of only on the device.
+with open("/var/log/wcn-toolbox.log", "a") as fh:
+    fh.write("%s auth %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), "ok" if ok else "FAIL"))
+
+print("OK" if ok else "BAD")
+sys.exit(0 if ok else 1)
+PY
+)
+    python3 -c "$prog" "$LOCK" "$SECRET"
+}
+
+# ── read-only status verbs ───────────────────────────────────────────────────
+# `wg show` needs root even to read, which is the only reason tunnel status is in here.
+# It prints no key material: latest-handshakes and transfer only, never `wg show` in full
+# (that would render the private key on a screen anyone at the counter can see).
+cmd_wg_status() {
+    timeout 5 wg show wg0 latest-handshakes 2>/dev/null
+    echo "--"
+    timeout 5 wg show wg0 transfer 2>/dev/null
+    echo "--"
+    timeout 5 wg show wg0 endpoints 2>/dev/null
+}
+
+# Only the URL. The token on the next line of that file stays here.
+cmd_agent_url() { sed -n 's/^VIGILANT_URL=//p' "$AGENT_ENV" 2>/dev/null | head -1; }
+
+# Whether unattended self-update is switched on. A verb rather than letting the TUI run its own
+# `sudo grep`, because the moment the caller can name the file and the pattern, the sudoers rule
+# stops being an allowlist of ACTIONS and becomes a general read primitive on root's files —
+# and agent.env's very next line is the device token.
+cmd_agent_autoupdate() {
+    grep -qE '^VIGILANT_AUTO_UPDATE=(1|true|yes)' "$AGENT_ENV" 2>/dev/null && echo on || echo off
+}
+
+cmd_agent_installed_sha() { sha256sum "$AGENT" 2>/dev/null | cut -d' ' -f1; }
+cmd_agent_prev_sha()      { sha256sum "$AGENT.prev" 2>/dev/null | cut -d' ' -f1; }
+
+# Ask the server what it is serving, WITHOUT downloading or installing anything. Reuses the
+# device's own token and the same /agent/pi-script endpoint the agent's self-update uses, so
+# "is there an update" and "take the update" can never disagree about where truth lives.
+cmd_agent_remote_sha() {
+    # BOTH env files, in order, later wins. The per-device token is written by self-enrol to
+    # /var/lib/wcn/agent.env on image-built devices, but to /etc/vigilant/agent.env on others —
+    # so a verb that reads only one silently fails on half the fleet (blank version check while
+    # telemetry is fine). Merge both and take whichever carries VIGILANT_TOKEN.
+    python3 - /etc/vigilant/agent.env /var/lib/wcn/agent.env <<'PY'
+import sys, urllib.error, urllib.request
+conf = {}
+for path in sys.argv[1:]:
+    try:
+        for line in open(path):
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                conf[k.strip()] = v.strip()
+    except Exception:
+        pass
+url, token = conf.get("VIGILANT_URL"), conf.get("VIGILANT_TOKEN")
+if not (url and token):
+    sys.exit(1)
+# The User-Agent MUST be set. Cloudflare sits in front of the ingest and its bot rules answer
+# the default "Python-urllib/x.y" agent with a 403 before the request ever reaches the app —
+# which reads as "server rejected our token" when the token is fine. The real agent sends
+# this exact UA for the same reason; matching it keeps the check honest. Verified 2026-08-17:
+# urllib UA -> 403, this UA -> 200.
+req = urllib.request.Request(url.rstrip("/") + "/agent/pi-script",
+                             headers={"Authorization": "Bearer " + token,
+                                      "User-Agent": "vigilant-pi-agent/1"})
+try:
+    with urllib.request.urlopen(req, timeout=15) as r:
+        adv = r.headers.get("x-vigilant-sha256")
+        body = r.read()
+    import hashlib
+    got = hashlib.sha256(body).hexdigest()
+    # Report the sha of what was actually served, and flag a server that disagrees with itself.
+    print(got if not adv or adv == got else "MISMATCH")
+except urllib.error.HTTPError as e:
+    # The status code is the diagnosis and the class name is not: 401 means this device's token
+    # is not accepted (unenrolled, or rotated), 404 means the server is too old to serve the
+    # agent at all. "HTTPError" alone sends an engineer looking in the wrong place.
+    print("ERROR HTTP %s" % e.code)
+    sys.exit(1)
+except Exception as e:
+    print("ERROR %s" % type(e).__name__)
+    sys.exit(1)
+PY
+}
+
+# ── agent update / rollback ──────────────────────────────────────────────────
+# WHY THIS EXISTS AT ALL, when the agent already self-updates: on every device built before
+# 2026-08-14 the agent unit lacks `ReadWritePaths=-/usr/local/sbin`, so ProtectSystem=full
+# makes the agent's own binary read-only INSIDE its namespace and every self-update dies with
+# EROFS — silently, while the agent otherwise looks healthy. This helper runs as root OUTSIDE
+# that namespace, so it is the one path that can update exactly the devices that cannot update
+# themselves. Same endpoint, same sha256 gate, same dead-man's revert.
+cmd_agent_update() {
+    python3 - "$AGENT" /etc/vigilant/agent.env /var/lib/wcn/agent.env <<'PY'
+import ast, hashlib, os, shutil, subprocess, sys, urllib.request
+
+agent_path, env_paths = sys.argv[1], sys.argv[2:]
+REVERT_UNIT, REVERT_AFTER_S = "vigilant-agent-revert", 600
+
+# Both env files, later wins — the per-device token lives in one or the other (see the note in
+# cmd_agent_remote_sha).
+conf = {}
+for path in env_paths:
+    try:
+        for line in open(path):
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                conf[k.strip()] = v.strip()
+    except Exception:
+        pass
+url, token = conf.get("VIGILANT_URL"), conf.get("VIGILANT_TOKEN")
+if not (url and token):
+    print("no url/token in agent.env"); sys.exit(1)
+
+req = urllib.request.Request(url.rstrip("/") + "/agent/pi-script",
+                             headers={"Authorization": "Bearer " + token,
+                                      "User-Agent": "vigilant-pi-agent/1"})   # Cloudflare 403s urllib's default UA
+with urllib.request.urlopen(req, timeout=30) as r:
+    body, advertised = r.read(), r.headers.get("x-vigilant-sha256")
+
+got = hashlib.sha256(body).hexdigest()
+# Guard 1: the body must match what the server says it is — catches a truncated download.
+if advertised and advertised != got:
+    print("refusing: sha256 does not match the server's"); sys.exit(1)
+
+def sha_file(p):
+    try:
+        return hashlib.sha256(open(p, "rb").read()).hexdigest()
+    except Exception:
+        return None
+
+# Guard 2: identical content is never rewritten, so this verb is safe to press twice.
+if got == sha_file(agent_path):
+    print("already current %s" % got[:12]); sys.exit(0)
+
+# Guard 3: it must PARSE before it is installed. A half-file here means a counter with an
+# agent that cannot start and no remote way back in.
+try:
+    ast.parse(body.decode())
+except Exception as e:
+    print("refusing: served agent does not parse (%s)" % type(e).__name__); sys.exit(1)
+
+tmp = agent_path + ".new"
+with open(tmp, "wb") as fh:
+    fh.write(body)
+os.chmod(tmp, 0o755)
+shutil.copy2(agent_path, agent_path + ".prev")
+
+# Guard 4: arm the revert BEFORE the swap, so a crash between here and the restart still
+# recovers on its own. The failure mode of an update must not need the access it removes.
+open("/run/vigilant-update-pending", "w").write(got)
+subprocess.run(["systemd-run", "--unit=" + REVERT_UNIT, "--on-active=%d" % REVERT_AFTER_S,
+                "/bin/sh", "-c",
+                "cp {a}.prev {a} && rm -f /run/vigilant-update-pending && "
+                "systemctl restart vigilant-agent".format(a=agent_path)], timeout=20)
+os.replace(tmp, agent_path)
+subprocess.run(["systemctl", "restart", "vigilant-agent"], timeout=25)
+print("updated to %s, auto-reverts in %ds unless the agent reports" % (got[:12], REVERT_AFTER_S))
+PY
+}
+
+cmd_agent_rollback() {
+    [ -r "$AGENT.prev" ] || die "no previous agent kept"
+    cp -p "$AGENT.prev" "$AGENT" || die "rollback copy failed"
+    systemctl restart vigilant-agent
+    echo "rolled back to $(cmd_agent_installed_sha | cut -c1-12)"
+}
+
+# ── network ──────────────────────────────────────────────────────────────────
+# This image is NetworkManager (Debian 13, no dhcpcd), so everything is nmcli and the same
+# tool covers wired, static and wifi. Writing dhcpcd.conf here would parse fine and do nothing.
+cmd_net_dhcp() {
+    local i="$1"; v_iface "$i"
+    local con; con=$(nmcli -t -g GENERAL.CONNECTION device show "$i" 2>/dev/null)
+    [ -n "$con" ] || die "no connection on $i"
+    nmcli con mod "$con" ipv4.method auto ipv4.addresses "" ipv4.gateway "" ipv4.dns "" \
+        || die "nmcli mod failed"
+    nmcli con up "$con" >/dev/null 2>&1
+    echo "$i set to DHCP"
+}
+
+cmd_net_static() {
+    local i="$1" addr="$2" gw="$3" dns="$4"
+    v_iface "$i"; v_cidr "$addr"; v_ip "$gw"
+    # DNS is a comma-separated list; validate every element rather than the string as a whole.
+    local d; local IFS=','
+    for d in $dns; do v_ip "$d"; done
+    unset IFS
+    local con; con=$(nmcli -t -g GENERAL.CONNECTION device show "$i" 2>/dev/null)
+    [ -n "$con" ] || die "no connection on $i"
+    nmcli con mod "$con" ipv4.method manual ipv4.addresses "$addr" ipv4.gateway "$gw" \
+        ipv4.dns "$dns" || die "nmcli mod failed"
+    nmcli con up "$con" >/dev/null 2>&1
+    echo "$i set to $addr via $gw"
+}
+
+cmd_dhcp_renew() {
+    local i="$1"; v_iface "$i"
+    local con; con=$(nmcli -t -g GENERAL.CONNECTION device show "$i" 2>/dev/null)
+    [ -n "$con" ] || die "no connection on $i"
+    # down/up rather than a dhclient poke: NetworkManager owns the lease and a foreign client
+    # renewing behind its back leaves the two disagreeing about the address.
+    nmcli con down "$con" >/dev/null 2>&1
+    nmcli con up "$con" >/dev/null 2>&1 || die "could not bring $con back up"
+    echo "renewed $i"
+}
+
+cmd_wifi_scan() {
+    # --rescan yes or the list is whatever was cached, which at a site whose router was just
+    # swapped is exactly the wrong answer.
+    timeout 20 nmcli -t -f SSID,SIGNAL,SECURITY device wifi list --rescan yes 2>/dev/null
+}
+
+cmd_wifi_join() {
+    local ssid="$1"; v_ssid "$ssid"
+    local psk; IFS= read -r psk       # PSK on stdin: never in argv, never in this file's log
+    [ -n "$psk" ] || die "empty passphrase"
+    # Fixed argv. The SSID and PSK are data to nmcli and never touch a shell.
+    if timeout 45 nmcli device wifi connect "$ssid" password "$psk" ifname wlan0 >/dev/null 2>&1; then
+        echo "joined $ssid"
+    else
+        die "could not join $ssid — wrong passphrase, or out of range"
+    fi
+}
+
+# ── device / service actions ─────────────────────────────────────────────────
+cmd_hostname_set() {
+    local h="$1"; v_host "$h"
+    hostnamectl set-hostname "$h" || die "hostnamectl failed"
+    # /etc/hosts keeps its own copy; sudo warns noisily on every call if it goes stale.
+    sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$h/" /etc/hosts 2>/dev/null
+    # The agent reports the hostname, so restart it or Watchman shows the old name until the
+    # next natural restart.
+    systemctl restart vigilant-agent 2>/dev/null
+    echo "hostname set to $h"
+}
+
+cmd_svc_restart() { local u="$1"; v_unit "$u"; systemctl restart "$u" && echo "restarted $u"; }
+
+# pcscd is SOCKET-ACTIVATED: `systemctl is-active pcscd` reads "inactive" on a perfectly
+# healthy device, and restarting the service alone leaves the socket owning the old state.
+# Stop both, start the SOCKET, and let the next client activate the daemon.
+cmd_pcscd_reset() {
+    systemctl stop pcscd.service pcscd.socket 2>/dev/null
+    systemctl start pcscd.socket || die "could not start pcscd.socket"
+    echo "card service reset"
+}
+
+# A real page, not an empty job. A raw queue (the Zebra label printer) silently produces
+# nothing from a text file, so branch on the queue's own device URI rather than its name.
+cmd_test_print() {
+    local q="$1"; v_queue "$q"
+    local uri; uri=$(lpstat -v "$q" 2>/dev/null | sed -n 's/.*device for [^:]*: //p')
+    local tmp; tmp=$(mktemp)
+    if printf '%s' "$uri" | grep -qi 'zebra\|zpl\|socket://'; then
+        printf '^XA^FO40,40^A0N,30,30^FDWCN test print^FS^FO40,90^A0N,24,24^FD%s^FS^XZ\n' \
+            "$(hostname)" > "$tmp"
+        timeout 20 lp -d "$q" -o raw "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "lp failed"; }
+    else
+        printf 'WCN counter test print\nhost: %s\ndate: %s\nqueue: %s\n' \
+            "$(hostname)" "$(date -Is)" "$q" > "$tmp"
+        timeout 20 lp -d "$q" "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "lp failed"; }
+    fi
+    rm -f "$tmp"
+    echo "test page sent to $q"
+}
+
+cmd_queue_enable() { local q="$1"; v_queue "$q"; cupsenable "$q" && echo "enabled $q"; }
+cmd_queue_clear()  { local q="$1"; v_queue "$q"; cancel -a "$q" && echo "cleared jobs on $q"; }
+
+# xfreerdp3 ignores SIGTERM, and `pkill -f` would match this very helper's own argv. -x on the
+# exact process name is the only correct form here; the kiosk loop reconnects by itself, which
+# also re-runs pick_transport and so recovers a session wedged on the Cloudflare fallback.
+cmd_kiosk_restart() {
+    pkill -9 -x xfreerdp3 2>/dev/null
+    echo "session restarting"
+}
+
+cmd_log_tail() {
+    # Bounded and sanitised: these lines are rendered on a terminal and a log can contain
+    # anything, including escape sequences from a printer name or an SSID.
+    tail -n 40 "$KIOSK_LOG" 2>/dev/null | tr -cd '\11\12\40-\176'
+}
+
+# Switch the physical display back to tty1, where the kiosk's X session lives. chvt needs
+# CAP_SYS_TTY_CONFIG, hence root, hence a verb. Only ever targets tty1 — the toolbox has no
+# business switching to any other console.
+cmd_to_rdp() { chvt 1; }
+
+cmd_reboot()   { systemctl reboot; }
+cmd_poweroff() { systemctl poweroff; }
+
+# ── dispatch ─────────────────────────────────────────────────────────────────
+verb="${1:-}"; shift 2>/dev/null || true
+case "$verb" in
+    auth)               cmd_auth ;;
+    wg-status)          cmd_wg_status ;;
+    agent-url)          cmd_agent_url ;;
+    agent-installed)    cmd_agent_installed_sha ;;
+    agent-autoupdate)   cmd_agent_autoupdate ;;
+    agent-prev)         cmd_agent_prev_sha ;;
+    agent-remote)       cmd_agent_remote_sha ;;
+    agent-update)       cmd_agent_update ;;
+    agent-rollback)     cmd_agent_rollback ;;
+    net-dhcp)           cmd_net_dhcp "${1:?iface}" ;;
+    net-static)         cmd_net_static "${1:?iface}" "${2:?addr}" "${3:?gw}" "${4:?dns}" ;;
+    dhcp-renew)         cmd_dhcp_renew "${1:?iface}" ;;
+    wifi-scan)          cmd_wifi_scan ;;
+    wifi-join)          cmd_wifi_join "${1:?ssid}" ;;
+    hostname-set)       cmd_hostname_set "${1:?name}" ;;
+    svc-restart)        cmd_svc_restart "${1:?unit}" ;;
+    pcscd-reset)        cmd_pcscd_reset ;;
+    test-print)         cmd_test_print "${1:?queue}" ;;
+    queue-enable)       cmd_queue_enable "${1:?queue}" ;;
+    queue-clear)        cmd_queue_clear "${1:?queue}" ;;
+    kiosk-restart)      cmd_kiosk_restart ;;
+    to-rdp)             cmd_to_rdp ;;
+    log-tail)           cmd_log_tail ;;
+    reboot)             cmd_reboot ;;
+    poweroff)           cmd_poweroff ;;
+    *)                  die "unknown verb: ${verb:-<none>}" ;;
+esac
