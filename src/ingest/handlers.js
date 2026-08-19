@@ -2432,6 +2432,33 @@ async function deviceMetaSet(ctx) {
   return json(res, 200, { ok: true, device: updated });
 }
 
+// DELETE /devices/:serial  { by?, force? }
+// Full removal from the register — the cascade takes live state, history, the enrollment
+// token (revoked-by-deletion; the plaintext is unrecoverable, so a returning router needs
+// a full re-enrol), config jobs/snapshots and alerts. An ONLINE device is refused without
+// {"force":true}. The audit row records who asked; 'watchman' is the honest fallback when
+// the UI does not say (same convention as brandingActor — the admin token identifies the
+// estate, not a person).
+async function deviceDelete(ctx) {
+  const { res, store, body, params } = ctx;
+  if (typeof store.deleteDevice !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const parsed = parseJsonBody(body) || {};
+  const by = typeof parsed.by === 'string' && parsed.by.trim() ? parsed.by.trim() : 'watchman';
+  const force = parsed.force === true;
+  const r = await store.deleteDevice(params.serial, { force });
+  if (!r) return json(res, 404, { ok: false, error: 'device not found' });
+  if (r.blocked === 'online') {
+    return json(res, 409, {
+      ok: false,
+      error: 'device is online — it is still reporting; pass {"force":true} to remove it anyway',
+      device: r.device,
+    });
+  }
+  await store.appendAudit(by, 'device.delete', params.serial,
+    `identity=${r.device.identity || '?'} site=${r.device.site_name || '?'} last_status=${r.device.status || 'unknown'} forced=${force}`);
+  return json(res, 200, { ok: true, deleted: true, device: r.device });
+}
+
 function validateTagRule(r, { partial } = {}) {
   if (!partial || r.tag !== undefined) {
     const tag = String(r.tag == null ? '' : r.tag).trim();
@@ -3067,6 +3094,7 @@ module.exports = {
   tagsList,
   deviceTagsSet,
   deviceMetaSet,
+  deviceDelete,
   pharmaciesList,
   pharmacyGet,
   pharmacyCreate,
