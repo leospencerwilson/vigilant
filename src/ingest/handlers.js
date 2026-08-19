@@ -162,6 +162,29 @@ async function realtimeConfig(ctx) {
   });
 }
 
+// Postgres cannot store a NUL byte in `text` OR a \u0000 escape in `jsonb` — the INSERT
+// throws "unsupported Unicode escape sequence". A counter Pi ships kiosk log lines verbatim
+// and FreeRDP writes raw control bytes into that log (MEASURED 2026-08-19: 29,845 NUL-bearing
+// lines on the pilot), so telemetry POSTs intermittently carried one and the whole tick died
+// at the DB — taking last_seen_at with it, so a healthy counter read as "7 minutes ago".
+//
+// Strip at the boundary rather than at each write: the same body reaches device_state.raw
+// (jsonb), device_state.recent_logs (jsonb) and device_logs.message (text), and a guard on
+// only one of them just moves the failure. A NUL is never meaningful payload — it is console
+// noise — so dropping it loses nothing a reader would want.
+function stripNuls(v) {
+  if (typeof v === 'string') return v.indexOf('\u0000') === -1 ? v : v.replace(/\u0000/g, '');
+  if (Array.isArray(v)) {
+    for (let i = 0; i < v.length; i++) v[i] = stripNuls(v[i]);
+    return v;
+  }
+  if (v && typeof v === 'object') {
+    for (const k of Object.keys(v)) v[k] = stripNuls(v[k]);
+    return v;
+  }
+  return v;
+}
+
 // ── POST /telemetry ──────────────────────────────────────────────────
 // Implements the 11-step algorithm from the contract verbatim.
 async function telemetryIngest(ctx) {
@@ -175,7 +198,7 @@ async function telemetryIngest(ctx) {
   // 2. parse JSON — fail safe (400), never crash the service.
   let raw;
   try {
-    raw = JSON.parse(body || '');
+    raw = stripNuls(JSON.parse(body || ''));
   } catch (e) {
     log.warn('telemetry: bad json', { device: device.id });
     return json(res, 400, { ok: false, error: 'bad json' });

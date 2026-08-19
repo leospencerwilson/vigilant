@@ -177,14 +177,14 @@ function createServer({ store, config: cfg }) {
     try {
       // GET /healthz — open, no auth.
       if (method === 'GET' && pathname === '/healthz') {
-        return handlers.healthz(ctx);
+        return await handlers.healthz(ctx);
       }
 
       // GET / — admin onboarding UI (static HTML shell; enrol/fleet actions inside it
       // call the admin-token-gated JSON endpoints). Also serves as the 2xx root that
       // platform health checks probe.
       if (method === 'GET' && pathname === '/') {
-        return handlers.adminUi(ctx);
+        return await handlers.adminUi(ctx);
       }
 
       // ── device routes ────────────────────────────────────────────
@@ -194,7 +194,7 @@ function createServer({ store, config: cfg }) {
         if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = device;
         ctx.body = await readBody(req);
-        return handlers.telemetry(ctx);
+        return await handlers.telemetry(ctx);
       }
 
       // GET /agent/script?serial=
@@ -202,7 +202,7 @@ function createServer({ store, config: cfg }) {
         const device = await authDevice(req, store);
         if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = device;
-        return handlers.agentScript(ctx);
+        return await handlers.agentScript(ctx);
       }
 
       // GET /config/pending?serial=
@@ -210,7 +210,7 @@ function createServer({ store, config: cfg }) {
         const device = await authDevice(req, store);
         if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = device;
-        return handlers.configPending(ctx);
+        return await handlers.configPending(ctx);
       }
 
       // GET /config/:id.rsc
@@ -220,7 +220,7 @@ function createServer({ store, config: cfg }) {
         if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = device;
         ctx.params = { id: decodeURIComponent(mCfg[1]) };
-        return handlers.configScript(ctx);
+        return await handlers.configScript(ctx);
       }
 
       // POST /config/result
@@ -229,7 +229,7 @@ function createServer({ store, config: cfg }) {
         if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = device;
         ctx.body = await readBody(req);
-        return handlers.configResult(ctx);
+        return await handlers.configResult(ctx);
       }
 
       // ── speedtest (device) — server-timed active bandwidth test ──
@@ -238,14 +238,14 @@ function createServer({ store, config: cfg }) {
         const device = await authDevice(req, store);
         if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = device;
-        return handlers.speedtestPending(ctx);
+        return await handlers.speedtestPending(ctx);
       }
       // GET /speedtest/down — streamed download payload (handler writes the body).
       if (method === 'GET' && pathname === '/speedtest/down') {
         const device = await authDevice(req, store);
         if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = device;
-        return handlers.speedtestDown(ctx);
+        return await handlers.speedtestDown(ctx);
       }
       // POST|PUT /speedtest/up — streamed upload; do NOT pre-buffer the body, the handler
       // consumes the stream itself so it can TIME the transfer. We accept PUT as well as POST
@@ -255,7 +255,7 @@ function createServer({ store, config: cfg }) {
         const device = await authDevice(req, store);
         if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = device;
-        return handlers.speedtestUp(ctx);
+        return await handlers.speedtestUp(ctx);
       }
       // POST /speedtest/result — optional finaliser from the agent.
       if (method === 'POST' && pathname === '/speedtest/result') {
@@ -263,7 +263,7 @@ function createServer({ store, config: cfg }) {
         if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = device;
         ctx.body = await readBody(req);
-        return handlers.speedtestResult(ctx);
+        return await handlers.speedtestResult(ctx);
       }
 
       // ── admin routes ─────────────────────────────────────────────
@@ -271,26 +271,26 @@ function createServer({ store, config: cfg }) {
       if (method === 'POST' && pathname === '/enroll') {
         if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
-        return handlers.enroll(ctx);
+        return await handlers.enroll(ctx);
       }
 
       // GET /fleet — master OR scoped field token (read-only device list for wc_field).
       if (method === 'GET' && pathname === '/fleet') {
         if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.fleet(ctx);
+        return await handlers.fleet(ctx);
       }
 
       // POST /admin/migrate — apply the bundled idempotent schema.sql (admin only).
       if (method === 'POST' && pathname === '/admin/migrate') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.adminMigrate(ctx);
+        return await handlers.adminMigrate(ctx);
       }
 
       // POST /realtime/config — admin-gated. Mints a short-lived Supabase `authenticated` JWT
       // (+ URL/anon key) so the dashboard can subscribe to Realtime. 501 if not configured.
       if (method === 'POST' && pathname === '/realtime/config') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.realtimeConfig(ctx);
+        return await handlers.realtimeConfig(ctx);
       }
 
       // ── alert-rule CRUD (admin) — backs the Rules UI ──
@@ -299,59 +299,59 @@ function createServer({ store, config: cfg }) {
       // (kind='counter-pi') so it reuses token auth, telemetry, alerting and tags.
       if (method === 'GET' && pathname === '/pharmacies') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.pharmaciesList(ctx);
+        return await handlers.pharmaciesList(ctx);
       }
       if (method === 'POST' && pathname === '/pharmacies') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
-        return handlers.pharmacyCreate(ctx);
+        return await handlers.pharmacyCreate(ctx);
       }
       const mPharm = /^\/pharmacies\/([^/]+)$/.exec(pathname);
       if (mPharm && method === 'GET') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mPharm[1]) };
-        return handlers.pharmacyGet(ctx);
+        return await handlers.pharmacyGet(ctx);
       }
       if (mPharm && (method === 'PUT' || method === 'PATCH')) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mPharm[1]) };
         ctx.body = await readBody(req);
-        return handlers.pharmacyUpdate(ctx);
+        return await handlers.pharmacyUpdate(ctx);
       }
       if (mPharm && method === 'DELETE') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mPharm[1]) };
-        return handlers.pharmacyDelete(ctx);
+        return await handlers.pharmacyDelete(ctx);
       }
 
       if (method === 'GET' && pathname === '/printers/lan') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.lanPrinters(ctx);
+        return await handlers.lanPrinters(ctx);
       }
       const mPrinterTest = /^\/printers\/([^/]+)\/test-print$/.exec(pathname);
       if (mPrinterTest && method === 'POST') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mPrinterTest[1]) };
-        return handlers.printerTestPrint(ctx);
+        return await handlers.printerTestPrint(ctx);
       }
       // Site VM list — before /pharmacies/:id so the suffix is not swallowed.
       const mPhVmOne = /^\/pharmacies\/([^/]+)\/vms\/(\d+)$/.exec(pathname);
       if (mPhVmOne && method === 'DELETE') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mPhVmOne[1]), vmid: mPhVmOne[2] };
-        return handlers.pharmacyVmDetach(ctx);
+        return await handlers.pharmacyVmDetach(ctx);
       }
       const mPhVms = /^\/pharmacies\/([^/]+)\/vms$/.exec(pathname);
       if (mPhVms && method === 'GET') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mPhVms[1]) };
-        return handlers.pharmacyVmsList(ctx);
+        return await handlers.pharmacyVmsList(ctx);
       }
       if (mPhVms && method === 'POST') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mPhVms[1]) };
         ctx.body = await readBody(req);
-        return handlers.pharmacyVmAttach(ctx);
+        return await handlers.pharmacyVmAttach(ctx);
       }
       // Zero-touch thin-client provisioning. Self-enrol is gated by the SHARED bootstrap
       // token (SELF_ENROL_TOKEN), not the estate master — a leak can only mint an unclaimed
@@ -362,7 +362,7 @@ function createServer({ store, config: cfg }) {
         const dev = await authDevice(req, store);
         if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = dev;
-        return handlers.piAgentScript(ctx);
+        return await handlers.piAgentScript(ctx);
       }
       // POST /screen — thin client uploads its screen thumbnail (device token, not admin).
       if (method === 'POST' && pathname === '/screen') {
@@ -370,7 +370,7 @@ function createServer({ store, config: cfg }) {
         if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = dev;
         ctx.body = await readBody(req);
-        return handlers.postScreen(ctx);
+        return await handlers.postScreen(ctx);
       }
       // ── fleet-wide thin-client branding ────────────────────────────────────
       // ONE record for the whole estate — no serial and no site code appears in any of these
@@ -390,22 +390,22 @@ function createServer({ store, config: cfg }) {
           if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
           ctx.device = dev;
         }
-        return handlers.brandingGetSplash(ctx);
+        return await handlers.brandingGetSplash(ctx);
       }
       if (method === 'PUT' && pathname === '/branding/splash') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
-        return handlers.brandingPutSplash(ctx);
+        return await handlers.brandingPutSplash(ctx);
       }
       if (method === 'DELETE' && pathname === '/branding/splash') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.brandingDeleteSplash(ctx);
+        return await handlers.brandingDeleteSplash(ctx);
       }
       // Read is authField — the same read-only credential the Watchman UI already uses for logs,
       // history and screen thumbnails, so the editor needs no new secret to populate its form.
       if (method === 'GET' && pathname === '/branding') {
         if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.brandingGet(ctx);
+        return await handlers.brandingGet(ctx);
       }
       // Writes are authAdmin: this changes what every thin client in the estate displays.
       // PATCH is accepted alongside PUT because the body is a PARTIAL update (only the keys
@@ -413,7 +413,7 @@ function createServer({ store, config: cfg }) {
       if ((method === 'PUT' || method === 'PATCH') && pathname === '/branding') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
-        return handlers.brandingPutText(ctx);
+        return await handlers.brandingPutText(ctx);
       }
 
       if (method === 'POST' && pathname === '/enrol/self') {
@@ -422,27 +422,27 @@ function createServer({ store, config: cfg }) {
           return json(res, 401, { ok: false, error: 'unauthorized' });
         }
         ctx.body = await readBody(req);
-        return handlers.selfEnrol(ctx);
+        return await handlers.selfEnrol(ctx);
       }
       if (method === 'GET' && pathname === '/pis/unclaimed') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.unclaimedPisList(ctx);
+        return await handlers.unclaimedPisList(ctx);
       }
       const mAdopt = /^\/pis\/([^/]+)\/adopt$/.exec(pathname);
       if (mAdopt && method === 'POST') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mAdopt[1]) };
         ctx.body = await readBody(req);
-        return handlers.adoptPi(ctx);
+        return await handlers.adoptPi(ctx);
       }
       if (method === 'GET' && pathname === '/counters') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.countersList(ctx);
+        return await handlers.countersList(ctx);
       }
       if (method === 'POST' && pathname === '/counters') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
-        return handlers.counterCreate(ctx);
+        return await handlers.counterCreate(ctx);
       }
       // Enrol route FIRST — it is more specific than /counters/:id.
       const mCounterPi = /^\/counters\/([^/]+)\/enrol-pi$/.exec(pathname);
@@ -450,14 +450,14 @@ function createServer({ store, config: cfg }) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mCounterPi[1]) };
         ctx.body = await readBody(req);
-        return handlers.counterEnrolPi(ctx);
+        return await handlers.counterEnrolPi(ctx);
       }
       const mCounterAction = /^\/counters\/([^/]+)\/action$/.exec(pathname);
       if (mCounterAction && method === 'POST') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mCounterAction[1]) };
         ctx.body = await readBody(req);
-        return handlers.counterAction(ctx);
+        return await handlers.counterAction(ctx);
       }
       // Support screen sharing. BEFORE /counters/:id for the same specificity reason.
       const mCounterSupport = /^\/counters\/([^/]+)\/support$/.exec(pathname);
@@ -465,12 +465,12 @@ function createServer({ store, config: cfg }) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mCounterSupport[1]) };
         ctx.body = await readBody(req);
-        return handlers.counterSupportStart(ctx);
+        return await handlers.counterSupportStart(ctx);
       }
       if (mCounterSupport && method === 'GET') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mCounterSupport[1]) };
-        return handlers.counterSupportStatus(ctx);
+        return await handlers.counterSupportStatus(ctx);
       }
       // Boot target BEFORE /counters/:id, same specificity reason as enrol-pi.
       const mCounterBoot = /^\/counters\/([^/]+)\/boot-target$/.exec(pathname);
@@ -478,30 +478,30 @@ function createServer({ store, config: cfg }) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mCounterBoot[1]) };
         ctx.body = await readBody(req);
-        return handlers.counterSetBootTarget(ctx);
+        return await handlers.counterSetBootTarget(ctx);
       }
       const mCounter = /^\/counters\/([^/]+)$/.exec(pathname);
       if (mCounter && (method === 'PUT' || method === 'PATCH')) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mCounter[1]) };
         ctx.body = await readBody(req);
-        return handlers.counterUpdate(ctx);
+        return await handlers.counterUpdate(ctx);
       }
       if (mCounter && method === 'DELETE') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mCounter[1]) };
-        return handlers.counterDelete(ctx);
+        return await handlers.counterDelete(ctx);
       }
 
       // ── Proxmox discovery (admin) ──────────────────────────────────────────
       if (method === 'POST' && pathname === '/proxmox/report') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
-        return handlers.proxmoxReport(ctx);
+        return await handlers.proxmoxReport(ctx);
       }
       if (method === 'GET' && pathname === '/proxmox-vms') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.proxmoxList(ctx);
+        return await handlers.proxmoxList(ctx);
       }
 
       // ── printers ───────────────────────────────────────────────────────────
@@ -509,12 +509,12 @@ function createServer({ store, config: cfg }) {
       // nothing in the datacentre can reach a printer on a site network.
       if (method === 'GET' && pathname === '/printers') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.printersList(ctx);
+        return await handlers.printersList(ctx);
       }
       if (method === 'POST' && pathname === '/printers') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
-        return handlers.printerUpsert(ctx);
+        return await handlers.printerUpsert(ctx);
       }
       // DEVICE route — the Pi reports with its own token, not the admin token.
       if (method === 'POST' && pathname === '/printers/report') {
@@ -522,24 +522,24 @@ function createServer({ store, config: cfg }) {
         if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = dev;
         ctx.body = await readBody(req);
-        return handlers.printersReport(ctx);
+        return await handlers.printersReport(ctx);
       }
       const mPrinter = /^\/printers\/([^/]+)$/.exec(pathname);
       if (mPrinter && method === 'DELETE') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mPrinter[1]) };
-        return handlers.printerDelete(ctx);
+        return await handlers.printerDelete(ctx);
       }
 
       // Observed WireGuard state from the hub's collector.
       if (method === 'GET' && pathname === '/wg-peers') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.wgPeersList(ctx);
+        return await handlers.wgPeersList(ctx);
       }
       if (method === 'POST' && pathname === '/wg-peers/report') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
-        return handlers.wgPeersReport(ctx);
+        return await handlers.wgPeersReport(ctx);
       }
 
       // ── site LAN inventory ─────────────────────────────────────────────────
@@ -550,7 +550,7 @@ function createServer({ store, config: cfg }) {
       if (method === 'GET' && mSiteDevices) {
         if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { code: decodeURIComponent(mSiteDevices[1]) };
-        return handlers.siteDevices(ctx);
+        return await handlers.siteDevices(ctx);
       }
 
       // ── LAN relay (long-poll reverse channel through a thin client) ─────────
@@ -560,7 +560,7 @@ function createServer({ store, config: cfg }) {
       if (method === 'POST' && pathname === '/relay/sessions') {
         if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
-        return handlers.relaySessionCreate(ctx);
+        return await handlers.relaySessionCreate(ctx);
       }
       // DEVICE routes — the Pi's own bearer, not an operator's token.
       const mRelayNext = /^\/relay\/([^/]+)\/next$/.exec(pathname);
@@ -569,7 +569,7 @@ function createServer({ store, config: cfg }) {
         if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = dev;
         ctx.params = { id: decodeURIComponent(mRelayNext[1]) };
-        return handlers.relayNext(ctx);
+        return await handlers.relayNext(ctx);
       }
       const mRelayReply = /^\/relay\/([^/]+)\/reply$/.exec(pathname);
       if (method === 'POST' && mRelayReply) {
@@ -578,7 +578,7 @@ function createServer({ store, config: cfg }) {
         ctx.device = dev;
         ctx.params = { id: decodeURIComponent(mRelayReply[1]) };
         ctx.body = await readBody(req);
-        return handlers.relayReply(ctx);
+        return await handlers.relayReply(ctx);
       }
       // Browser-facing proxy. The trailing path is captured RAW (not decoded): it is handed
       // straight to the device, and decoding it here would corrupt an escaped query or path
@@ -595,7 +595,7 @@ function createServer({ store, config: cfg }) {
         // a narrower thing to hold than the field key this replaces.
         ctx.params = { id: decodeURIComponent(mRelayProxy[1]), path: mRelayProxy[2] || '/' };
         if (method === 'POST') ctx.body = await readBody(req);
-        return handlers.relayProxy(ctx);
+        return await handlers.relayProxy(ctx);
       }
 
       // ── tags & smart tags (admin) ──────────────────────────────────────────
@@ -603,39 +603,39 @@ function createServer({ store, config: cfg }) {
       // config_jobs.target_tag select on, so these make tag-scoped alerting usable.
       if (method === 'GET' && pathname === '/tags') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.tagsList(ctx);
+        return await handlers.tagsList(ctx);
       }
       if (method === 'GET' && pathname === '/tag-rules') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.tagRulesList(ctx);
+        return await handlers.tagRulesList(ctx);
       }
       // Preview before create/update, so the UI can show the blast radius first.
       if (method === 'POST' && pathname === '/tag-rules/preview') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
-        return handlers.tagRulePreview(ctx);
+        return await handlers.tagRulePreview(ctx);
       }
       // Apply rules now rather than waiting for the worker's next pass.
       if (method === 'POST' && pathname === '/tag-rules/sync') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.tagRulesSync(ctx);
+        return await handlers.tagRulesSync(ctx);
       }
       if (method === 'POST' && pathname === '/tag-rules') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
-        return handlers.tagRuleCreate(ctx);
+        return await handlers.tagRuleCreate(ctx);
       }
       const mTagRule = /^\/tag-rules\/([^/]+)$/.exec(pathname);
       if (mTagRule && (method === 'PUT' || method === 'PATCH')) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mTagRule[1]) };
         ctx.body = await readBody(req);
-        return handlers.tagRuleUpdate(ctx);
+        return await handlers.tagRuleUpdate(ctx);
       }
       if (mTagRule && method === 'DELETE') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mTagRule[1]) };
-        return handlers.tagRuleDelete(ctx);
+        return await handlers.tagRuleDelete(ctx);
       }
       // PATCH /devices/:serial/tags — set a device's manual tags.
       const mDevTags = /^\/devices\/([^/]+)\/tags$/.exec(pathname);
@@ -643,7 +643,7 @@ function createServer({ store, config: cfg }) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { serial: decodeURIComponent(mDevTags[1]) };
         ctx.body = await readBody(req);
-        return handlers.deviceTagsSet(ctx);
+        return await handlers.deviceTagsSet(ctx);
       }
       // PATCH /devices/:serial — operator-editable metadata (customer, site_name, …).
       // Registered AFTER /devices/:serial/tags so the more specific path wins.
@@ -652,39 +652,39 @@ function createServer({ store, config: cfg }) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { serial: decodeURIComponent(mDevMeta[1]) };
         ctx.body = await readBody(req);
-        return handlers.deviceMetaSet(ctx);
+        return await handlers.deviceMetaSet(ctx);
       }
 
       if (method === 'GET' && pathname === '/alert-rules') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.alertRulesList(ctx);
+        return await handlers.alertRulesList(ctx);
       }
       // GET /alerts (admin) — recent alert history (rule hits) for the Rules history view.
       if (method === 'GET' && pathname === '/alerts') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
-        return handlers.alertHistory(ctx);
+        return await handlers.alertHistory(ctx);
       }
       if (method === 'POST' && pathname === '/alert-rules/test') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
-        return handlers.alertRuleTest(ctx);
+        return await handlers.alertRuleTest(ctx);
       }
       if (method === 'POST' && pathname === '/alert-rules') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.body = await readBody(req);
-        return handlers.alertRuleCreate(ctx);
+        return await handlers.alertRuleCreate(ctx);
       }
       const mRule = /^\/alert-rules\/([^/]+)$/.exec(pathname);
       if (mRule && (method === 'PUT' || method === 'PATCH')) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mRule[1]) };
         ctx.body = await readBody(req);
-        return handlers.alertRuleUpdate(ctx);
+        return await handlers.alertRuleUpdate(ctx);
       }
       if (mRule && method === 'DELETE') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mRule[1]) };
-        return handlers.alertRuleDelete(ctx);
+        return await handlers.alertRuleDelete(ctx);
       }
 
       // GET /devices/:serial/history?window=1h (admin) — dashboard chart series.
@@ -695,7 +695,7 @@ function createServer({ store, config: cfg }) {
       if (method === 'GET' && mHist) {
         if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { serial: decodeURIComponent(mHist[1]) };
-        return handlers.deviceHistory(ctx);
+        return await handlers.deviceHistory(ctx);
       }
       // GET /devices/:serial/screen — the thumbnail as an image, for the thin-client list.
       // authField, not authAdmin: this is the same read-only credential the Watchman UI
@@ -704,14 +704,14 @@ function createServer({ store, config: cfg }) {
       if (method === 'GET' && mScreen) {
         if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { serial: decodeURIComponent(mScreen[1]) };
-        return handlers.deviceScreen(ctx);
+        return await handlers.deviceScreen(ctx);
       }
       // GET /devices/:serial/logs?q=&topic=&limit= — filtered 30-day log history.
       const mLogs = /^\/devices\/([^/]+)\/logs$/.exec(pathname);
       if (method === 'GET' && mLogs) {
         if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { serial: decodeURIComponent(mLogs[1]) };
-        return handlers.deviceLogs(ctx);
+        return await handlers.deviceLogs(ctx);
       }
 
       // GET|POST /devices/:serial/config-jobs (admin) — list / author review-gated config-push
@@ -731,7 +731,7 @@ function createServer({ store, config: cfg }) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mCfgApprove[1]) };
         ctx.body = await readBody(req);
-        return handlers.configJobApprove(ctx);
+        return await handlers.configJobApprove(ctx);
       }
 
       // POST /config-jobs/:id/cancel (admin) — cancel a draft / not-yet-picked-up approved job.
@@ -740,7 +740,7 @@ function createServer({ store, config: cfg }) {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mCfgCancel[1]) };
         ctx.body = await readBody(req);
-        return handlers.configJobCancel(ctx);
+        return await handlers.configJobCancel(ctx);
       }
 
       // GET|POST /devices/:serial/speedtests (admin) — list / request an active speedtest.
@@ -757,7 +757,7 @@ function createServer({ store, config: cfg }) {
       if (method === 'GET' && mDev) {
         if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { serial: decodeURIComponent(mDev[1]) };
-        return handlers.deviceDetail(ctx);
+        return await handlers.deviceDetail(ctx);
       }
 
       // GET /oui/:mac (admin) — OUI -> vendor lookup for the dashboard. The :mac segment may
@@ -770,12 +770,20 @@ function createServer({ store, config: cfg }) {
       if (method === 'GET' && mOui) {
         if (!authField(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { mac: decodeURIComponent(mOui[1]) };
-        return handlers.ouiLookup(ctx);
+        return await handlers.ouiLookup(ctx);
       }
 
       return json(res, 404, { ok: false, error: 'not found' });
     } catch (e) {
       // Fail safe: one bad request must never 500-cascade or take the service down.
+      //
+      // Every dispatch above is `return await handlers.x(ctx)`, NOT `return handlers.x(ctx)`.
+      // The await is load-bearing: returning a promise from a try block resolves this function
+      // with it WITHOUT awaiting, so a rejecting handler skips this catch entirely, surfaces as
+      // an unhandledRejection, and — because nothing ever writes the response — leaves the
+      // client hanging until ITS timeout. That is strictly worse than a 500: the caller cannot
+      // tell a broken request from a dead server. MEASURED 2026-08-19 on the counter Pi, which
+      // read as offline for minutes at a time while the ingest was healthy and serving.
       log.error('ingest: unhandled request error', { method, path: pathname, msg: e && e.message });
       if (!res.headersSent) return json(res, 500, { ok: false, error: 'internal error' });
       try {

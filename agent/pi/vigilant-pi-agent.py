@@ -1574,18 +1574,36 @@ LOG_KEEP = re.compile(
 )
 
 
+# Control bytes that must never reach the server. Postgres rejects a NUL in `text` and a
+# \u0000 escape in `jsonb`, so ONE such byte anywhere in the batch fails the whole telemetry
+# write — not just the log insert — and the counter's last_seen_at stops advancing while the
+# agent, the network and the ingest are all perfectly healthy.
+#
+# MEASURED 2026-08-19 on the pilot: 29,845 lines of /var/log/wcn-kiosk.log contain a NUL,
+# because FreeRDP writes raw terminal control bytes there. Whether a given tick broke depended
+# purely on where the tail window happened to land, which is what made this look intermittent
+# and what sent three earlier diagnoses (payload size, log volume, a "poison line") the wrong
+# way. The server strips these too; doing it here as well keeps a fleet of older servers safe
+# and saves shipping bytes no reader would ever want to see.
+_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
 def _log_line(source, text):
-    return {"time": "", "topics": source, "message": REDACT.sub(r"\1<redacted>", text)[:400]}
+    clean = _CTRL.sub("", REDACT.sub(r"\1<redacted>", text))
+    return {"time": "", "topics": source, "message": clean[:400]}
 
 
 # Keys of log lines already accepted by the server, so the same tail is not re-sent forever.
 #
-# MEASURED 2026-08-19: re-sending the same lines every tick made every telemetry POST carrying
-# `logs` hang for >20s, while the byte-identical POST without them answered in 0.2s. The insert
-# is one multi-row statement, so the time was spent CONTENDING on the (device_id, log_time,
-# message) primary key — whose entries are whole log lines — not doing work. Because every tick
-# ships logs, the counter stopped reporting at all and went stale: a dead-looking pharmacy
-# counter caused entirely by a log write.
+# NOTE ON HISTORY: this dedup was originally added because POSTs carrying `logs` hung >20s
+# while the same POST without them answered in 0.2s, which was read as primary-key contention
+# on (device_id, log_time, message). That diagnosis was WRONG. The hang was a NUL byte in a
+# kiosk log line (see _CTRL above) failing the write, plus a missing `await` on the server that
+# turned the resulting error into no-response-at-all. Both are fixed at the source.
+#
+# The dedup is kept on its own merits — re-sending an unchanged tail every tick is pure waste,
+# and bounding the batch keeps one bad device from dominating the ingest — but it was never the
+# cure, and anyone reading it as one will mis-diagnose the next stall.
 #
 # Bounded so a long-running agent cannot grow this without limit; the server still dedupes, so
 # a line dropped here is only ever a duplicate we chose not to re-send.
