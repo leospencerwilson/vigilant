@@ -163,3 +163,36 @@ test("every field the handler reads off the payload is present in normalize()'s 
       "they arrive as undefined on every tick and are stored as null forever: " + missing.join(", ")
   );
 });
+
+test("every device_state field the handler sets is actually written by the POSTGRES store", async () => {
+  // The third instance of one trap, and the reason the previous two survived review: the
+  // in-memory store keeps whatever object it is handed, so a mem-backed test passes even when
+  // the pg store never writes the column. smartcard_stack_ok was added to the schema and to
+  // alertMetricColumn's whitelist but NOT to upsertDeviceState's INSERT, so in production it
+  // stayed null on every tick while all of its unit tests were green.
+  //
+  // Compare the handler's deviceState literal against the real INSERT column list, so any new
+  // field must be wired all the way through or this fails loudly.
+  const fs = require("node:fs");
+  const handlers = fs.readFileSync(require.resolve("../src/ingest/handlers.js"), "utf8");
+  const pg = fs.readFileSync(require.resolve("../src/shared/store.pg.js"), "utf8");
+
+  const start = handlers.indexOf("const deviceState = {");
+  assert.ok(start > -1, "the deviceState literal must exist");
+  const lit = handlers.slice(start, handlers.indexOf("\n    };", start));
+  // Top-level keys only: nested object properties are indented deeper than 6 spaces.
+  const keys = [...lit.matchAll(/^ {6}([a-z_][a-z0-9_]*):/gim)].map((m) => m[1]);
+  assert.ok(keys.length > 10, "expected many device_state keys, got " + keys.length);
+
+  const ins = pg.indexOf("INSERT INTO device_state");
+  const cols = pg.slice(ins, pg.indexOf(")", pg.indexOf("(", ins)));
+
+  // `raw` and `last_seen_at` are handled positionally/by COALESCE but still appear by name.
+  const missing = keys.filter((k) => !new RegExp("\\b" + k + "\\b").test(cols));
+  assert.deepEqual(
+    missing, [],
+    "these fields are set by the ingest handler but are NOT columns in upsertDeviceState's " +
+      "INSERT, so postgres silently stores nothing for them (mem-store tests will still pass): " +
+      missing.join(", ")
+  );
+});

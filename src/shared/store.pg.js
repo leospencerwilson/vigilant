@@ -193,9 +193,9 @@ function makePgStore(poolOrConfig) {
           pppoe_running, ppp_sessions, dhcp_leases, conn_count, lte_signal,
           cpu_temperature, board_temperature, fan1_speed, fan2_speed, write_sect_total,
           firmware_current, firmware_upgrade, ntp_synced, netwatch_down, last_seen_at, raw,
-          recent_logs)
+          recent_logs, smartcard_stack_ok)
        VALUES ($1,COALESCE($2,'unknown'),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-               $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,COALESCE($28, now()),$29,$30)
+               $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,COALESCE($28, now()),$29,$30,$31)
        ON CONFLICT (device_id) DO UPDATE SET
          status            = EXCLUDED.status,
          uptime_s          = EXCLUDED.uptime_s,
@@ -229,7 +229,12 @@ function makePgStore(poolOrConfig) {
          -- log lines when it has some; taking EXCLUDED unconditionally would blank the
          -- stored set on the very next quiet tick, which is precisely the bug this
          -- column was added to fix. Last known logs persist until newer ones arrive.
-         recent_logs       = COALESCE(EXCLUDED.recent_logs, device_state.recent_logs)`,
+         recent_logs       = COALESCE(EXCLUDED.recent_logs, device_state.recent_logs),
+         -- COALESCE for the same reason as recent_logs, plus one of its own: null here means
+         -- "this agent said nothing about smartcards", which is the normal case for most of
+         -- the estate. Taking EXCLUDED unconditionally would erase a counter's last known
+         -- good/broken verdict on any tick that omitted the block, so the alert would flap.
+         smartcard_stack_ok = COALESCE(EXCLUDED.smartcard_stack_ok, device_state.smartcard_stack_ok)`,
       [
         deviceId,
         s.status,
@@ -261,6 +266,9 @@ function makePgStore(poolOrConfig) {
         s.last_seen_at || null,
         s.raw != null ? JSON.stringify(s.raw) : null,
         s.recent_logs != null ? JSON.stringify(s.recent_logs) : null,
+        // nz() would map 0 to null and silently turn "smartcard stack BROKEN" into "no
+        // opinion", which is the one value this column exists to report.
+        s.smartcard_stack_ok == null ? null : (s.smartcard_stack_ok ? 1 : 0),
       ]
     );
   }
