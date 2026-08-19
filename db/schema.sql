@@ -576,6 +576,28 @@ ALTER TABLE counters ADD COLUMN IF NOT EXISTS boot_applied_at timestamptz;
 -- this version at all.
 ALTER TABLE counters ADD COLUMN IF NOT EXISTS settings jsonb NOT NULL DEFAULT '{}'::jsonb;
 
+-- The smartcard fix stack on a counter Pi, as a single alertable number (1 = intact,
+-- 0 = broken). Added 2026-08-17 with the NHS smartcard fix.
+--
+-- WHY A COLUMN AND NOT JUST raw->'smartcard_stack': alert_rules can only read device_state
+-- COLUMNS (see alertMetricColumn in store.pg.js), and this is the one thin-client fact whose
+-- silent regression closes a pharmacy counter. The fix is a shim library plus one exported
+-- environment variable on the kiosk process; an apt upgrade, an edited launcher or a rebuilt
+-- image removes it with no error anywhere — pcscd still runs, the reader is still detected,
+-- the session still connects, and the failure only surfaces as a pharmacist unable to log in.
+-- A boolean would have been the natural type, but every other alertable health value here is
+-- numeric and evaluateAlert() compares numerically, so 1/0 keeps rules writable as
+-- `smartcard_stack_ok < 1`.
+--
+-- NULL means "not applicable / not known" (a counter with no smartcard redirection, or an
+-- agent too old to report it) and must NEVER read as a fault: evaluateAlert() returns false
+-- on a null value, which is the behaviour we want.
+ALTER TABLE device_state ADD COLUMN IF NOT EXISTS smartcard_stack_ok int;
+-- NOTE ON ORDER: this ALTER must stay ABOVE counters_v, which selects the column below.
+-- schema.sql is applied top-to-bottom in one pass, so a column added after the view that
+-- reads it fails the whole migration with "column ds.smartcard_stack_ok does not exist" —
+-- and on this deployment that means the ingest crash-loops on a fresh container.
+
 CREATE OR REPLACE VIEW counters_v AS
 SELECT c.id, c.pharmacy_id,
        p.code AS pharmacy_code, p.name AS pharmacy_name, p.idx AS pharmacy_idx, p.vlan,
@@ -824,23 +846,6 @@ SELECT v.*,
 -- Recent device log lines (agent-collected, fetch-noise stripped) for the device view.
 ALTER TABLE device_state ADD COLUMN IF NOT EXISTS recent_logs jsonb;
 
--- The smartcard fix stack on a counter Pi, as a single alertable number (1 = intact,
--- 0 = broken). Added 2026-08-17 with the NHS smartcard fix.
---
--- WHY A COLUMN AND NOT JUST raw->'smartcard_stack': alert_rules can only read device_state
--- COLUMNS (see alertMetricColumn in store.pg.js), and this is the one thin-client fact whose
--- silent regression closes a pharmacy counter. The fix is a shim library plus one exported
--- environment variable on the kiosk process; an apt upgrade, an edited launcher or a rebuilt
--- image removes it with no error anywhere — pcscd still runs, the reader is still detected,
--- the session still connects, and the failure only surfaces as a pharmacist unable to log in.
--- A boolean would have been the natural type, but every other alertable health value here is
--- numeric and evaluateAlert() compares numerically, so 1/0 keeps rules writable as
--- `smartcard_stack_ok < 1`.
---
--- NULL means "not applicable / not known" (a counter with no smartcard redirection, or an
--- agent too old to report it) and must NEVER read as a fault: evaluateAlert() returns false
--- on a null value, which is the behaviour we want.
-ALTER TABLE device_state ADD COLUMN IF NOT EXISTS smartcard_stack_ok int;
 
 -- Per-device log HISTORY (agent-collected, fetch-noise stripped). 30-day retention (worker
 -- prune). The agent re-sends its recent window each slow tick, so the PK dedups overlap;
