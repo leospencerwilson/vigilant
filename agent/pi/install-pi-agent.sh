@@ -12,7 +12,7 @@
 # went dark" rather than as a configuration error. Take it from the Install Desktop page.
 set -euo pipefail
 
-URL=""; TOKEN=""; SERIAL=""; PRINTERS=""; INTERVAL="60"
+URL=""; TOKEN=""; SERIAL=""; PRINTERS=""; INTERVAL="60"; TOOLBOX_SECRET=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --url) URL="$2"; shift 2;;
@@ -23,6 +23,10 @@ while [ $# -gt 0 ]; do
     --serial) SERIAL="$2"; shift 2;;
     --printers) PRINTERS="$2"; shift 2;;
     --interval) INTERVAL="$2"; shift 2;;
+    # Estate toolbox secret, as a FILE for the same reason as --token-file: an argument is
+    # visible in `ps` to every local user while the install runs. Optional — without it the
+    # support menu installs and runs, but every PIN-gated action refuses.
+    --toolbox-secret-file) TOOLBOX_SECRET="$(cat "$2")"; shift 2;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -55,6 +59,56 @@ fi
 
 echo "→ agent"
 install -m 0755 -o root -g root vigilant-pi-agent.py /usr/local/sbin/vigilant-pi-agent
+
+# ── on-console support toolbox ───────────────────────────────────────────────
+# Retrofits an already-deployed counter without a reimage. Modes are the security model, not
+# housekeeping: the TUI runs unprivileged as westerncomms on tty1 and can only NAME a verb in
+# the root-only helper, because tty1 autologins that user and any escape from a menu there is
+# a root shell at a pharmacy counter.
+if [ -f wcn-toolbox ] && [ -f wcn-toolbox-priv ]; then
+  echo "→ support toolbox"
+  install -m 0755 -o root -g root wcn-toolbox      /usr/local/bin/wcn-toolbox
+  install -m 0700 -o root -g root wcn-toolbox-priv /usr/local/sbin/wcn-toolbox-priv
+  [ -f wcn-logo.ansi ] && install -D -m 0644 wcn-logo.ansi /usr/local/share/wcn/logo.ansi
+
+  install -d -m 0755 /etc/wcn
+  # Only if absent: re-running the installer must not stamp on a counter whose countdown was
+  # tuned on purpose.
+  [ -f /etc/wcn/boot-wait ] || { echo 4 > /etc/wcn/boot-wait; chmod 0644 /etc/wcn/boot-wait; }
+
+  if [ -n "$TOOLBOX_SECRET" ]; then
+    ( umask 077; printf '%s' "$TOOLBOX_SECRET" > /etc/wcn/toolbox.secret )
+    chown root:root /etc/wcn/toolbox.secret
+    echo "   PIN secret installed"
+  elif [ -s /etc/wcn/toolbox.secret ]; then
+    echo "   PIN secret already present, left alone"
+  else
+    echo "   WARNING: no toolbox secret — every PIN-gated menu action will refuse." >&2
+    echo "            Re-run with --toolbox-secret-file to fix." >&2
+  fi
+
+  # Boot into the toolbox. `exec` is required: as a child of the login shell, whiptail is not
+  # in the foreground process group, takes SIGTTOU and freezes to a black screen. The trailing
+  # startx is a fail-open so a broken toolbox cannot cost a counter its session.
+  HOME_DIR="$(getent passwd westerncomms | cut -d: -f6)"
+  if [ -n "$HOME_DIR" ] && [ -d "$HOME_DIR" ]; then
+    if ! grep -q 'wcn-toolbox --boot' "$HOME_DIR/.bash_profile" 2>/dev/null; then
+      [ -f "$HOME_DIR/.bash_profile" ] && cp "$HOME_DIR/.bash_profile" "$HOME_DIR/.bash_profile.bak-pretoolbox"
+      cat > "$HOME_DIR/.bash_profile" <<'PROFILE'
+# Physical console only; SSH logins (any other tty) are unaffected.
+if [ "$(tty)" = "/dev/tty1" ] && [ -z "${DISPLAY:-}" ]; then
+    exec /usr/local/bin/wcn-toolbox --boot
+    exec startx
+fi
+PROFILE
+      chown westerncomms:westerncomms "$HOME_DIR/.bash_profile"
+      chmod 0644 "$HOME_DIR/.bash_profile"
+      echo "   console boot flow installed"
+    else
+      echo "   console boot flow already present"
+    fi
+  fi
+fi
 
 echo "→ config"
 install -d -m 0750 /etc/vigilant

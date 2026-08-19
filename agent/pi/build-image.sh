@@ -18,7 +18,7 @@ BASE_IMG="${1:-}"
 VIGILANT_URL="${2:-}"
 BOOTSTRAP_TOKEN="${3:-}"
 if [ -z "$BASE_IMG" ] || [ -z "$VIGILANT_URL" ] || [ -z "$BOOTSTRAP_TOKEN" ]; then
-  echo "usage: build-image.sh RASPIOS_LITE.img VIGILANT_URL BOOTSTRAP_TOKEN [authorized_keys]" >&2
+  echo "usage: build-image.sh RASPIOS_LITE.img VIGILANT_URL BOOTSTRAP_TOKEN [authorized_keys] [toolbox_secret_file]" >&2
   echo "  BOOTSTRAP_TOKEN is the SELF_ENROL_TOKEN from Vigilant's .env" >&2
   exit 2
 fi
@@ -30,6 +30,16 @@ fi
 # route, which meant every fix needed that person or someone physically on site. At 500
 # devices that is unsupportable. Put every on-call engineer's key in here.
 AUTH_KEYS="${4:-}"
+# Optional 5th argument: a file containing the ESTATE toolbox secret, baked in like the
+# bootstrap token above. Supplied rather than hardcoded for the same reason as the keys — it
+# must never be committed.
+#
+# It is deliberately estate-wide, NOT per-device, and that is safe because the PIN a person
+# types is HMAC-SHA256(this secret, that board's serial) truncated to six digits: every Pi
+# built from one image still has a DIFFERENT PIN, so a number read aloud at a counter opens
+# that counter and nothing else. Baking a per-device secret is impossible here anyway — one
+# image serves the whole fleet, which is the entire point of self-enrolment.
+TOOLBOX_SECRET_FILE="${5:-}"
 OUT="wcn-thin-client.img"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
@@ -49,6 +59,68 @@ mount "${LOOP}p1" "$MNT/boot/firmware" 2>/dev/null || mount "${LOOP}p1" "$MNT/bo
 # ── drop in the agent + kiosk ────────────────────────────────────────────────
 install -D -m 0755 "$HERE/vigilant-pi-agent.py" "$MNT/usr/local/sbin/vigilant-pi-agent"
 install -D -m 0755 "$HERE/../pi/wcn-kiosk"        "$MNT/usr/local/bin/wcn-kiosk"
+
+# ── the on-console support toolbox ("BIOS" for a thin client) ────────────────
+# Without this a rebuilt counter comes up with NO support menu, and the failure is invisible
+# until someone is standing at a dark counter during an outage — which is the exact scenario
+# the toolbox exists for. It was hand-installed on the pilot; that is why it is here now.
+#
+# The two halves have deliberately different modes, and this is the security model:
+#   wcn-toolbox      0755  runs UNPRIVILEGED as westerncomms on tty1, can act only by naming
+#                          a verb in the helper below. It must never be root: tty1 autologins
+#                          westerncomms and the chain is getty -> .bash_profile -> startx ->
+#                          wcn-kiosk, so an escape from a menu there is a root shell at a
+#                          pharmacy counter, one `cat` from the RDP creds and the wg key.
+#   wcn-toolbox-priv 0700  root-only. Holds every privileged verb, reads the PIN secret, and
+#                          never prints it.
+install -D -m 0755 "$HERE/wcn-toolbox"      "$MNT/usr/local/bin/wcn-toolbox"
+install -D -m 0700 "$HERE/wcn-toolbox-priv" "$MNT/usr/local/sbin/wcn-toolbox-priv"
+
+# Console splash. Optional by design — the toolbox tests [ -r "$LOGO" ] and simply omits it,
+# so a missing file costs branding, never a boot.
+if [ -r "$HERE/wcn-logo.ansi" ]; then
+  install -D -m 0644 "$HERE/wcn-logo.ansi" "$MNT/usr/local/share/wcn/logo.ansi"
+fi
+
+install -d -m 0755 "$MNT/etc/wcn"
+
+# The F4 window before the desktop starts. FOUR seconds, matching the pilot.
+#
+# ⚠️ The toolbox reads this as an unclamped integer and a bad value is not rejected: a stray
+# 600 held a counter on the splash for TEN MINUTES on every boot (2026-08-17) and nothing
+# reported it. Keep it small, and note the agent now reports it so the fleet view catches a
+# repeat.
+echo 4 > "$MNT/etc/wcn/boot-wait"
+chmod 0644 "$MNT/etc/wcn/boot-wait"
+
+if [ -n "$TOOLBOX_SECRET_FILE" ] && [ -r "$TOOLBOX_SECRET_FILE" ]; then
+  install -m 0600 -o root -g root "$TOOLBOX_SECRET_FILE" "$MNT/etc/wcn/toolbox.secret"
+  echo "  baked the toolbox PIN secret"
+else
+  # Fail LOUD but do not abort: an image without it still boots and still runs the kiosk, and
+  # a pharmacy counter that works is worth more than one that refuses to build. But every
+  # PIN-gated action is unreachable, so this must not pass unnoticed.
+  echo "  WARNING: no toolbox secret supplied — the support menu will refuse every PIN action" >&2
+  echo "           on every Pi from this image. Pass the secret file as the 5th argument." >&2
+fi
+
+# Boot into the toolbox, which shows the F4 window and then starts the desktop itself.
+#
+# `exec` (not a child) is REQUIRED, not stylistic: as a child of the interactive login shell
+# the whiptail menu is not in the terminal's foreground process group, takes a SIGTTOU and
+# freezes to a black screen. Owning the tty1 session is what keeps the menu in the foreground.
+# The bare `startx` after it is a hard fail-open — reached only if the toolbox binary is
+# missing or unrunnable, so a broken toolbox can never cost a pharmacy its counter.
+install -d -m 0755 -o 1000 -g 1000 "$MNT/home/westerncomms"
+cat > "$MNT/home/westerncomms/.bash_profile" <<'PROFILE'
+# Physical console only; SSH logins (any other tty) are unaffected.
+if [ "$(tty)" = "/dev/tty1" ] && [ -z "${DISPLAY:-}" ]; then
+    exec /usr/local/bin/wcn-toolbox --boot
+    exec startx
+fi
+PROFILE
+chmod 0644 "$MNT/home/westerncomms/.bash_profile"
+chown 1000:1000 "$MNT/home/westerncomms/.bash_profile"
 
 # ── bootstrap config: URL + shared token, NO per-device token yet ────────────
 # The agent finds no VIGILANT_TOKEN on first boot, so it self-enrols with the bootstrap
