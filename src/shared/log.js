@@ -28,10 +28,21 @@ function redact(value, seen) {
   return out;
 }
 
+// The three fields every log line is grepped and filtered by. A meta key of the same name
+// used to overwrite them via Object.assign, which is not a cosmetic bug: `log.error(m, {msg})`
+// silently DISCARDED m and emitted only the meta value. On 2026-08-19 that turned
+// "ingest: unhandledRejection (kept alive)" into a bare postgres error string, hiding which
+// guard had fired and costing real time on a live investigation. A colliding key is now kept
+// under a meta_ prefix so nothing is lost and the caller's message always wins.
+const RESERVED = ["ts", "level", "msg"];
+
 function emit(stream, level, msg, meta) {
   const line = { ts: new Date().toISOString(), level, msg: String(msg) };
   if (meta && typeof meta === "object") {
-    Object.assign(line, redact(meta, new WeakSet()));
+    const safe = redact(meta, new WeakSet());
+    for (const k of Object.keys(safe)) {
+      line[RESERVED.indexOf(k) === -1 ? k : "meta_" + k] = safe[k];
+    }
   }
   let serialised;
   try {
