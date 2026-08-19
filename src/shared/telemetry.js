@@ -336,6 +336,11 @@ function normalize(raw) {
     wifi_clients: normalizeWifiClients(p.wifi_clients),
     // The field whose absence from this list disabled log collection entirely.
     logs: normalizeLogs(p.logs),
+    // Counter-Pi NHS smartcard fix stack. THIS LIST IS AN ALLOWLIST: a field the agent sends
+    // that is not named here is silently dropped, so the handler saw undefined and wrote null
+    // on every tick — the alert added with it could never fire, and the UI could never show a
+    // broken shim. Same trap as the logs line above, hit a second time.
+    smartcard_stack: normalizeSmartcardStack(p.smartcard_stack),
     // CHUNKED TELEMETRY: did the raw payload carry a system/core block? When false this is a
     // detail-only chunk and the handler must NOT overwrite device_state with nulls — it only
     // bumps last_seen_at. Computed from raw-key presence (see hasCoreFields), NOT from the
@@ -345,6 +350,27 @@ function normalize(raw) {
   };
 
   return out;
+}
+
+// Counter-Pi smartcard fix stack: the shim, its hash, whether the kiosk actually exports it,
+// the FreeRDP version and the /smartcard flag. Only `ok` drives the alert (flattened to 1/0 in
+// device_state); the rest is diagnostic and is what the thin-client modal shows an engineer.
+//
+// Returns null when the agent said nothing — NOT a false `ok`. Most counters have no smartcard
+// reader and every agent predating this reports nothing at all, so a default of false would
+// light the whole fleet red and get the alert switched off within the hour.
+function normalizeSmartcardStack(sc) {
+  if (!sc || typeof sc !== "object" || Array.isArray(sc)) return null;
+  const ok = parseBool(sc.ok);
+  return {
+    ok: typeof ok === "boolean" ? ok : null,
+    shim_present: parseBool(sc.shim_present) === true,
+    shim_active: parseBool(sc.shim_active) === true,
+    shim_sha256: str(sc.shim_sha256),
+    shim_bytes: transform.parseNum(sc.shim_bytes),
+    freerdp_version: str(sc.freerdp_version),
+    smartcard_flag: parseBool(sc.smartcard_flag) === true,
+  };
 }
 
 // Agent log lines: [{ time, topics, message }, …] — exactly the shape device_logs stores and
