@@ -2974,6 +2974,10 @@ function alertMetricColumn(metric) {
     'write_sect_total',
     'netwatch_down',
     'uptime_s',
+    // Counter-Pi smartcard fix stack: 1 = intact, 0 = broken, null = not applicable.
+    // Write rules as `smartcard_stack_ok < 1` (comparator '<', threshold 1) — nulls are
+    // ignored by evaluateAlert(), so counters without smartcards never fire.
+    'smartcard_stack_ok',
   ]);
   return allowed.has(metric) ? metric : null;
 }

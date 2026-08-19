@@ -669,7 +669,14 @@ SELECT c.id, c.pharmacy_id,
        (ds.raw ->> 'rootfs_readonly')::boolean                         AS pi_rootfs_ro,
        ds.raw -> 'failed_units'                                        AS pi_failed_units,
        ds.raw -> 'storage'                                             AS pi_storage,
-       ds.raw -> 'wifi_link'                                           AS pi_wifi_link
+       ds.raw -> 'wifi_link'                                           AS pi_wifi_link,
+       -- The smartcard fix stack (2026-08-17). Appended at the END of the select list because
+       -- CREATE OR REPLACE VIEW can only add columns, never insert mid-list — the same
+       -- constraint noted three times above. The roll-up is also carried as a real column
+       -- (device_state.smartcard_stack_ok) so alert_rules can read it; this jsonb is for the
+       -- UI, which needs to say WHICH part broke, not merely that something did.
+       ds.raw -> 'smartcard_stack'                                     AS pi_smartcard_stack,
+       ds.smartcard_stack_ok                                           AS pi_smartcard_ok
   FROM counters c
   JOIN pharmacies p   ON p.id = c.pharmacy_id
   LEFT JOIN devices d ON d.id = c.pi_device_id
@@ -816,6 +823,24 @@ SELECT v.*,
 
 -- Recent device log lines (agent-collected, fetch-noise stripped) for the device view.
 ALTER TABLE device_state ADD COLUMN IF NOT EXISTS recent_logs jsonb;
+
+-- The smartcard fix stack on a counter Pi, as a single alertable number (1 = intact,
+-- 0 = broken). Added 2026-08-17 with the NHS smartcard fix.
+--
+-- WHY A COLUMN AND NOT JUST raw->'smartcard_stack': alert_rules can only read device_state
+-- COLUMNS (see alertMetricColumn in store.pg.js), and this is the one thin-client fact whose
+-- silent regression closes a pharmacy counter. The fix is a shim library plus one exported
+-- environment variable on the kiosk process; an apt upgrade, an edited launcher or a rebuilt
+-- image removes it with no error anywhere — pcscd still runs, the reader is still detected,
+-- the session still connects, and the failure only surfaces as a pharmacist unable to log in.
+-- A boolean would have been the natural type, but every other alertable health value here is
+-- numeric and evaluateAlert() compares numerically, so 1/0 keeps rules writable as
+-- `smartcard_stack_ok < 1`.
+--
+-- NULL means "not applicable / not known" (a counter with no smartcard redirection, or an
+-- agent too old to report it) and must NEVER read as a fault: evaluateAlert() returns false
+-- on a null value, which is the behaviour we want.
+ALTER TABLE device_state ADD COLUMN IF NOT EXISTS smartcard_stack_ok int;
 
 -- Per-device log HISTORY (agent-collected, fetch-noise stripped). 30-day retention (worker
 -- prune). The agent re-sends its recent window each slow tick, so the PK dedups overlap;

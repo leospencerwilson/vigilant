@@ -355,6 +355,14 @@ async function telemetryIngest(ctx) {
       // latest-snapshot column — an agent bug that shipped thousands of lines would otherwise
       // bloat one row on every tick, forever.
       recent_logs: Array.isArray(payload.logs) ? payload.logs.slice(-200) : null,
+      // Smartcard fix stack roll-up, flattened to 1/0 so an alert rule can read it (rules can
+      // only see device_state COLUMNS, never raw). Deliberately null — not 0 — when the agent
+      // does not report it, so an older agent or a counter that was never set up for
+      // smartcards cannot raise a permanent false alarm: evaluateAlert() ignores nulls.
+      smartcard_stack_ok:
+        payload.smartcard_stack && typeof payload.smartcard_stack.ok === 'boolean'
+          ? (payload.smartcard_stack.ok ? 1 : 0)
+          : null,
       last_seen_at: ts,
       raw,
     };

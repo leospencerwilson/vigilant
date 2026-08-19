@@ -616,6 +616,196 @@ def peripherals(rdp_argv=""):
     return out
 
 
+# ── the smartcard fix stack ─────────────────────────────────────────────────
+# NHS smartcard login over RDP redirection needs FOUR faults fixed at once (2026-08-17).
+# Two of them live on this Pi, and BOTH are invisible to every other check we have:
+#
+#   1. FreeRDP negotiates SCARD_PROTOCOL_RAW on a card that is T=1 only, pinning it in RAW
+#      so every later connect dies with SCARD_E_PROTO_MISMATCH — the PIN never verifies.
+#   2. FreeRDP re-copies the RDP server's dwCurrentState verbatim on every 100ms poll of
+#      SCardGetStatusChange, INCLUDING SCARD_STATE_CHANGED. PC/SC requires that bit to be
+#      cleared before re-arming, so pcsc-lite reports "changed" instantly, the wait never
+#      blocks, and card INSERTIONS are never reported to Windows at all.
+#
+# Both are worked around by a forwarding libpcsclite.so.1 shim that FreeRDP loads instead of
+# the system library. FreeRDP dlopen()s that soname BY NAME, so LD_PRELOAD cannot reach it —
+# the only lever is LD_LIBRARY_PATH on the kiosk process, set by wcn-kiosk.
+#
+# WHY THIS IS MONITORED AT ALL: the shim is a file plus one exported environment variable.
+# An apt upgrade that reinstalls libpcsclite, an edit to wcn-kiosk, a rebuilt image that
+# skips the build step, or a rollback to stock FreeRDP each silently removes it — and the
+# symptom is not an error anywhere. It is "the counter cannot log in", discovered by a
+# pharmacist at 09:00. Nothing else in this agent would notice: pcscd still runs, the reader
+# is still detected, the kiosk still connects. So the stack reports itself explicitly.
+SHIM_LIB = "/usr/local/lib/wcn-pcsc/libpcsclite.so.1"
+SHIM_DIR = "/usr/local/lib/wcn-pcsc"
+
+
+def _kiosk_has_shim_env():
+    """Whether the RUNNING kiosk process actually has the shim on its library path.
+
+    Checked against /proc rather than by grepping wcn-kiosk, because the two can disagree in
+    the way that matters: the launcher is a long-running bash loop that reads its own file
+    lazily, so an edited script does NOT affect the live session until the kiosk restarts.
+    A file that says the fix is present while the process running the pharmacy counter does
+    not have it is exactly the state this check exists to catch.
+    """
+    for proc in ("xfreerdp3", "xfreerdp"):
+        for pid in run(["pgrep", "-x", proc]).split():
+            try:
+                with open("/proc/%s/environ" % pid, "rb") as fh:
+                    env = fh.read().decode("utf-8", "replace")
+            except Exception:
+                continue
+            for kv in env.split("\0"):
+                if kv.startswith("LD_LIBRARY_PATH="):
+                    return SHIM_DIR in kv.split("=", 1)[1].split(":")
+            return False          # process found, no LD_LIBRARY_PATH at all
+    return None                    # no kiosk running: unknowable, not false
+
+
+def smartcard_stack():
+    """Is the smartcard fix stack intact on this Pi?
+
+    Returns None on a device with no reader configured for redirection, so counters that
+    were never meant to do smartcards do not report a permanent fault.
+
+    `ok` is the single roll-up the alert rule reads. It is deliberately conservative: unknown
+    counts as NOT ok for the file/env facts (a missing shim is a real outage) but the FreeRDP
+    version is reported without gating `ok`, because a future release that fixes the upstream
+    bug should not page anyone at 3am — the shim is harmless once redundant.
+    """
+    if not os.path.exists("/var/lib/wcn/kiosk.conf") and not os.path.exists(SHIM_LIB):
+        return None
+
+    out = {}
+
+    # The shim itself. sha256 so a corrupted or half-written .so is distinguishable from a
+    # correct one — "the file exists" is not the same as "the file is the fix".
+    out["shim_present"] = os.path.exists(SHIM_LIB)
+    if out["shim_present"]:
+        try:
+            import hashlib          # imported locally, as elsewhere in this file
+            h = hashlib.sha256()
+            with open(SHIM_LIB, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    h.update(chunk)
+            out["shim_sha256"] = h.hexdigest()
+            out["shim_bytes"] = os.path.getsize(SHIM_LIB)
+        except Exception:
+            out["shim_sha256"] = None
+
+    # Wired into the LIVE session, not merely into the script (see _kiosk_has_shim_env).
+    out["shim_active"] = _kiosk_has_shim_env()
+
+    # FreeRDP version. Stock Debian 13 ships 3.15.0, which additionally suffers a
+    # SCARD_E_CANCELLED storm; the fix stack was validated on 3.30.0 from trixie-backports.
+    ver = run(["xfreerdp3", "--version"]) or run(["xfreerdp", "--version"])
+    m = re.search(r"version\s+(\d+\.\d+\.\d+)", ver)
+    out["freerdp_version"] = m.group(1) if m else None
+
+    # The kiosk must be ASKING for redirection; without /smartcard the rest is moot.
+    out["smartcard_flag"] = None
+    try:
+        with open("/var/lib/wcn/kiosk.conf") as fh:
+            for line in fh:
+                if line.startswith("RDP_SMARTCARD="):
+                    out["smartcard_flag"] = line.strip().split("=", 1)[1] == "1"
+    except Exception:
+        pass
+
+    # Roll-up. Only the two Pi-side fixes are judged here — the VM-side registry settings
+    # (EnablePinPad, UseCardReaderPolling) are not visible from this device and are not
+    # currently monitored anywhere. Recorded as a known gap rather than silently implied.
+    out["ok"] = bool(out.get("shim_present")) and out.get("shim_active") is not False
+    return out
+
+
+# ── the on-console support menu (F4 "boot menu") ────────────────────────────
+# What an engineer standing at a counter depends on, and what today has no remote visibility
+# at all. Three separate failures, none of which anything else would notice:
+#
+#   * no secret provisioned  -> NOBODY can get into the support menu on that counter, ever.
+#     Discovered only when someone is already on site and stuck.
+#   * locked out             -> five wrong PINs locks it for 15 minutes, and the lock is on
+#     DISK so a reboot does not clear it. Without this an engineer sits there re-entering a
+#     PIN that cannot work yet, with no way to know why.
+#   * boot wait misconfigured -> /etc/wcn/boot-wait is an unclamped integer. A stray value
+#     held a counter on the splash for TEN MINUTES per boot on 2026-08-17 before anyone
+#     noticed, because nothing reported it.
+#
+# The derived PIN IS reported, deliberately. It gates the on-console menu's device settings
+# (static IP and similar), not access to data or the tunnel — an engineer standing at a counter
+# needs it, and making them phone someone to get in is a worse outcome than it appearing in an
+# authenticated operator UI. Estate owner's call, 2026-08-17.
+#
+# ⚠️ The SECRET is never reported, and must not be. The PIN is HMAC-SHA256(secret, board serial)
+# truncated to six digits, so it is per-device: one PIN read aloud at a counter opens THAT
+# counter and nothing else. Sending the secret would collapse that into an estate-wide key and
+# make every future PIN forgeable, so only the derived value travels.
+TOOLBOX_SECRET = "/etc/wcn/toolbox.secret"
+TOOLBOX_LOCK = "/var/lib/wcn/toolbox.lock"
+BOOT_WAIT_FILE = "/etc/wcn/boot-wait"
+
+
+def toolbox():
+    """Support-menu readiness. Never returns key material — see the block above."""
+    out = {}
+
+    # Provisioned at all? Size only, never contents: a zero-byte secret is a real and
+    # otherwise-silent failure mode (the helper fails closed, so it looks like a wrong PIN).
+    secret = None
+    try:
+        with open(TOOLBOX_SECRET, "rb") as fh:
+            secret = fh.read().strip()
+        out["secret_provisioned"] = bool(secret)
+    except Exception:
+        out["secret_provisioned"] = False
+
+    # Derived exactly as the privileged helper does it, so the two can never disagree — a PIN
+    # shown in the UI that the device rejects is worse than showing nothing. Any change to
+    # wcn-toolbox-priv's derivation MUST be mirrored here.
+    if secret:
+        try:
+            import hashlib
+            import hmac as _hmac
+            serial = ""
+            with open("/proc/cpuinfo") as fh:
+                for line in fh:
+                    if line.startswith("Serial"):
+                        serial = line.split(":", 1)[1].strip()
+                        break
+            digest = _hmac.new(secret, serial.encode(), hashlib.sha256).digest()
+            out["pin"] = "%06d" % (int.from_bytes(digest[:4], "big") % 1000000)
+        except Exception:
+            out["pin"] = None
+
+    # Lockout state, from the same file the privileged helper writes.
+    out["locked"] = False
+    try:
+        with open(TOOLBOX_LOCK) as fh:
+            state = json.load(fh)
+        until = int(state.get("until") or 0)
+        remaining = until - int(time.time())
+        out["failed_attempts"] = int(state.get("fails") or 0)
+        if remaining > 0:
+            out["locked"] = True
+            out["locked_for_s"] = remaining
+    except Exception:
+        pass
+
+    # The splash countdown. Reported so a misconfigured value is visible from the fleet view
+    # rather than only to whoever is standing in front of the counter.
+    try:
+        with open(BOOT_WAIT_FILE) as fh:
+            raw_wait = fh.read().strip()
+        out["boot_wait_s"] = int(raw_wait) if raw_wait.isdigit() else None
+    except Exception:
+        out["boot_wait_s"] = None      # absent file = the toolbox default (5s)
+
+    return out
+
+
 def wg_state():
     """This Pi's own view of its tunnel. The hub's view is collected separately — when the
     two disagree, that difference is itself the diagnosis."""
@@ -1571,6 +1761,16 @@ def build_payload(conf):
         "support_vnc": support_vnc_status(),
         # Detected, not asserted: proves presence, never that a peripheral works end to end.
         "peripherals": peripherals(rdp.get("redirect") or ""),
+        # The smartcard FIX STACK, as opposed to `peripherals.smartcard_*` which reports what
+        # is plugged in. Separate key because the two answer different questions and fail
+        # independently: a counter can have a perfectly detected reader and still be unable to
+        # log in because the libpcsclite shim went missing on an apt upgrade. See the block
+        # above smartcard_stack() for why a silent regression here costs a pharmacy its morning.
+        "smartcard_stack": smartcard_stack(),
+        # On-console support menu: the per-device PIN an engineer needs at the counter, whether
+        # the menu is locked out, and whether the splash countdown is sane. Carries the derived
+        # PIN but never the estate secret it comes from.
+        "toolbox": toolbox(),
         # Counter-Pi specifics a router agent would have no reason to gather.
         "load": loadavg(),
         "storage": storage(),
