@@ -1578,11 +1578,39 @@ def _log_line(source, text):
     return {"time": "", "topics": source, "message": REDACT.sub(r"\1<redacted>", text)[:400]}
 
 
-def collect_logs(limit=60):
+# Keys of log lines already accepted by the server, so the same tail is not re-sent forever.
+#
+# MEASURED 2026-08-19: re-sending the same lines every tick made every telemetry POST carrying
+# `logs` hang for >20s, while the byte-identical POST without them answered in 0.2s. The insert
+# is one multi-row statement, so the time was spent CONTENDING on the (device_id, log_time,
+# message) primary key — whose entries are whole log lines — not doing work. Because every tick
+# ships logs, the counter stopped reporting at all and went stale: a dead-looking pharmacy
+# counter caused entirely by a log write.
+#
+# Bounded so a long-running agent cannot grow this without limit; the server still dedupes, so
+# a line dropped here is only ever a duplicate we chose not to re-send.
+_SENT_LOG_KEYS = set()
+_SENT_LOG_CAP = 2000
+
+
+def mark_logs_sent(logs):
+    """Called only after the server has ACCEPTED the batch. On a failed POST nothing is marked,
+    so the lines are retried on the next tick — the self-healing property is preserved."""
+    for l in logs or []:
+        _SENT_LOG_KEYS.add((str(l.get("time", "")), str(l.get("message", ""))))
+    if len(_SENT_LOG_KEYS) > _SENT_LOG_CAP:
+        # Cheap bound: drop the oldest half. Re-sending a few duplicates later is harmless
+        # (the server dedupes); an unbounded set on a 1 GB device is not.
+        for k in list(_SENT_LOG_KEYS)[: _SENT_LOG_CAP // 2]:
+            _SENT_LOG_KEYS.discard(k)
+
+
+def collect_logs(limit=25):
     """Recent interesting lines from the kiosk log and the two units we own.
 
-    Vigilant dedupes on (time, message), so re-sending the same tail every tick is cheap and
-    self-healing — a line lost to a failed POST arrives on the next one.
+    Only lines not already accepted by the server are returned, and the batch is bounded. Both
+    matter: re-sending the same tail every tick is what stalled the ingest (see the comment on
+    _SENT_LOG_KEYS), and an unbounded batch is what made the stall permanent rather than brief.
     """
     out = []
     try:
@@ -1615,8 +1643,16 @@ def collect_logs(limit=60):
             if line and LOG_KEEP.search(line):
                 out.append(_log_line(unit, line))
 
-    # Newest last, and stay inside the server's 100-row cap with headroom.
-    return out[-limit:]
+    # Drop anything the server has already accepted. This is the fix for the stall described
+    # on _SENT_LOG_KEYS: without it the same tail is re-sent every tick forever, and those
+    # repeated rows are what the ingest contends on.
+    fresh = [l for l in out
+             if (str(l.get("time", "")), str(l.get("message", ""))) not in _SENT_LOG_KEYS]
+
+    # Newest last, and well inside the server's 100-row cap. The bound is the second half of
+    # the fix: a burst (a boot, a crash loop) must not produce a batch big enough to stall the
+    # request that carries this device's liveness.
+    return fresh[-limit:]
 
 
 # ── agent self-update ───────────────────────────────────────────────────────
@@ -1643,6 +1679,10 @@ def collect_logs(limit=60):
 AGENT_PATH = "/usr/local/sbin/vigilant-pi-agent"
 REVERT_UNIT = "vigilant-agent-revert"
 REVERT_AFTER_S = 600
+
+# Fastest cadence the agent will accept from the server. Matches config.fastPollS so the
+# fast-poll window works; anything lower is refused as a misconfiguration.
+MIN_POLL_S = 3
 
 
 def _sha256_file(path):
@@ -3191,8 +3231,13 @@ def tick(conf, do_printers):
     # mode is not "the motd is short" but "json.loads fails and the boot target, the settings, the
     # action and the relay session are ALL silently lost". 64 KB is a bounded read, so the memory
     # protection that limit= exists for still holds on a 1 GB device.
-    status, body = post(url, token, "/telemetry", build_payload(conf), limit=64000)
+    payload = build_payload(conf)
+    status, body = post(url, token, "/telemetry", payload, limit=64000)
     print(f"telemetry {status} {body[:400]}", flush=True)
+    # Only once the server has ACCEPTED them: a failed POST marks nothing, so the lines are
+    # retried on the next tick and the self-healing behaviour is unchanged.
+    if status == 200 and payload.get("logs"):
+        mark_logs_sent(payload["logs"])
     # A successful report is the ONLY evidence a just-installed agent actually works.
     if status == 200:
         cancel_revert()
@@ -3252,9 +3297,14 @@ def tick(conf, do_printers):
     # server drive also means the interval can be retuned fleet-wide without touching a Pi.
     try:
         want = json.loads(body).get("poll_interval_s")
-        # Floor at 10s so a server-side misconfiguration cannot turn the fleet into a
-        # thundering herd, which is precisely how the router fleet saturated the ingest.
-        if isinstance(want, (int, float)) and want >= 10:
+        # Floor exists so a server-side misconfiguration cannot turn the fleet into a
+        # thundering herd — precisely how the router fleet saturated the ingest.
+        #
+        # It was 10, which silently broke the server's own fast-poll feature: config.fastPollS
+        # is 3, so every fast-poll directive was discarded and `poll_until` did nothing at all.
+        # 3 matches that constant, and the window is bounded server-side and opt-in per device,
+        # so the herd protection that mattered is still there.
+        if isinstance(want, (int, float)) and want >= MIN_POLL_S:
             return int(want)
     except Exception:
         pass

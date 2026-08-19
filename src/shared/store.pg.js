@@ -763,6 +763,22 @@ function makePgStore(poolOrConfig) {
     }
     if (!params.length) return;
     await tx(async (client) => {
+      // MEASURED 2026-08-19: a telemetry POST carrying `logs` hung for >20s while the
+      // byte-identical POST without it returned in 0.2s, reproducibly, alternating. Every
+      // tick ships logs, so the device stopped reporting entirely and went stale — the whole
+      // counter looked dead because of a log write.
+      //
+      // The insert itself is a single multi-row statement, so the time is spent WAITING, not
+      // working: contending on the (device_id, log_time, message) primary key, whose entries
+      // are whole log lines. Once one request stalls, the next tick re-sends the same lines
+      // and queues behind it, which is why it never recovers on its own.
+      //
+      // These are per-transaction and reset on commit. A log line is the least important
+      // thing this request carries: losing it is invisible, whereas blocking the transaction
+      // costs the device's boot target, its settings and its liveness. So bound the wait and
+      // let the rest of the tick through.
+      await client.query("SET LOCAL lock_timeout = '2s'");
+      await client.query("SET LOCAL statement_timeout = '5s'");
       await bulkInsert(
         client,
         `INSERT INTO device_logs (device_id, log_time, topics, message)`,

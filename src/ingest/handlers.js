@@ -390,7 +390,20 @@ async function telemetryIngest(ctx) {
   // Device log lines (agent already strips its own fetch noise). Append to 30-day history.
   if (payload.logs != null && typeof store.appendDeviceLogs === 'function') {
     log.info('telemetry: logs partial', { serial: device.serial, n: Array.isArray(payload.logs) ? payload.logs.length : 0 });
-    await store.appendDeviceLogs(device.id, payload.logs);
+    // Never let a log write decide whether this device gets a reply. MEASURED 2026-08-19: a
+    // POST carrying `logs` hung >20s while the identical POST without it answered in 0.2s,
+    // and because every tick ships logs the counter stopped reporting altogether and went
+    // stale. A device that looks dead because of a log insert is the worst trade this
+    // service makes: the reply carries the boot target, the settings and the liveness stamp,
+    // and a dropped log line is invisible by comparison.
+    //
+    // The store now bounds the statement itself (lock_timeout/statement_timeout); this catch
+    // is the second half of the same decision — if it fails anyway, log it and answer.
+    try {
+      await store.appendDeviceLogs(device.id, payload.logs);
+    } catch (e) {
+      log.warn('telemetry: log append failed, continuing', { serial: device.serial, err: String((e && e.message) || e) });
+    }
   }
 
   // Metrics history is a snapshot of the system block — only meaningful for a CORE chunk.
