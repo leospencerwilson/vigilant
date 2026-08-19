@@ -264,6 +264,146 @@ ln -sf /etc/systemd/system/vigilant-agent.service \
 # WireGuard key: a Pi generates its own key on first boot and reports its public key in
 # telemetry, so the hub side is provisioned at adoption. Wire that into first-boot here.
 
+# ── quiet boot (bake-time ONLY) ──────────────────────────────────────────────
+# The counter should come up like a commercial thin client — a black screen then the WCN splash
+# and progress bar the toolbox draws — not a wall of kernel and systemd text. That verbosity is
+# controlled by cmdline.txt, which is THE ONE FILE ON THE PI WITH NO REMOTE RECOVERY: a typo
+# means a device that will not boot, so no SSH, no agent, no tunnel, and a drive to a pharmacy
+# with an SD reader. So it is set here at bake time and NEVER pushed live (a live retrofit, if it
+# is ever done, has to carry its own write-validate-reboot-with-dead-man-revert — see the agent).
+#
+# We MODIFY the existing line in place, we never rewrite it: root=, rootfstype= and the partition
+# UUID the firmware hands the kernel are preserved byte-for-byte, and we only append the tokens
+# the line does not already carry. cmdline.txt must also stay a SINGLE line — a stray newline is
+# itself a non-boot — so it is read with the newline stripped and written back as one line.
+CMDLINE=""
+for c in "$MNT/boot/firmware/cmdline.txt" "$MNT/boot/cmdline.txt"; do
+  [ -f "$c" ] && { CMDLINE="$c"; break; }
+done
+if [ -n "$CMDLINE" ]; then
+  line="$(tr -d '\n' < "$CMDLINE")"
+  # Add the tokens the line does not already carry:
+  #   quiet loglevel=3            hush the kernel printk stream
+  #   logo.nologo                 drop the framebuffer raspberries
+  #   vt.global_cursor_default=0  no blinking cursor left on the console
+  #   consoleblank=0              never blank the counter's screen on a timer
+  #   systemd.show_status=false   hide the [ OK ] unit ladder
+  #   plymouth.enable=0           no Plymouth at all. On a Pi 3B the GPU is not up for ~12s, so
+  #                               Plymouth only ever showed a text-dot fallback or, with splash off,
+  #                               dumped the boot log. The WCN brand is carried by wcn-boot-logo and
+  #                               the toolbox instead. Proven on the pilot 2026-08-19.
+  for tok in quiet loglevel=3 logo.nologo vt.global_cursor_default=0 consoleblank=0 systemd.show_status=false plymouth.enable=0; do
+    case " $line " in *" $tok "*) ;; *) line="$line $tok" ;; esac
+  done
+  # REMOVE two tokens the stock image ships that fight a clean boot: console=tty1 dumps the kernel
+  # log onto the screen (serial console is kept), and splash asks the now-disabled Plymouth to draw.
+  # root=, its PARTUUID and rootfstype are never touched — only these two named tokens are dropped.
+  line=" $line "; line="${line// console=tty1 / }"; line="${line// splash / }"
+  line="$(printf '%s' "$line" | sed 's/^ *//; s/  */ /g; s/ *$//')"
+  printf '%s\n' "$line" > "$CMDLINE"
+  echo "cmdline.txt: quiet tokens + plymouth.enable=0 ensured; console=tty1 + splash removed (root=/PARTUUID untouched)"
+else
+  echo "WARNING: no cmdline.txt found in image — boot verbosity left as-is" >&2
+fi
+
+# Firmware rainbow splash off, so power-on is black, not a colour square.
+CONFIGTXT=""
+for c in "$MNT/boot/firmware/config.txt" "$MNT/boot/config.txt"; do
+  [ -f "$c" ] && { CONFIGTXT="$c"; break; }
+done
+if [ -n "$CONFIGTXT" ] && ! grep -qE '^disable_splash=1' "$CONFIGTXT"; then
+  printf 'disable_splash=1\n' >> "$CONFIGTXT"
+  echo "config.txt: disable_splash=1"
+fi
+
+# The last visible noise is agetty on tty1: without this it clears the (now quiet) console and
+# prints a login banner before autologin, undoing the hush a fraction before the toolbox paints.
+# --noclear leaves the screen alone, --noissue drops the banner (/etc/issue is blanked above too),
+# and the autologin user is westerncomms, whose .bash_profile execs the toolbox. The empty first
+# ExecStart= is REQUIRED: it clears the base unit's ExecStart so this fully-specified one wins,
+# regardless of what the stock image shipped.
+install -d "$MNT/etc/systemd/system/getty@tty1.service.d"
+cat > "$MNT/etc/systemd/system/getty@tty1.service.d/autologin.conf" <<'GETTY'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin westerncomms --noclear --noissue %I $TERM
+GETTY
+
+# ── clean, fast, branded boot (bake-time) ────────────────────────────────────
+# Turns the stock verbose boot into: black -> WCN mark on the console -> the toolbox loader -> the
+# VM, and cuts ~8s of pointless boot wait. Every line here was proven on the pilot Pi 3B 2026-08-19.
+
+# 1. Silence systemd's [ OK ] unit ladder at the source. The cmdline systemd.show_status=false is
+#    not honoured on its own once Plymouth is not covering the console; ShowStatus=no is.
+if [ -f "$MNT/etc/systemd/system.conf" ]; then
+  if grep -qE '^#?ShowStatus=' "$MNT/etc/systemd/system.conf"; then
+    sed -i 's/^#\?ShowStatus=.*/ShowStatus=no/' "$MNT/etc/systemd/system.conf"
+  else
+    printf 'ShowStatus=no\n' >> "$MNT/etc/systemd/system.conf"
+  fi
+fi
+
+# 2. Cut the two big boot-time waits. NetworkManager-wait-online blocks boot ~6s for no kiosk
+#    benefit (the agent handles connectivity); cloud-init sits in the critical chain ~10s and is
+#    first-boot provisioning this image does not use (NetworkManager owns the network, the agent
+#    self-enrols). Both are reversible on a device if ever needed.
+ln -sf /dev/null "$MNT/etc/systemd/system/NetworkManager-wait-online.service"
+touch "$MNT/etc/cloud/cloud-init.disabled" 2>/dev/null || true
+
+# 3. No login banner between the boot logo and the toolbox: keep motd empty and hush login for
+#    westerncomms (getty already runs --noissue above).
+: > "$MNT/etc/motd"
+touch "$MNT/home/westerncomms/.hushlogin"
+chown 1000:1000 "$MNT/home/westerncomms/.hushlogin"
+
+# 4. The early console brand: wcn-boot-logo paints the WCN mark to tty1 the moment there is a
+#    framebuffer, filling the black until the toolbox takes over with the SAME mark. Ordered early
+#    (sysinit) so it is not the ~15s-late thing multi-user ordering would make it.
+install -D -m 0755 "$HERE/wcn-boot-logo"         "$MNT/usr/local/bin/wcn-boot-logo"
+install -D -m 0644 "$HERE/wcn-boot-logo.service" "$MNT/etc/systemd/system/wcn-boot-logo.service"
+install -d "$MNT/etc/systemd/system/sysinit.target.wants"
+ln -sf /etc/systemd/system/wcn-boot-logo.service \
+   "$MNT/etc/systemd/system/sysinit.target.wants/wcn-boot-logo.service"
+
+# 5. The composed splash (black + centred mark) the X kiosk paints on its root while the VM
+#    connects — the same image at both stages. Optional: wcn-kiosk falls back to a black root.
+[ -r "$HERE/wcn-splash.png" ] && \
+  install -D -m 0644 "$HERE/wcn-splash.png" "$MNT/usr/local/share/wcn/splash.png"
+
+# The support banner the X kiosk launches: an always-on-top strip showing a message support pushes
+# from wc-field (the agent writes it to /var/lib/wcn/kiosk-message.txt). Needs python3-tk, present
+# in the base image.
+install -D -m 0755 "$HERE/wcn-banner" "$MNT/usr/local/bin/wcn-banner"
+
+# 6. feh paints that splash on the X root. The image is customised WITHOUT a chroot, so feh cannot
+#    be apt-installed here; a one-shot first-boot unit installs it once (online by then) and stands
+#    down. A missing feh is not an error — wcn-kiosk degrades to a solid black root.
+install -D -m 0755 /dev/stdin "$MNT/usr/local/sbin/wcn-firstboot" <<'FB'
+#!/bin/sh
+# First-boot package top-ups that cannot be baked without a chroot. Idempotent; only stands down
+# once the top-up actually succeeded, so a first boot with no network simply retries next boot.
+if [ ! -x /usr/bin/feh ]; then
+    apt-get update -qq && apt-get install -y -q feh
+fi
+[ -x /usr/bin/feh ] && systemctl disable wcn-firstboot.service 2>/dev/null || true
+FB
+cat > "$MNT/etc/systemd/system/wcn-firstboot.service" <<'UNIT'
+[Unit]
+Description=WCN first-boot package top-ups
+After=NetworkManager.service
+ConditionPathExists=!/usr/bin/feh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wcn-firstboot
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+ln -sf /etc/systemd/system/wcn-firstboot.service \
+   "$MNT/etc/systemd/system/multi-user.target.wants/wcn-firstboot.service"
+
 sync
 umount "$MNT/boot/firmware" 2>/dev/null || umount "$MNT/boot" 2>/dev/null || true
 umount "$MNT"

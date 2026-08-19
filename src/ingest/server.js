@@ -114,6 +114,15 @@ function authField(req, cfg) {
   return timingSafeEqual(tok, cfg.fieldEnrollToken);
 }
 
+// Auth for the PMR gateway agent: the master admin token OR the scoped GATEWAY_PULL_TOKEN.
+// Read-only manifest pull, so the gateway can carry the scoped key instead of the estate master.
+function authGateway(req, cfg) {
+  if (authAdmin(req, cfg)) return true;
+  const tok = bearer(req);
+  if (!tok || !cfg.gatewayPullToken) return false;
+  return timingSafeEqual(tok, cfg.gatewayPullToken);
+}
+
 // Field auth for the RELAY PROXY only, which is loaded by an <iframe> and by that page's own
 // subresources — neither can carry an Authorization header. RFC 6750 §2.3 defines exactly this
 // fallback, so the token may arrive as ?access_token=. Kept to this one route family: every
@@ -353,6 +362,18 @@ function createServer({ store, config: cfg }) {
         ctx.body = await readBody(req);
         return await handlers.pharmacyVmAttach(ctx);
       }
+      // Preview the dnsmasq drop-in a site's network settings produce (read-only).
+      const mPhGwCfg = /^\/pharmacies\/([^/]+)\/gateway-config$/.exec(pathname);
+      if (mPhGwCfg && method === 'GET') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPhGwCfg[1]) };
+        return await handlers.pharmacyGatewayConfig(ctx);
+      }
+      // The PMR gateway agent pulls every site's dnsmasq drop-in from here (scoped token).
+      if (method === 'GET' && pathname === '/gateway/dnsmasq') {
+        if (!authGateway(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return await handlers.gatewayDnsmasqManifest(ctx);
+      }
       // Zero-touch thin-client provisioning. Self-enrol is gated by the SHARED bootstrap
       // token (SELF_ENROL_TOKEN), not the estate master — a leak can only mint an unclaimed
       // device. Unclaimed-list and adopt are estate-admin.
@@ -363,6 +384,15 @@ function createServer({ store, config: cfg }) {
         if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = dev;
         return await handlers.piAgentScript(ctx);
+      }
+      // The on-console toolbox scripts, same device-token contract as pi-script above. Two fixed
+      // paths map to a route-chosen allowlist key; the caller never names a file.
+      if (method === 'GET' && (pathname === '/agent/pi-toolbox' || pathname === '/agent/pi-toolbox-priv')) {
+        const dev = await authDevice(req, store);
+        if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.device = dev;
+        const which = pathname === '/agent/pi-toolbox-priv' ? 'wcn-toolbox-priv' : 'wcn-toolbox';
+        return await handlers.piToolboxScript(ctx, which);
       }
       // POST /screen — thin client uploads its screen thumbnail (device token, not admin).
       if (method === 'POST' && pathname === '/screen') {

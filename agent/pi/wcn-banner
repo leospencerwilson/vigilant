@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+# WCN counter support banner.
+#
+# A severity-coloured strip pinned to the TOP of the screen — but ONLY while there is an active
+# message. With no message the strip is hidden and the RDP session fills the whole screen; when a
+# message arrives the strip appears and the session is shrunk to sit BELOW it, so the banner never
+# covers the pharmacy desktop. It is un-shrunk again the moment the message clears.
+#
+# The message is what support pushes from wc-field: the vigilant agent writes it to
+# /var/lib/wcn/kiosk-message.txt (one of the branding files it already syncs). FIRST line is the
+# severity (info | warning | alert), the REST is the message; anything else is shown whole at info
+# level. An empty or missing file hides the strip.
+#
+# The RDP window is resized live with xdotool + FreeRDP's /dynamic-resolution (wcn-kiosk launches
+# it full-screen and resizable). Staying above FreeRDP: override-redirect + -topmost, re-asserted
+# each tick.
+import subprocess
+import tkinter as tk
+
+MSG_PATH = "/var/lib/wcn/kiosk-message.txt"
+POLL_MS = 1000
+BAR_H = 44
+STYLE = {
+    "info":    ("#0b3d6b", "#eaf2ff", "ℹ"),   # ℹ
+    "warning": ("#9a6400", "#fff5e0", "⚠"),   # ⚠
+    "alert":   ("#8a0f0f", "#ffe6e6", "⛔"),   # ⛔
+}
+
+
+def read_message():
+    try:
+        with open(MSG_PATH, encoding="utf-8", errors="replace") as fh:
+            raw = fh.read().strip("\n")
+    except OSError:
+        return None, None
+    if not raw.strip():
+        return None, None
+    parts = raw.split("\n", 1)
+    head = parts[0].strip().lower()
+    if head in STYLE and len(parts) > 1 and parts[1].strip():
+        return head, " ".join(parts[1].split())
+    return "info", " ".join(raw.split())
+
+
+def rdp_window():
+    """The xfreerdp window id, or None if it hasn't mapped yet."""
+    try:
+        out = subprocess.run(["xdotool", "search", "--class", "xfreerdp"],
+                             capture_output=True, text=True, timeout=3).stdout.split()
+        return out[-1] if out else None
+    except Exception:
+        return None
+
+
+def place_rdp(win, x, y, w, h):
+    if not win:
+        return
+    for args in (["windowmove", win, str(x), str(y)], ["windowsize", win, str(w), str(h)]):
+        try:
+            subprocess.run(["xdotool", *args], timeout=3)
+        except Exception:
+            pass
+
+
+def main():
+    root = tk.Tk()
+    root.overrideredirect(True)
+    root.attributes("-topmost", True)
+    root.withdraw()
+    SW = root.winfo_screenwidth()
+    SH = root.winfo_screenheight()
+
+    label = tk.Label(root, text="", font=("DejaVu Sans", 16, "bold"), anchor="center")
+    label.pack(fill="both", expand=True)
+
+    # None = unknown (force a placement on the first decision either way).
+    shown = {"v": None}
+
+    def tick():
+        level, text = read_message()
+        win = rdp_window()
+        if text:
+            if shown["v"] is not True:
+                place_rdp(win, 0, BAR_H, SW, SH - BAR_H)   # make room: session sits below the bar
+                root.deiconify()
+                shown["v"] = True
+            bg, fg, icon = STYLE.get(level, STYLE["info"])
+            label.config(text=f"   {icon}   {text}", bg=bg, fg=fg)
+            root.configure(bg=bg)
+            root.geometry(f"{SW}x{BAR_H}+0+0")
+            root.lift()
+            root.attributes("-topmost", True)
+        else:
+            if shown["v"] is not False:
+                root.withdraw()
+                place_rdp(win, 0, 0, SW, SH)               # no banner: session fills the screen
+                shown["v"] = False
+        root.after(POLL_MS, tick)
+
+    tick()
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

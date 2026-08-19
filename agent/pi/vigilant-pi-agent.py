@@ -1724,6 +1724,55 @@ def cancel_revert():
     print("vigilant-pi-agent: update confirmed working, revert disarmed", flush=True)
 
 
+CMDLINE_TRIAL = "/var/lib/wcn/cmdline-trial"
+
+
+def confirm_cmdline_trial():
+    """Disarm a live quiet-boot cmdline.txt retrofit once it is proven good.
+
+    A successful telemetry tick is proof this Pi booted the retrofitted cmdline.txt AND is back
+    online, so the trial marker is deleted. That single unlink disarms the ENTIRE dead-man revert
+    the privileged helper armed: wcn-cmdline-revert.service is ConditionPathExists on this file
+    (so it is condition-skipped on every future boot once the marker is gone) and the deadman
+    timer no-ops without it. A confirmed change just becomes permanent, nothing left to undo.
+
+    The marker lives under /var/lib/wcn, which is writable to the agent; cmdline.txt itself and
+    its backup are on /boot, which ProtectSystem=full keeps read-only here on purpose — restoring
+    them is the boot-time unit's job (root, outside this namespace), never the agent's."""
+    if not os.path.exists(CMDLINE_TRIAL):
+        return
+    try:
+        os.unlink(CMDLINE_TRIAL)
+        print("vigilant-pi-agent: quiet-boot cmdline change confirmed, revert disarmed", flush=True)
+    except Exception:
+        pass
+
+
+TOOLBOX_PRIV = "/usr/local/sbin/wcn-toolbox-priv"
+
+
+def sync_toolbox(conf):
+    """Pull the on-console toolbox scripts on the SAME opt-in, slow cadence as the agent's own
+    self-update, so wcn-toolbox / wcn-toolbox-priv track the agent live instead of only arriving
+    with a reimage.
+
+    The privileged helper does the actual fetch-validate-install: it runs OUTSIDE this unit's
+    ProtectSystem namespace, so it can write /usr/local/bin (and, on older devices, /usr/local/sbin)
+    that this agent process cannot. We just trigger it and surface its one-line result. Best-effort
+    by design — any failure here is logged and never touches the telemetry tick. On a device whose
+    installed helper predates this verb the call simply reports 'unknown verb' and is ignored; the
+    first new helper has to arrive out-of-band (reimage / install-pi-agent.sh), after which every
+    later toolbox change self-propagates through this path."""
+    try:
+        r = subprocess.run([TOOLBOX_PRIV, "toolbox-sync"],
+                           capture_output=True, text=True, timeout=90)
+        out = (r.stdout or r.stderr).strip()
+        if out and "already current" not in out and "unknown verb" not in out:
+            print("vigilant-pi-agent: " + out, flush=True)
+    except Exception as e:
+        print(f"vigilant-pi-agent: toolbox sync failed: {type(e).__name__}: {e}", flush=True)
+
+
 def self_update(conf):
     import hashlib
     url, token = conf.get("VIGILANT_URL"), conf.get("VIGILANT_TOKEN")
@@ -3259,6 +3308,7 @@ def tick(conf, do_printers):
     # A successful report is the ONLY evidence a just-installed agent actually works.
     if status == 200:
         cancel_revert()
+        confirm_cmdline_trial()
 
     # Kept in its own guard: a malformed or unexpected boot directive must not stop the
     # interval negotiation below, or a bad push would also desynchronise the poll cadence.
@@ -3422,6 +3472,7 @@ def main():
             # Opt-in, and only on the slow pass: an update check every 30s is pointless load.
             if str(conf.get("VIGILANT_AUTO_UPDATE") or "").strip() in ("1", "true", "yes"):
                 self_update(conf)
+                sync_toolbox(conf)
         else:
             printer_pass += 1
         # Logs on EVERY tick. They used to be collected inside the printer branch above, which

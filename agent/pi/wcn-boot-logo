@@ -1,0 +1,39 @@
+#!/bin/bash
+# Paint the WCN mark on the console early in boot, so the screen carries the brand instead of bare
+# black in the window between power-on and the toolbox taking over. The toolbox draws the SAME
+# ASCII mark from /usr/local/share/wcn/logo.ansi, so this is a seamless lead-in rather than a
+# second, different screen.
+#
+# Best-effort and silent by construction: on a Pi 3B the framebuffer is torn down and re-created
+# during the KMS hand-over, so this may paint, briefly blank, and re-appear — that is fine. If the
+# logo file or the console is not there, it does nothing rather than failing a boot-critical unit.
+set -u
+LOGO=/usr/local/share/wcn/logo.ansi
+TTY=/dev/tty1
+[ -r "$LOGO" ] || exit 0
+
+# Console size in CHARACTERS. Prefer the framebuffer geometry (pixels / an 8x16 console font);
+# fall back to a 1080p panel (240x67), the estate's panel. An off-centre mark beats none, so this
+# never aborts on a bad read.
+COLS=240; ROWS=67
+if IFS= read -r geo < /sys/class/graphics/fb0/virtual_size 2>/dev/null; then
+    w=${geo%,*}; h=${geo#*,}
+    case "$w" in ''|*[!0-9]*) ;; *) [ "$w" -ge 320 ] && COLS=$(( w / 8 )) ;; esac
+    case "$h" in ''|*[!0-9]*) ;; *) [ "$h" -ge 240 ] && ROWS=$(( h / 16 )) ;; esac
+fi
+
+{
+    printf '\033[2J\033[H\033[?25l'                       # clear, home, hide the cursor
+    # Vertical centre: the mark is ~11 rows plus a two-line caption; pad the top to the middle.
+    top=$(( (ROWS - 15) / 2 )); [ "$top" -lt 0 ] && top=0
+    for ((i=0; i<top; i++)); do printf '\n'; done
+    # Centre each row on the width, padding against the PLAIN length (colour codes are zero-width).
+    while IFS= read -r line; do
+        plain=$(printf '%s' "$line" | sed 's/\x1b\[[0-9;]*m//g')
+        pad=$(( (COLS - ${#plain}) / 2 )); [ "$pad" -lt 0 ] && pad=0
+        printf '%*s%s\n' "$pad" '' "$line"
+    done < "$LOGO"
+    cap="W E S T E R N   C O M M U N I C A T I O N"
+    pad=$(( (COLS - ${#cap}) / 2 )); [ "$pad" -lt 0 ] && pad=0
+    printf '\n%*s\033[96m%s\033[0m\n' "$pad" '' "$cap"
+} > "$TTY" 2>/dev/null || true

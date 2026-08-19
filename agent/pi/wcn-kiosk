@@ -169,24 +169,56 @@ build_opts() {
 }
 # --- end kiosk.conf handling -------------------------------------------------------------
 
+# Brand the local X root before the first connection, so the counter never shows a bare grey X
+# stipple or a black gap — during the initial connect, between reconnects, or after a server
+# reboot it shows the WCN mark, matching the toolbox splash that ran a moment earlier. This is the
+# same composed splash Plymouth would use, kept at a stable path. feh paints the root pixmap; if
+# feh or the image is missing it falls back to a solid black root, which is still on-brand and can
+# never be an error that stops a session starting.
+WCN_SPLASH=/usr/local/share/wcn/splash.png
+if command -v feh >/dev/null 2>&1 && [ -r "$WCN_SPLASH" ]; then
+    feh --no-fehbg --bg-center --image-bg black "$WCN_SPLASH" >/dev/null 2>&1 || xsetroot -solid black
+else
+    xsetroot -solid black 2>/dev/null || true
+fi
+
+# Support banner: an on-demand strip that shows a severity-coloured message support pushes from
+# wc-field (the agent writes it to /var/lib/wcn/kiosk-message.txt). It appears ONLY while a message
+# is active — when it does, it shrinks the RDP session below itself; when the message clears it
+# hides and restores the session to full screen. All of that positioning lives in wcn-banner; this
+# script just needs the screen size for the initial full-screen launch. Kept alive across reconnects.
+read -r SCREEN_W SCREEN_H < <(xdotool getdisplaygeometry 2>/dev/null || echo "1920 1080")
+case "${SCREEN_W:-}${SCREEN_H:-}" in *[!0-9]*|"") SCREEN_W=1920; SCREEN_H=1080 ;; esac
+start_banner() {
+    command -v python3 >/dev/null 2>&1 && [ -x /usr/local/bin/wcn-banner ] || return 0
+    pgrep -f /usr/local/bin/wcn-banner >/dev/null 2>&1 || /usr/local/bin/wcn-banner >/dev/null 2>&1 &
+}
+start_banner
+
 while true; do
     # Re-read on every pass, exactly like the target: a setting pushed from Watchman is then
     # picked up by the next reconnect even if the agent's kiosk restart never landed.
     read_settings
     apply_blanking "$BLANK"
     build_opts
+    start_banner                    # keep the support banner alive across reconnects
 
     TARGET=$(pick_transport)
     while [ -z "$TARGET" ]; do sleep 3; TARGET=$(pick_transport); done
     # No credential is ever logged; OPTS holds only redirection and display switches.
     echo "$(date -Is) connecting via $TARGET [${OPTS[*]} blank:${BLANK}m]" >> /var/log/wcn-kiosk.log
 
+    # Full screen and RESIZABLE (not /f, which is fixed): the WCN banner shrinks this window to sit
+    # below itself while a support message is active, and restores it to full screen when the message
+    # clears. /dynamic-resolution makes the remote session follow the local window size live, so the
+    # resize is seamless rather than a reconnect.
     xfreerdp3 \
         /v:"$TARGET" \
         /u:"$RDP_USER" \
         /p:"$RDP_PASS" \
         /cert:ignore \
-        /f \
+        /size:"${SCREEN_W}x${SCREEN_H}" \
+        /dynamic-resolution \
         +auto-reconnect /auto-reconnect-max-retries:0 \
         /network:auto \
         "${OPTS[@]}" \

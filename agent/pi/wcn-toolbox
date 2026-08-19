@@ -24,10 +24,12 @@
 #
 # Usage:
 #   wcn-toolbox                 the menu
-#   wcn-toolbox --boot-prompt   the 4-second "press F4" window, then the menu or a clean exit
+#   wcn-toolbox --boot          the boot progress bar (F4 opens the menu), an at-boot update
+#                               check/install, then the pharmacy desktop
+#   wcn-toolbox --boot-prompt   the progress-bar window only; the caller launches the desktop
 set -u
 
-TOOLBOX_VERSION="0.1.0"
+TOOLBOX_VERSION="0.2.0"
 PRIV="/usr/local/sbin/wcn-toolbox-priv"
 KIOSK_LOG=/var/log/wcn-kiosk.log
 TARGET_FILE=/var/lib/wcn/rdp-target
@@ -104,7 +106,7 @@ splash() {
     fi
     printf '\n\033[96m%*s\033[0m\n' $(( (cols + 22) / 2 )) "WESTERN COMMUNICATION"
     printf '\033[37m%*s\033[0m\n\n' $(( (cols + ${#HOSTLINE}) / 2 )) "$HOSTLINE"
-    printf '\033[90m%*s\033[0m\n' $(( (cols + 34) / 2 )) "thin-client support console  v$TOOLBOX_VERSION"
+    printf '\033[90m%*s\033[0m\n' $(( (cols + ${#TOOLBOX_VERSION} + 1) / 2 )) "v$TOOLBOX_VERSION"
     # A short, skippable beat so the mark is seen before the menu paints over it.
     read -rsn1 -t 1.5 _ 2>/dev/null || true
 }
@@ -470,18 +472,38 @@ screen_agent() {
     esac
 }
 
+# Retrofit the quiet-boot cmdline tokens onto THIS counter, live. The privileged verb validates
+# the change (append-only, root= preserved), backs up the original and arms a dead-man revert,
+# but it never reboots — the change only lands on the reboot offered here, and undoes itself if
+# the counter does not come back reporting. Reached only from inside screen_fixit, so it is
+# already behind the PIN gate: applying it persists across a reboot and could strand a device,
+# which is exactly the PIN tier.
+action_quiet_boot() {
+    yesno "Quiet the boot screen" \
+        "This hides the Linux boot text so the counter comes up on the\nWCN splash instead of scrolling commands. It needs a reboot.\n\nIf the counter does not come back online afterwards it undoes\nitself automatically within about 11 minutes.\n\nApply it now?" 16 70 || return
+    local out; out=$(priv cmdline-quiet)
+    msg "Quiet boot" "$(printf '%s' "${out:-done}" | san)" 12 68
+    case "$out" in
+        cmdline\ updated*)
+            yesno "Restart this box" "Restart now to apply?\n\nThe counter is unavailable for about 90 seconds." \
+                || return
+            priv reboot ;;
+    esac
+}
+
 screen_fixit() {
     gate || return
     local choice out q
     while true; do
-        choice=$(whiptail --backtitle "$BACKTITLE" --title "Fix-it actions" --menu "" 20 70 8 \
+        choice=$(whiptail --backtitle "$BACKTITLE" --title "Fix-it actions" --menu "" 21 70 9 \
             "1" "Restart the monitoring agent" \
             "2" "Restart the backup-link tunnel" \
             "3" "Reset the smartcard service" \
             "4" "Send a test print" \
             "5" "Clear stuck print jobs" \
             "6" "Show the last session log" \
-            "7" "Back" 3>&1 1>&2 2>&3) || return
+            "7" "Quiet the boot screen (needs a reboot)" \
+            "8" "Back" 3>&1 1>&2 2>&3) || return
         case "$choice" in
             1) out=$(priv svc-restart vigilant-agent) ;;
             2) out=$(priv svc-restart rdp-tunnel) ;;
@@ -491,6 +513,7 @@ screen_fixit() {
                  elif [ "$choice" = 4 ]; then out=$(sudo -n "$PRIV" test-print "$q" 2>&1)
                  else out=$(sudo -n "$PRIV" queue-clear "$q" 2>&1); fi ;;
             6) msg "Session log" "$(priv log-tail)" 24 78; continue ;;
+            7) action_quiet_boot; continue ;;
             *) return ;;
         esac
         msg "Fix-it actions" "$(printf '%s' "${out:-done}" | san)" 10 64
@@ -561,24 +584,31 @@ main_menu() {
     done
 }
 
-# ── boot prompt ──────────────────────────────────────────────────────────────
-# Holding a key during firmware boot is not reliable on a Pi 3B — a USB keyboard often has not
-# enumerated yet. So the window is owned by a systemd unit ordered before the kiosk instead,
-# which is what commercial thin clients do too. It runs from .bash_profile on tty1 BEFORE
-# `exec startx`, so at this point no X server exists and nothing has grabbed the keyboard —
-# the one window in which the console keyboard is reliably ours. (While the kiosk's X is
-# running it holds an EVIOCGRAB on the keyboard and no other VT can read it, which is why the
-# toolbox is a boot-time mode and not a switch-to-anytime console.)
+# ── boot progress bar ────────────────────────────────────────────────────────
+# Replaces the old "press F4" countdown with a filling progress bar — the reassuring, quiet thing
+# a commercial thin client shows while it comes up, instead of a wall of kernel and systemd text.
+# The bar does double duty: it IS the F4 window, and it is the cover for the update check running
+# behind it (boot_update_phase). Drawn with one glyph in two colours (bright fill, dim track) so
+# every cell is exactly one column and it renders in the framebuffer font the logo already relies
+# on (▀▄█).
 #
-# VERIFIED on this console with dumpkeys: the Linux VT sends F1-F5 as ESC [ [ A .. ESC [ [ E,
-# so F4 is ESC [ [ D (NOT ESC [ [ S — an earlier guess that silently never matched). Terminals
-# claiming xterm send SS3 (ESC O P..S) or ESC [ 1 n ~ instead. We accept the whole top-row
-# function-key class rather than F4 alone: at a counter a fumbled F3/F5 should still open the
-# menu, and there is nothing else those keys could mean at a boot prompt. A plain arrow key is
-# ESC [ X (single bracket) and deliberately does NOT match. Any unrecognised key is ignored and
-# the countdown continues, so neither a stray press nor an unattended boot holds a counter
-# offline — it always falls through to the desktop when the timer expires.
+# Holding a key during firmware boot is not reliable on a Pi 3B — a USB keyboard often has not
+# enumerated yet. So this window is owned by the boot chain instead: it runs from .bash_profile on
+# tty1 BEFORE `exec startx`, when no X server exists and nothing has grabbed the keyboard — the one
+# window in which the console keyboard is reliably ours. (While the kiosk's X runs it holds an
+# EVIOCGRAB and no other VT can read the keyboard, which is why the toolbox is a boot-time mode and
+# not a switch-to-anytime console.)
+#
+# VERIFIED on this console with dumpkeys: the Linux VT sends F1-F5 as ESC [ [ A .. ESC [ [ E, so F4
+# is ESC [ [ D (NOT ESC [ [ S — an earlier guess that silently never matched). Terminals claiming
+# xterm send SS3 (ESC O P..S) or ESC [ 1 n ~ instead. We accept the whole top-row function-key
+# class rather than F4 alone: at a counter a fumbled F3/F5 should still open the menu. A plain arrow
+# key is ESC [ X (single bracket) and deliberately does NOT match. Any unrecognised key is ignored
+# and the bar keeps filling, so neither a stray press nor an unattended boot holds a counter
+# offline — it always falls through to the desktop when the bar completes.
 BOOT_WAIT_FILE=/etc/wcn/boot-wait          # optional single integer; default 5s
+BAR_W=48                                   # one big bar; recomputed in boot_prompt from the console width
+BAR_ROW=20                                 # the bar's screen row; recomputed in boot_prompt from the height
 
 # Centre one line on the console width. The width comes from the framebuffer console, which on a
 # 1080p panel is ~240 cols, not 80 — so leading padding must be COMPUTED, never hardcoded, or
@@ -591,50 +621,185 @@ cline() {
     printf '%*s%b\n' "$pad" '' "$text"
 }
 
+# Centre the ANSI logo block on $COLS; silently omitted if the file is absent (older Lite images
+# that never had it). Colour codes have zero display width, so pad against the plain-text length.
+draw_logo() {
+    local line plain pad
+    [ -r "$LOGO" ] || return 0
+    while IFS= read -r line; do
+        plain=$(printf '%s' "$line" | sed 's/\x1b\[[0-9;]*m//g')
+        pad=$(( (COLS - ${#plain}) / 2 )); [ "$pad" -lt 0 ] && pad=0
+        printf '%*s%s\n' "$pad" '' "$line"
+    done < "$LOGO"
+}
+
+draw_boot_header() {
+    clear; echo
+    draw_logo
+    echo
+    cline '\033[96mW E S T E R N   C O M M U N I C A T I O N\033[0m' 41
+    echo
+}
+
+# One redraw of the bottom progress bar at $1 percent with label $2. Uses ABSOLUTE cursor
+# addressing so the bar stays anchored at one fixed spot however the label length changes: the
+# label sits on its own centred line above it, the bar is centred by its OWN width alone, and the
+# percentage sits below. \033[K clears each line so a shorter label leaves no tail. This is the
+# single "one big bar" look — between phases only the label text changes, the bar never jumps.
+bar_line() {
+    local pct=$1 label=$2 hint=${3:-} fill i out bpad lcol rlab rpct
+    [ "$pct" -lt 0 ] && pct=0; [ "$pct" -gt 100 ] && pct=100
+    fill=$(( pct * BAR_W / 100 ))
+    out='\033[96m'                                    # filled cells: bright cyan
+    for ((i=0;    i<fill;  i++)); do out+='█'; done
+    out+='\033[90m'                                   # remaining track: dim grey
+    for ((i=fill; i<BAR_W; i++)); do out+='█'; done
+    out+='\033[0m'
+    bpad=$(( (COLS - BAR_W) / 2 )); [ "$bpad" -lt 0 ] && bpad=0
+    lcol=$(( bpad + 1 ))                              # the bar's left edge column
+    rlab=$(( bpad + BAR_W - ${#label} + 1 )); [ "$rlab" -lt "$lcol" ] && rlab=$lcol
+    rpct=$(( bpad + BAR_W - 3 ))                      # "NNN%" flush with the bar's right edge
+    # The line above the bar frames it: the F4 hint sits at the LEFT edge (dim), the current phase
+    # at the RIGHT edge (bright). The hint is only passed while F4 actually works (the checking
+    # window), so it never invites a keypress that would be ignored.
+    printf '\033[%d;1H\033[K' "$((BAR_ROW-2))"
+    [ -n "$hint" ] && printf '\033[%d;%dH\033[90m%s\033[0m' "$((BAR_ROW-2))" "$lcol" "$hint"
+    printf '\033[%d;%dH\033[97m%s\033[0m' "$((BAR_ROW-2))" "$rlab" "$label"
+    printf '\033[%d;1H\033[K%*s%b' "$BAR_ROW" "$bpad" '' "$out"
+    printf '\033[%d;1H\033[K\033[%d;%dH\033[90m%3d%%\033[0m' "$((BAR_ROW+1))" "$((BAR_ROW+1))" "$rpct" "$pct"
+}
+
+# A short centred status line under the bar, held ~1.2s so it can be read before the hand-off.
+# Placed at a fixed row below the bar with the same absolute addressing bar_line uses, so it never
+# collides with the bar. col: ok=green, anything else dim grey.
+status_line() {
+    local col=90 pad; [ "$1" = ok ] && col=92
+    pad=$(( (COLS - ${#2}) / 2 )); [ "$pad" -lt 0 ] && pad=0
+    printf '\033[%d;1H\033[K%*s\033[%dm%s\033[0m' "$((BAR_ROW+3))" "$pad" '' "$col" "$2"
+    read -rsn1 -t 1.2 _ 2>/dev/null || true
+}
+
+# The timed bar. Returns 0 the instant a top-row function key is pressed; 1 when it completes.
+# Elapsed time is read from EPOCHREALTIME as integer microseconds — LC_ALL=C pins the radix char,
+# then the dot/comma is stripped — so there is no per-frame fork and no float arithmetic. Requires
+# bash 5 (the image is bash 5.2). Polling at ~0.08s keeps F4 responsive and the fill smooth.
+progress_window() {
+    local secs=$1 label=$2 start now pct k rest total_us
+    local LC_ALL=C
+    total_us=$(( secs * 1000000 )); [ "$total_us" -lt 1 ] && total_us=1
+    start=${EPOCHREALTIME/[.,]/}
+    printf '\033[?25l'                                # hide the cursor while the bar animates
+    while :; do
+        now=${EPOCHREALTIME/[.,]/}
+        pct=$(( (now - start) * 100 / total_us ))
+        [ "$pct" -gt 100 ] && pct=100
+        bar_line "$pct" "$label" "Press F4 to enter support toolbox"
+        [ "$pct" -ge 100 ] && break
+        if IFS= read -rsn1 -t 0.08 k && [ "$k" = $'\e' ]; then
+            IFS= read -rsn5 -t 0.3 rest
+            case "$rest" in
+                '[['* | 'OP' | 'OQ' | 'OR' | 'OS' | '[11~' | '[12~' | '[13~' | '[14~')
+                    printf '\033[?25h\n'; return 0 ;;
+            esac
+        fi
+    done
+    printf '\033[?25h'
+    return 1
+}
+
+# The boot entry point. Draw the brand, run the bar as the F4 window with the update check going on
+# behind it, then (unless F4 opened the menu) act on that check. Returns 0 => open the menu,
+# 1 => start the desktop.
 boot_prompt() {
-    [ -t 0 ] || return 1                    # no real console (e.g. --report over a pipe)
-    local secs k rest line plain pad
+    [ -t 0 ] || return 1                              # no real console (e.g. --report over a pipe)
+    local secs chk checker
     secs=$(cat "$BOOT_WAIT_FILE" 2>/dev/null)
     case "$secs" in ""|*[!0-9]*) secs=5 ;; esac
     COLS=$(tput cols 2>/dev/null || echo 80)
+    local rows; rows=$(tput lines 2>/dev/null || echo 24)
+    # One big bar spanning the full width minus a 5% margin (2.5% each side), anchored near the foot
+    # of the screen. BAR_W/BAR_ROW are global so bar_line and status_line see them.
+    BAR_W=$(( COLS * 95 / 100 )); [ "$BAR_W" -lt 20 ] && BAR_W=20
+    BAR_ROW=$(( rows - 4 )); [ "$BAR_ROW" -lt 6 ] && BAR_ROW=6
 
-    clear
-    echo
-    if [ -r "$LOGO" ]; then
-        while IFS= read -r line; do
-            plain=$(printf '%s' "$line" | sed 's/\x1b\[[0-9;]*m//g')
-            pad=$(( (COLS - ${#plain}) / 2 )); [ "$pad" -lt 0 ] && pad=0
-            printf '%*s%s\n' "$pad" '' "$line"
-        done < "$LOGO"
+    draw_boot_header
+
+    # Kick the slow, networked check off behind the bar so the till is never blocked on it. The 8s
+    # timeout caps a black-holed server (agent-remote's own urllib timeout is 15s); the file gains
+    # content only once there is a real answer, so "empty" reads cleanly as "no answer yet".
+    chk=$(mktemp 2>/dev/null || echo "/tmp/wcn-chk.$$")
+    ( timeout 8 sudo -n "$PRIV" agent-remote >"$chk" 2>/dev/null ) &
+    checker=$!
+
+    if progress_window "$secs" "Checking for updates"; then
+        kill "$checker" 2>/dev/null; rm -f "$chk" 2>/dev/null
+        return 0                                      # F4 -> the menu's Agent screen handles updates
     fi
-    echo
-    cline '\033[96mW E S T E R N   C O M M U N I C A T I O N\033[0m' 41
-    cline '\033[90mthin-client support console\033[0m' 27
-    echo
 
-    # The countdown line is rebuilt and re-centred each second. \r returns to column 0 and the
-    # whole (padded) line is reprinted, so it updates in place and stays centred.
-    local msg mlen
-    while [ "$secs" -gt 0 ]; do
-        mlen=$(( 34 + ${#secs} + 30 ))       # printable length of the assembled line below
-        pad=$(( (COLS - mlen) / 2 )); [ "$pad" -lt 0 ] && pad=0
-        printf '\r%*sStarting the pharmacy desktop in \033[96m%s\033[0m s     press \033[1;97mF4\033[0m for the support menu' \
-            "$pad" '' "$secs"
-        if IFS= read -rsn1 -t 1 k; then
-            if [ "$k" = $'\e' ]; then
-                IFS= read -rsn5 -t 0.3 rest
-                case "$rest" in
-                    '[['*)                       printf '\n'; return 0 ;;  # Linux VT F1-F5 (F4 = [[D)
-                    'OP'|'OQ'|'OR'|'OS')         printf '\n'; return 0 ;;  # xterm SS3 F1-F4
-                    '[11~'|'[12~'|'[13~'|'[14~') printf '\n'; return 0 ;;  # vt-style F1-F4
-                esac
-            fi
-            # any other key: ignore and keep counting; only a function key opens the menu
-        fi
-        secs=$(( secs - 1 ))
-    done
-    printf '\n'
+    boot_update_phase "$chk" "$checker"
+    loading_desktop
     return 1
+}
+
+# The last beat before the VM appears: the same bar, relabelled for what is actually happening as
+# the toolbox hands off to startx/RDP. Fills once over ~2.5s so the customer sees a deliberate
+# "Loading Virtual Desktop" rather than a bare console while X and FreeRDP come up.
+loading_desktop() {
+    local start now pct total_us
+    local LC_ALL=C
+    total_us=2500000
+    start=${EPOCHREALTIME/[.,]/}
+    printf '\033[?25l'
+    while :; do
+        now=${EPOCHREALTIME/[.,]/}
+        pct=$(( (now - start) * 100 / total_us ))
+        [ "$pct" -gt 100 ] && pct=100
+        bar_line "$pct" "Loading Virtual Desktop"
+        [ "$pct" -ge 100 ] && break
+        IFS= read -rsn1 -t 0.05 _ 2>/dev/null || true
+    done
+    printf '\033[?25h'
+}
+
+# Install-at-boot. The check may still be in flight when the bar finishes, so wait for it under a
+# "Checking" bar bounded by the same 8s the background job already carries. A real, different,
+# well-formed sha is installed NOW and visibly — with the dead-man revert armed inside agent-update
+# before the swap, so a bad update recovers on its own with nobody at the counter. Every other
+# outcome (up to date, offline, malformed) just starts the desktop; the agent's own auto-updater
+# will pick up a missed update on a later tick.
+boot_update_phase() {
+    local chk=$1 checker=$2 rem inst out upd up w
+    if [ ! -s "$chk" ]; then
+        w=0
+        while kill -0 "$checker" 2>/dev/null && [ "$w" -le 100 ]; do
+            bar_line "$w" "Checking for updates"
+            IFS= read -rsn1 -t 0.09 _ 2>/dev/null; w=$(( w + 4 ))
+        done
+    fi
+    wait "$checker" 2>/dev/null
+    rem=$(cat "$chk" 2>/dev/null); rm -f "$chk" 2>/dev/null
+    inst=$(sudo -n "$PRIV" agent-installed 2>/dev/null)
+
+    if [ "$rem" = "$inst" ]; then return; fi                 # up to date -> straight to loading
+    case "$rem" in
+        ""|ERROR*|MISMATCH) return ;;                        # offline / server unsure -> just load
+        *[!0-9a-f]*)        return ;;                        # malformed -> ignore, just load
+    esac
+    [ ${#rem} -eq 64 ] || return
+
+    # A genuine update. Install it behind a marching bar — install is not linear, so the bar cycles
+    # rather than pretending to track real progress.
+    printf '\n'
+    upd=$(mktemp 2>/dev/null || echo "/tmp/wcn-upd.$$")
+    ( sudo -n "$PRIV" agent-update >"$upd" 2>&1 ) &
+    up=$!; w=0
+    while kill -0 "$up" 2>/dev/null; do
+        bar_line "$(( w % 101 ))" "Installing update"
+        IFS= read -rsn1 -t 0.09 _ 2>/dev/null; w=$(( w + 6 ))
+    done
+    wait "$up" 2>/dev/null
+    rm -f "$upd" 2>/dev/null                                  # result is in the agent's journal; the
+                                                             # bar moves on to "Loading Virtual Desktop"
 }
 
 # Plain-text dump of every read-only screen, no whiptail and no terminal needed. Two uses:
@@ -668,7 +833,14 @@ report() {
 # whether the timer expired, the user never pressed F4, or they chose "Start the pharmacy
 # desktop". startx must run as THIS session (its own controlling tty is tty1), so exec rather
 # than a child keeps X owning the console it was started from.
-start_desktop() { exec startx; }
+start_desktop() {
+    # startx and its clients chatter to stdout/stderr, which on tty1 IS the console the customer is
+    # looking at — so the last thing before the desktop appears is a wall of "linux running below,
+    # pushing everything up". Send that to a log in the user's home instead (westerncomms can write
+    # there; /var/log cannot). X still owns tty1 and paints over the console exactly as before; only
+    # the scrolling text is gone. The X server's own log stays in the usual Xorg.*.log.
+    exec startx >"${HOME:-/home/westerncomms}/.wcn-startx.log" 2>&1
+}
 
 case "${1:-}" in
     # The boot entry. .bash_profile `exec`s us, so we ARE the tty1 session leader and job

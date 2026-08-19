@@ -284,6 +284,86 @@ cmd_agent_rollback() {
     echo "rolled back to $(cmd_agent_installed_sha | cut -c1-12)"
 }
 
+# ── toolbox self-update ──────────────────────────────────────────────────────
+# Pull the on-console toolbox scripts (wcn-toolbox, wcn-toolbox-priv) from the SAME endpoint
+# family and device token the agent update uses, so all three stay in lockstep behind one trust
+# boundary. Triggered by the agent on its opt-in slow cadence (VIGILANT_AUTO_UPDATE), but done
+# HERE and not in the agent ON PURPOSE: ProtectSystem=full makes /usr/local/bin read-only to the
+# agent on every device (and /usr/local/sbin on pre-2026-08-14 ones), whereas this helper runs
+# OUTSIDE that namespace and can write both anywhere in the fleet — the same reason cmd_agent_update
+# exists.
+#
+# Guards mirror agent-update: the body must match the server's advertised sha256; identical
+# content is never rewritten (safe to run every tick); and — the shell analogue of agent-update's
+# ast.parse — each file MUST pass `bash -n` before it is installed, because a wcn-toolbox that does
+# not parse loops the tty1 boot chain and a broken wcn-toolbox-priv disarms every privileged verb.
+# A .prev is kept for manual rollback. There is deliberately NO dead-man reboot: unlike the agent
+# or cmdline.txt, a bad toolbox leaves the agent reporting and SSH up, so the next sync or an SSH
+# copy recovers it with nobody on site.
+cmd_toolbox_sync() {
+    python3 - /etc/vigilant/agent.env /var/lib/wcn/agent.env <<'PY'
+import hashlib, os, shutil, subprocess, sys, urllib.request
+
+# (endpoint, install path, mode). The paths are fixed here, never taken from the network.
+FILES = [
+    ("/agent/pi-toolbox",      "/usr/local/bin/wcn-toolbox",       0o755),
+    ("/agent/pi-toolbox-priv", "/usr/local/sbin/wcn-toolbox-priv", 0o700),
+]
+conf = {}
+for path in sys.argv[1:]:
+    try:
+        for line in open(path):
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1); conf[k.strip()] = v.strip()
+    except Exception:
+        pass
+url, token = conf.get("VIGILANT_URL"), conf.get("VIGILANT_TOKEN")
+if not (url and token):
+    print("no url/token in agent.env"); sys.exit(1)
+
+def sha_file(p):
+    try:
+        return hashlib.sha256(open(p, "rb").read()).hexdigest()
+    except Exception:
+        return None
+
+changed = []
+for endpoint, dest, mode in FILES:
+    try:
+        req = urllib.request.Request(url.rstrip("/") + endpoint,
+            headers={"Authorization": "Bearer " + token,
+                     "User-Agent": "vigilant-pi-agent/1"})   # Cloudflare 403s urllib's default UA
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body, advertised = r.read(), r.headers.get("x-vigilant-sha256")
+    except Exception as e:
+        print("%s: fetch failed (%s)" % (endpoint, type(e).__name__)); continue
+    got = hashlib.sha256(body).hexdigest()
+    if advertised and advertised != got:
+        print("%s: refusing, sha256 does not match the server's" % dest); continue
+    if got == sha_file(dest):
+        continue                                           # unchanged — nothing to do
+    tmp = dest + ".new"
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(body)
+        os.chmod(tmp, mode)
+    except OSError as e:
+        # EROFS here means an old unit without the ReadWritePaths grant; log and move on rather
+        # than dying, so the other file still updates.
+        print("%s: cannot write (%s)" % (dest, e.strerror)); continue
+    chk = subprocess.run(["bash", "-n", tmp], capture_output=True, text=True)
+    if chk.returncode != 0:
+        os.unlink(tmp)
+        print("%s: refusing, does not parse (%s)" % (dest, chk.stderr.strip()[:100])); continue
+    if os.path.exists(dest):
+        shutil.copy2(dest, dest + ".prev")
+    os.replace(tmp, dest)                                  # atomic; a running copy keeps its inode
+    changed.append("%s -> %s" % (os.path.basename(dest), got[:12]))
+
+print("toolbox: " + (", ".join(changed) if changed else "already current"))
+PY
+}
+
 # ── network ──────────────────────────────────────────────────────────────────
 # This image is NetworkManager (Debian 13, no dhcpcd), so everything is nmcli and the same
 # tool covers wired, static and wifi. Writing dhcpcd.conf here would parse fine and do nothing.
@@ -408,6 +488,120 @@ cmd_to_rdp() { chvt 1; }
 cmd_reboot()   { systemctl reboot; }
 cmd_poweroff() { systemctl poweroff; }
 
+# ── quiet-boot cmdline retrofit (LIVE, guarded) ──────────────────────────────
+# Add the quiet-boot tokens to a DEPLOYED Pi's cmdline.txt. cmdline.txt is THE ONE FILE ON THE PI
+# WITH NO REMOTE RECOVERY — a bad one means no boot, so no SSH, no agent, no tunnel, and a drive
+# to the pharmacy with an SD reader — so this is the most dangerous verb in the file and is built
+# like it:
+#
+#   * APPEND-ONLY. root=, its PARTUUID and every existing token are preserved byte-for-byte; only
+#     tokens from a fixed allowlist are added. It REFUSES if the result is not a single line, or
+#     if the original root= token is not still present verbatim afterwards.
+#   * the true original is backed up beside the file (cmdline.txt.wcn-prev) before any write.
+#   * a DEAD-MAN REVERT is armed BEFORE the change can take effect: a boot-time unit restores the
+#     backup and reboots unless the agent — once it is up AND reporting — deletes the trial
+#     marker (confirm_cmdline_trial in the agent). A successful telemetry POST is the all-clear.
+#   * it does NOT reboot; the caller confirms the reboot separately, so applying is deliberate.
+#
+# The allowlist is limited to tokens that cannot affect root, networking or the X session (kernel
+# verbosity, the console cursor/blanking, the boot logo), so "the agent reported" is a sufficient
+# health signal and a genuinely non-booting outcome is off the table for this token set. Anything
+# beyond quiet-boot must NOT be bolted onto this verb — it would break that guarantee.
+CMDLINE_TRIAL=/var/lib/wcn/cmdline-trial
+REVERT_UNIT_FILE=/etc/systemd/system/wcn-cmdline-revert.service
+QUIET_TOKENS="quiet loglevel=3 logo.nologo vt.global_cursor_default=0 consoleblank=0 systemd.show_status=false"
+
+_cmdline_path() {
+    local c
+    for c in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
+        [ -f "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    return 1
+}
+
+# Installed on first retrofit (baked images boot quiet already and never need it). Condition-
+# skipped the instant the agent deletes the marker, so a confirmed change leaves it inert on
+# every future boot WITHOUT a disable — which matters because /etc is read-only to the agent.
+_ensure_revert_unit() {
+    [ -f "$REVERT_UNIT_FILE" ] && return 0
+    cat > "$REVERT_UNIT_FILE" <<'UNIT'
+[Unit]
+Description=WCN cmdline.txt trial - revert the quiet-boot change if it did not confirm
+After=local-fs.target
+ConditionPathExists=/var/lib/wcn/cmdline-trial
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wcn-toolbox-priv cmdline-revert-check
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+_cmdline_restore() {
+    local c bak; c=$(_cmdline_path) || return 1
+    bak="$c.wcn-prev"; [ -f "$bak" ] || return 1
+    cp -p "$bak" "$c" && sync
+    rm -f "$CMDLINE_TRIAL"
+}
+
+cmd_cmdline_quiet() {
+    local c orig new root_tok tok bak sha
+    c=$(_cmdline_path) || die "no cmdline.txt found"
+    orig=$(tr -d '\n' < "$c"); [ -n "$orig" ] || die "cmdline.txt is empty - refusing"
+    root_tok=$(printf '%s' "$orig" | tr ' ' '\n' | grep -m1 '^root=') \
+        || die "cmdline.txt has no root= - refusing"
+    new="$orig"
+    for tok in $QUIET_TOKENS; do
+        case " $new " in *" $tok "*) ;; *) new="$new $tok" ;; esac
+    done
+    [ "$new" = "$orig" ] && { echo "already quiet - nothing to do"; return 0; }
+    # Guards, both fail closed: the result must be ONE line, and root= must survive verbatim.
+    case "$new" in *[$'\n\r']*) die "refusing: result is not a single line" ;; esac
+    case " $new " in *" $root_tok "*) ;; *) die "refusing: root= would change" ;; esac
+
+    bak="$c.wcn-prev"; [ -e "$bak" ] || cp -p "$c" "$bak" || die "backup failed"
+    install -d -m 0755 /var/lib/wcn
+    sha=$(printf '%s\n' "$new" | sha256sum | cut -d' ' -f1)
+    # Arm in this order — marker, unit, THEN the file — so a crash between any two steps still
+    # leaves a bootable device that reverts itself. The failure of an update must not need the
+    # access the update removes.
+    printf '%s\n0\n' "$sha" > "$CMDLINE_TRIAL"
+    _ensure_revert_unit
+    systemctl enable wcn-cmdline-revert.service 2>/dev/null || true
+    printf '%s\n' "$new" > "$c"; sync
+    echo "cmdline updated; REBOOT to apply. Auto-reverts within ~11 min unless the agent reports."
+}
+
+# Run at every boot by wcn-cmdline-revert.service, but ONLY while a trial marker exists (the
+# unit's ConditionPathExists gate). First trial boot: bump the counter and arm a deadman so a
+# device that boots but never gets back online still reverts. A SECOND trial boot with the marker
+# still present means the agent never confirmed across a whole boot, or the device is looping ->
+# revert now.
+cmd_cmdline_revert_check() {
+    [ -f "$CMDLINE_TRIAL" ] || return 0
+    local sha boots
+    sha=$(sed -n 1p "$CMDLINE_TRIAL"); boots=$(sed -n 2p "$CMDLINE_TRIAL")
+    case "$boots" in ""|*[!0-9]*) boots=0 ;; esac
+    boots=$(( boots + 1 ))
+    if [ "$boots" -ge 2 ]; then
+        _cmdline_restore
+        systemctl reboot
+        return 0
+    fi
+    printf '%s\n%s\n' "$sha" "$boots" > "$CMDLINE_TRIAL"
+    systemd-run --unit=wcn-cmdline-deadman --on-active=660 \
+        /usr/local/sbin/wcn-toolbox-priv cmdline-deadman 2>/dev/null || true
+}
+
+cmd_cmdline_deadman() {
+    [ -f "$CMDLINE_TRIAL" ] || return 0        # agent confirmed in time; nothing to do
+    _cmdline_restore
+    systemctl reboot
+}
+
 # ── dispatch ─────────────────────────────────────────────────────────────────
 verb="${1:-}"; shift 2>/dev/null || true
 case "$verb" in
@@ -420,6 +614,7 @@ case "$verb" in
     agent-remote)       cmd_agent_remote_sha ;;
     agent-update)       cmd_agent_update ;;
     agent-rollback)     cmd_agent_rollback ;;
+    toolbox-sync)       cmd_toolbox_sync ;;
     net-dhcp)           cmd_net_dhcp "${1:?iface}" ;;
     net-static)         cmd_net_static "${1:?iface}" "${2:?addr}" "${3:?gw}" "${4:?dns}" ;;
     dhcp-renew)         cmd_dhcp_renew "${1:?iface}" ;;
@@ -436,5 +631,8 @@ case "$verb" in
     log-tail)           cmd_log_tail ;;
     reboot)             cmd_reboot ;;
     poweroff)           cmd_poweroff ;;
+    cmdline-quiet)        cmd_cmdline_quiet ;;
+    cmdline-revert-check) cmd_cmdline_revert_check ;;
+    cmdline-deadman)      cmd_cmdline_deadman ;;
     *)                  die "unknown verb: ${verb:-<none>}" ;;
 esac

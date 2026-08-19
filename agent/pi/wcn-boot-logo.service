@@ -1,0 +1,20 @@
+[Unit]
+Description=WCN boot logo on the console
+# Paint the mark as EARLY as possible — not at multi-user, which on a Pi 3B is ~15s of black after
+# the framebuffer is already up. DefaultDependencies=no + ordering right after the console font is
+# set lets it run in the first couple of seconds; it writes to the tty1 text buffer, which fbcon
+# restores onto the real framebuffer the moment the GPU finishes coming up. Before getty so it is
+# never racing the toolbox for tty1.
+DefaultDependencies=no
+After=systemd-vconsole-setup.service
+Before=sysinit.target getty@tty1.service getty.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/wcn-boot-logo
+# Never let a cosmetic unit stall or fail the boot.
+TimeoutStartSec=5
+
+[Install]
+WantedBy=sysinit.target
