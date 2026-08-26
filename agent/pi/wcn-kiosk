@@ -11,9 +11,18 @@
 # Loops forever, re-evaluating the transport each time, so the desktop returns by
 # itself after a server reboot, a link drop, or a user logging off.
 #
-# Printing: the Pi's CUPS queue `brother-hl8260` (driverless IPP to the Brother at
-# 192.168.88.221) is redirected into the session. Print jobs never cross either
-# transport — CUPS delivers on the site LAN.
+# Printing: the site's CUPS queues are redirected into the session, one /printer: flag each.
+# The list is DATA, not code — it comes from /var/lib/wcn/printers.tab, written by the Vigilant
+# agent from Watchman, so a new site is a new file rather than a hand-edited copy of this
+# script. Print jobs never cross either transport — CUPS delivers on the site LAN.
+#
+# Each flag is /printer:<cups-queue>,<windows-driver>[,default]. The CUPS queue name IS the
+# name the printer gets inside Windows, and ProScript stores that name, so a queue rename
+# breaks ProScript's report mapping. The second field names a Windows driver that must already
+# exist in the VM: a missing driver does NOT error, Windows silently falls back to Remote
+# Desktop Easy Print, which RASTERISES the page instead of passing ZPL through and the labels
+# come out unreadable. Every Pi-side queue is raw (/etc/cups/ppd is empty and must stay empty);
+# the Windows driver generates the PCL or ZPL and CUPS passes the bytes through.
 #
 # Smartcard: the Dell SK-3205 keyboard's integrated CCID reader (413c:2101) is redirected
 # so NHS Spine authentication can happen inside the hosted session. Unlike printing, this
@@ -22,9 +31,16 @@
 # Requires pcscd on the Pi; the kiosk's tty1 seat0 session is what authorises it to pcscd.
 #
 # Session options (smartcard / printing / clipboard / colour depth / screen blanking) are
-# chosen in Watchman and pushed here by the Vigilant agent as /var/lib/wcn/kiosk.conf.
-# Everything below falls back to the behaviour this script had before it could read that
-# file, so an absent or corrupt one can never leave a thin client unable to start a session.
+# chosen in Watchman and pushed here by the Vigilant agent as /var/lib/wcn/kiosk.conf, and the
+# printer list as /var/lib/wcn/printers.tab. Everything below falls back to a working session
+# when either file is absent or corrupt, so a file that did not arrive can never leave a thin
+# client unable to start a session — or, for printers.tab, leave a counter with no printers.
+#
+# Both files are re-read on EVERY reconnect, not only at startup, so a push takes effect on the
+# next connect with no restart — and, equally, a half-written file would be picked up by the
+# next network blip. That is why the agent writes printers.tab.next and a privileged verb
+# promotes it to printers.tab and restarts the session as one action; this script only ever
+# reads the live file.
 #
 # Credentials: /etc/wcn-rdp.creds (root 0640). FreeRDP masks the password in `ps`.
 set -u
@@ -81,10 +97,21 @@ pick_transport() {
     echo ""
 }
 
-# --- kiosk.conf handling: parse, validate, build flags -----------------------------------
+# --- kiosk.conf / printers.tab handling: parse, validate, build flags ---------------------
 # Kept as one self-contained block of functions so it can be extracted and unit-tested
 # without running the session loop.
 KIOSK_CONF="/var/lib/wcn/kiosk.conf"
+PRINTERS_TAB="/var/lib/wcn/printers.tab"
+KIOSK_LOG="/var/log/wcn-kiosk.log"
+
+PRINTERS_TAB_PREV="$PRINTERS_TAB.prev"
+
+# Hard cap on redirected queues. A site has a handful; anything beyond this is a corrupt or
+# runaway file, and every queue is an argv element and a printer installed inside the session.
+# THE SAME NUMBER is enforced by vigilant-pi-agent.py (PRINTERS_MAX, refuses the push) and by
+# wcn-toolbox-priv (_printers_validate, refuses the promotion) — see the contract block below.
+PRINTERS_MAX=32
+PRINTERS_MAX_BYTES=65536
 
 # The defaults ARE this script's previous hardcoded behaviour: smartcard on, printing on,
 # clipboard on, 16bpp, never blank. Every fallback path lands here, because a thin client
@@ -148,12 +175,297 @@ conf_blank_min() {
     if [ "$v" -le 120 ]; then echo "$v"; else echo "$DEF_BLANK"; fi
 }
 
+# --- printers.tab ------------------------------------------------------------------------
+#
+# ── THE printers.tab CONTRACT — ONE format, THREE owners ──
+# Owners, and what each is allowed to touch:
+#   vigilant-pi-agent.py  writes printers.tab.NEXT only, never the live file.
+#   wcn-toolbox-priv      ('printing-promote')  validates .next, keeps .prev, swaps live,
+#                         restarts the session — as ONE action.
+#   wcn-kiosk             (this file) reads printers.tab only, and turns it into xfreerdp argv.
+#
+# ALL THREE MUST ACCEPT AND REJECT EXACTLY THE SAME FILES. Every rule below is repeated
+# verbatim in the other two files. Three owners each applying their own rules to one shared
+# format is not a theoretical problem: it is the bug class that produced R1-R6, where a value
+# was staged by one owner, promoted by a second and silently dropped by a third — this one.
+#
+#   line            <queue_name>\t<windows_driver>\t<flags>   — exactly two TABs, LF only
+#   blank / '#'     ignored
+#   queue_name      ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$   i.e. 1..63 characters.
+#                   It is the CUPS queue name AND the Windows printer name AND what ProScript
+#                   stores in its report mapping — one string wearing three hats, which is why
+#                   this is a tight allowlist and not a sanitiser.
+#                   63 and not 64: wcn-toolbox-priv hands the same name to test-print and
+#                   queue-clear, whose v_queue caps at 63. A 64-character name would promote
+#                   and then be untestable — and because validation is all-or-nothing at the
+#                   writing ends, ONE over-long name made a site's WHOLE table un-promotable.
+#   windows_driver  printable ASCII 0x20..0x7e, 1..128 characters, NO COMMA.
+#                   THE COMMA is FreeRDP's OWN field separator inside the flag this script
+#                   builds — /printer:<queue>,<driver>[,default] — so a driver containing one
+#                   silently invents a third field, i.e. forges ',default' onto a queue that
+#                   must not be the default. Real driver names contain one ("Kyocera
+#                   FS-1030D, KPDL"), so this needs no attacker, just an operator typing the
+#                   true name. This script's refusal was always right; what was wrong was that
+#                   it was the ONLY one refusing, so the table staged, promoted, restarted the
+#                   session and the counter came back with that printer GONE. Both other owners
+#                   now refuse it first, which is what keeps the mistake visible in Watchman.
+#   flags           comma separated, a CLOSED SET, currently only `default`; empty is legal.
+#                   At most ONE `default` in the whole table.
+#   uniqueness      queue names unique across the table.
+#   table size      at most PRINTERS_MAX queues. ONE number in all three: the agent refuses the
+#                   push, the toolbox refuses the promotion, and this script counts anything
+#                   past it as REJECTED. It used to `break` silently, so a 40-queue table
+#                   promoted cleanly, cost the counter its session, came back missing queues
+#                   33-40 and its default printer, and logged "(0 line(s) rejected)".
+#   file size       at most 64 KiB.
+#
+# THE ONE DELIBERATE ASYMMETRY, written down so nobody "fixes" it into a fourth disagreement:
+# on a duplicate queue name, a second `default`, or more than PRINTERS_MAX queues, the two
+# WRITING owners refuse the WHOLE table — so none of those can ever reach the live file through
+# promotion. This script, which reads a file it did not write, resolves the same three per LINE
+# (first queue wins, first `default` wins, the excess counted as rejected), because its
+# non-negotiable job is that a counter never ends up with zero printers. Every PER-VALUE rule
+# above is identical in all three; only these three whole-table conditions differ, and this
+# leniency is unreachable by anything that came through promotion.
+#
+# Everything here is PARSED, never sourced. The file comes from the monitoring server, and
+# every field is validated by REJECTION (a case-glob that says what is not allowed) rather
+# than by sanitising, exactly like read_direct and read_user above. The other two owners
+# validate before this script ever sees the file; this is the last lock on the same door, and
+# it is the side that turns the value into xfreerdp argv.
+
+# read_settings/build_opts run on EVERY reconnect, not just at startup, so an unconditional
+# log line here would write once per network blip. Only state CHANGES are logged, which keeps
+# a fallback loud (it is logged the moment it starts, and again when it stops) without the
+# log turning into noise. collect_logs() ships this file.
+PRINTERS_LAST_STATE=""
+printers_state() {
+    [ "$1" = "$PRINTERS_LAST_STATE" ] && return 0
+    PRINTERS_LAST_STATE="$1"
+    echo "$(date -Is) printers: $1" >> "$KIOSK_LOG" 2>/dev/null || true
+}
+
+_valid_queue_name() {
+    # The contract's queue-name class, 1..63. ONE implementation, used both for a printers.tab
+    # line and for a queue name discovered from local CUPS, so the two can never disagree.
+    case "$1" in
+        [A-Za-z0-9]*) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    [ ${#1} -le 63 ] || return 1
+    return 0
+}
+
+parse_printers_file() {
+    # Parse ONE file in printers.tab format into the PRINTER_FLAGS global, as ready-made
+    # xfreerdp argv words. Returns 0 when at least one line was accepted, 1 otherwise, and
+    # leaves the counts in PARSE_N / PARSE_BAD / PARSE_TOTAL for the caller's log line.
+    #
+    # Taking the path as an argument is what lets the fallback below run printers.tab.prev
+    # through the IDENTICAL rules — a second, looser parser for the rollback copy would be the
+    # same disagreement bug again, one file further down.
+    #
+    # LC_ALL=C for the duration so [[:print:]] means ASCII printable and the A-Za-z ranges
+    # cannot be widened by whatever locale the Pi happens to boot with. bash restores it when
+    # the function returns.
+    local f="$1"
+    local LC_ALL=C
+    local line q rest drv flags tok ok fdef sz
+    local have_default=0 seen="|"
+
+    PARSE_N=0; PARSE_BAD=0; PARSE_TOTAL=0
+    PRINTER_FLAGS=()
+
+    [ -f "$f" ] && [ -r "$f" ] || return 1
+    # The 64 KiB ceiling the other two owners apply. Without it a runaway file is read line by
+    # line on every reconnect, and the cap no longer stops the read early now that lines past
+    # PRINTERS_MAX are counted rather than breaking the loop.
+    # `| tr -d ' \t'` because some wc implementations pad the count. An unparseable answer is
+    # treated as "too big" — refusing a file whose size we could not establish is the same
+    # direction of failure as refusing one that is over the ceiling.
+    sz=$(wc -c < "$f" 2>/dev/null | tr -d ' \t')
+    case "$sz" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$sz" -le "$PRINTERS_MAX_BYTES" ] || return 1
+
+    # Read the WHOLE file once. Deliberately not conf_get: that strips all whitespace from
+    # every line (safe there, values are digits), and every real driver name here contains
+    # spaces — "ZDesigner ZD420-203dpi ZPL", "Brother HL-L5100DN series".
+    # `|| [ -n "$line" ]` so a final line with no trailing newline — a truncated write — is
+    # still considered rather than silently dropped.
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "" | '#'*) continue ;;
+        esac
+        PARSE_TOTAL=$(( PARSE_TOTAL + 1 ))
+
+        # --- the table cap ----------------------------------------------------------------
+        # Counted as REJECTED, not broken out of. The count is what the log line reports, and
+        # a log that says "32 queue(s) (0 rejected)" for a 40-queue table is a clean parse
+        # claimed over eight missing printers.
+        if [ "$PARSE_N" -ge "$PRINTERS_MAX" ]; then
+            PARSE_BAD=$(( PARSE_BAD + 1 )); continue
+        fi
+
+        # --- LF only ----------------------------------------------------------------------
+        # wcn-toolbox-priv refuses any line holding a CR ("the file must be LF only"), so a
+        # CRLF file cannot reach the live path through promotion at all. Matching that here
+        # rather than stripping the CR is what makes the three accept-sets identical; a file
+        # that gets here with CRs in it did not come through promotion, and the fallback
+        # chain below is exactly the right answer to that.
+        case "$line" in
+            *$'\r'*) PARSE_BAD=$(( PARSE_BAD + 1 )); continue ;;
+        esac
+
+        # --- split into exactly three fields on TAB ---------------------------------------
+        # No manual IFS juggling and no here-string: pure parameter expansion, so nothing is
+        # word-split and no temp file is created per line. EXACTLY two tabs, which is what the
+        # toolbox's _printers_validate requires — a two-field line is not this format.
+        tok=${line//[!$'\t']/}
+        if [ ${#tok} -ne 2 ]; then PARSE_BAD=$(( PARSE_BAD + 1 )); continue; fi
+        q=${line%%$'\t'*}
+        rest=${line#*$'\t'}
+        drv=${rest%%$'\t'*}
+        flags=${rest#*$'\t'}
+
+        # --- queue name -------------------------------------------------------------------
+        # This string is also the printer's name inside Windows and the name ProScript stores.
+        if ! _valid_queue_name "$q"; then PARSE_BAD=$(( PARSE_BAD + 1 )); continue; fi
+
+        # --- windows driver: printable ASCII, 1..128, no control character, NO COMMA -------
+        # See the contract block above for why the comma is refused at all three owners.
+        # Newline and tab cannot survive the line reader and the split above, but [[:cntrl:]]
+        # is caught here anyway so the rule reads completely in one place.
+        case "$drv" in
+            "" | *[![:print:]]* | *,*) PARSE_BAD=$(( PARSE_BAD + 1 )); continue ;;
+        esac
+        if [ ${#drv} -gt 128 ]; then PARSE_BAD=$(( PARSE_BAD + 1 )); continue; fi
+
+        # --- flags: comma separated, CLOSED set, currently just `default` -----------------
+        # Unknown tokens reject the whole LINE rather than being dropped. A flag this script
+        # does not understand means the file was written by something that disagrees with the
+        # contract, and guessing at its intent is how a label printer becomes the default for
+        # A4 scripts. Rejecting is also safe in the large: if every line is rejected the count
+        # lands at zero and the fallback chain takes over, so the counter still prints.
+        ok=1; fdef=0; rest=$flags
+        while [ -n "$rest" ]; do
+            tok=${rest%%,*}
+            if [ "$tok" = "$rest" ]; then rest=""; else rest=${rest#*,}; fi
+            case "$tok" in
+                default) fdef=1 ;;
+                *) ok=0; break ;;
+            esac
+        done
+        [ "$ok" = 1 ] || { PARSE_BAD=$(( PARSE_BAD + 1 )); continue; }
+
+        # --- duplicate queue names ---------------------------------------------------------
+        # Two /printer: flags with the same name give the session two printers fighting over
+        # one Windows name; first line wins.
+        case "$seen" in
+            *"|$q|"*) PARSE_BAD=$(( PARSE_BAD + 1 )); continue ;;
+        esac
+        seen="$seen$q|"
+
+        # Only the FIRST default is honoured — Windows has exactly one default printer, and a
+        # second ',default' would just race the first. Later ones are emitted without the flag
+        # rather than dropped, because the queue itself is still wanted.
+        if [ "$fdef" = 1 ] && [ "$have_default" = 0 ]; then
+            have_default=1
+            PRINTER_FLAGS+=( "/printer:$q,$drv,default" )
+        else
+            PRINTER_FLAGS+=( "/printer:$q,$drv" )
+        fi
+
+        PARSE_N=$(( PARSE_N + 1 ))
+    done < "$f"
+
+    [ "$PARSE_N" -ge 1 ]
+}
+
+printers_fallback() {
+    # THE RULE, unchanged: no valid live table must NEVER mean no printers. A counter with the
+    # wrong printers can still be driven by a human; a counter with no printers cannot dispense.
+    #
+    # WHAT CHANGED, and why: this used to be a hardcoded copy of iPharm counter 1's five queue
+    # names, shipped inside a script that goes to EVERY Pi in the estate. At any site that is
+    # not iPharm those names match no local CUPS queue, so it satisfied "never emit zero flags"
+    # while delivering ZERO WORKING PRINTERS — and it seeded ProScript with a foreign site's
+    # printer names, which is a dispensing-report problem, not a cosmetic one. Every fallback
+    # path reached it: an unconverged Pi, an all-invalid file, an unreadable file, a restore
+    # that removed the live file.
+    #
+    # SO NO SITE'S QUEUE NAMES LIVE IN THIS FILE. The chain is site-agnostic, in order:
+    #   1. printers.tab.prev — the set this counter was ACTUALLY printing to before the last
+    #      promotion, through the IDENTICAL parser. wcn-toolbox-priv keeps it for exactly this.
+    #   2. this Pi's OWN CUPS queues, via lpstat. Local reality, discovered, never shipped.
+    #   3. bare /printer — FreeRDP enumerates and redirects every local printer itself.
+    # Each rung is logged loudly with WHICH source was used, because a counter running on a
+    # fallback is a counter somebody needs to converge.
+    local why="$1" q n=0 seen="|"
+
+    # 1 ── the previous live set.
+    if parse_printers_file "$PRINTERS_TAB_PREV"; then
+        printers_state "FALLBACK to $PRINTERS_TAB_PREV — the set before the last promotion ($PARSE_N queue(s), $PARSE_BAD rejected) — $why"
+        return
+    fi
+
+    # 2 ── local reality. The queue NAME is all CUPS can tell us; there is no driver name to
+    # recover, so the flag is emitted without one. FreeRDP then presents the printer under the
+    # queue name and Windows falls back to Easy Print if no matching driver exists — which
+    # rasterises, so labels will be poor. Degraded and printing beats correct and absent, and
+    # the log line says plainly that this happened.
+    if command -v lpstat >/dev/null 2>&1; then
+        PRINTER_FLAGS=()
+        while IFS= read -r q; do
+            q=${q%$'\r'}
+            _valid_queue_name "$q" || continue
+            case "$seen" in *"|$q|"*) continue ;; esac
+            seen="$seen$q|"
+            PRINTER_FLAGS+=( "/printer:$q" )
+            n=$(( n + 1 ))
+            [ "$n" -ge "$PRINTERS_MAX" ] && break
+        done < <(timeout 5 lpstat -e 2>/dev/null)
+        if [ "$n" -gt 0 ]; then
+            printers_state "FALLBACK to this Pi's own CUPS queues ($n queue(s), no driver names - Windows will use Easy Print) — $why"
+            return
+        fi
+    fi
+
+    # 3 ── last rung, and it is still not zero flags: bare /printer tells FreeRDP to enumerate
+    # and redirect every local printer on its own. Nothing site-specific, nothing to maintain.
+    PRINTER_FLAGS=( /printer )
+    printers_state "FALLBACK to bare /printer - FreeRDP redirects whatever CUPS has — $why"
+}
+
+read_printers() {
+    # Fills the PRINTER_FLAGS global from the LIVE file, or falls back. This script reads
+    # printers.tab and nothing else — .next belongs to the agent and .prev is read only by the
+    # fallback chain above.
+    if [ ! -f "$PRINTERS_TAB" ] || [ ! -r "$PRINTERS_TAB" ]; then
+        printers_fallback "$PRINTERS_TAB is absent or unreadable"
+        return
+    fi
+    if parse_printers_file "$PRINTERS_TAB"; then
+        printers_state "$PARSE_N queue(s) from printers.tab ($PARSE_BAD line(s) rejected)"
+        return
+    fi
+    printers_fallback "$PRINTERS_TAB has no valid line ($PARSE_TOTAL read, $PARSE_BAD rejected)"
+}
+# --- end printers.tab ---------------------------------------------------------------------
+
 read_settings() {
     SMARTCARD=$(conf_bool RDP_SMARTCARD "$DEF_SMARTCARD")
     PRINTER=$(conf_bool RDP_PRINTER "$DEF_PRINTER")
     CLIPBOARD=$(conf_bool RDP_CLIPBOARD "$DEF_CLIPBOARD")
     BPP=$(conf_bpp)
     BLANK=$(conf_blank_min)
+    # Sets the PRINTER_FLAGS array the same way the five lines above set their globals:
+    # no argument passing, build_opts reads what read_settings left behind.
+    read_printers
 }
 
 apply_blanking() {
@@ -177,11 +489,17 @@ build_opts() {
     # Explicitly negated rather than omitted, so the result does not depend on whichever
     # default this FreeRDP build was compiled with.
     if [ "$CLIPBOARD" = 1 ]; then OPTS+=( +clipboard ); else OPTS+=( -clipboard ); fi
-    # Device redirections have no negative form: off means the flag is absent. The queue name
-    # and its arguments are byte-identical to the pre-settings version — the printer is
-    # driverless IPP and those two extra fields are what makes it work.
+    # Device redirections have no negative form: off means the flag is absent — so RDP_PRINTER=0
+    # still removes EVERY printer from the session, whatever printers.tab says. The list itself
+    # is no longer written here; read_printers() has already turned printers.tab (or the
+    # built-in fallback) into finished argv words, one per queue.
+    #
+    # Appended with OPTS+=( … ) and expanded as "${OPTS[@]}" at the call, so a driver name with
+    # spaces stays ONE argument. Never build these into a string.
+    # The ${...+"${...[@]}"} guard is for `set -u`: on bash < 4.4 expanding an empty array is
+    # an unbound-variable error, and build_opts must not depend on read_settings having run.
     if [ "$PRINTER" = 1 ]; then
-        OPTS+=( /printer:brother-hl8260,"MS Publisher Imagesetter",default )
+        OPTS+=( ${PRINTER_FLAGS[@]+"${PRINTER_FLAGS[@]}"} )
     fi
     if [ "$SMARTCARD" = 1 ]; then OPTS+=( /smartcard ); fi
     OPTS+=( /bpp:"$BPP" )

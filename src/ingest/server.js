@@ -22,8 +22,11 @@
 //   GET  /devices/:serial         admin   device detail
 //   GET  /devices/:serial/history admin   dashboard time-series (window=1h|6h|24h|7d)
 //   GET  /devices/:serial/config-jobs   admin  list config-push jobs for the device
-//   POST /devices/:serial/config-jobs   admin  author a DRAFT config-push job
-//   POST /config-jobs/:id/approve       admin  two-person approve a draft
+//   POST /devices/:serial/config-jobs   admin|OPERATOR  author a DRAFT config-push job
+//   POST /config-jobs/:id/approve       admin|OPERATOR  approve a draft. It is a TWO-PERSON
+//                                       rule only when author and approver each proved a
+//                                       separate operator credential; with the shared admin
+//                                       token the response says two_person:false (A6)
 //   POST /config-jobs/:id/cancel        admin  cancel a draft / not-yet-picked-up job
 //   GET  /speedtest/pending             device next pending active speedtest (marks running)
 //   GET  /speedtest/down?job=&bytes=    device server-timed download payload
@@ -41,6 +44,88 @@
 //   GET  /relay/:id/next                device long-poll: next queued request (204 / 410)
 //   POST /relay/:id/reply               device the answer to one relayed request
 //   GET|POST /relay/:id/p/*             field  browser-facing proxy through the thin client
+//   ── the PMR control plane ──────────────────────────────────────────────────
+//   Executors are NOT routed here: a counter Pi collects its job on the reply to
+//   POST /telemetry and a Proxmox node collects its jobs on the reply to
+//   POST /proxmox/report, because both already call outward and nothing may dial in.
+//   GET  /pharmacies/:id/hours          admin  effective week + exceptions + state now
+//   PUT  /pharmacies/:id/hours          OPERATOR  replace the whole week (manual source).
+//                                       This is the write that decides what every gate in the
+//                                       platform permits, so it takes a named credential and,
+//                                       when the edit would newly arm the nightly restart on a
+//                                       day that currently forbids it, the typed site name (A2)
+//   PUT  /pharmacies/:id/hours/exception OPERATOR a bank holiday / one-off closure
+//   DELETE /pharmacies/:id/hours/exception?on_date=  OPERATOR  drop a one-off day
+//   GET  /pmr/intent?pharmacy_id=       admin  intended state + what has been observed
+//   PUT  /pmr/intent                    admin  set an intention for a subject
+//   DELETE /pmr/intent/:id              admin  drop an intention
+//   GET  /pmr/jobs?pharmacy_id=&status= admin  the job list, incl. why one is waiting
+//   POST /pmr/jobs                      admin  create a job from a NAMED verb
+//   DELETE /pmr/jobs/:id                admin  cancel a job not yet with an executor
+//   POST /pmr/jobs/:id/apply-now        OPERATOR  the hours override — needs a named
+//                                       per-person token (PMR_OPERATOR_TOKENS); the shared
+//                                       admin token is refused
+//   POST /pmr/job-result                device a counter Pi reporting applied|failed
+//   -- the printer model (docs/pmr-printer-contract.md) --
+//   GET  /printer-devices?pharmacy_id= admin  §1's PHYSICAL printers, keyed by USB serial /
+//                                       USB path / network address — the identity a rename
+//                                       cannot orphan. Carries §3's three-valued status (B10)
+//   The queues Watchman INTENDS a counter to have, as opposed to /printers, which is the
+//   discovery feed. The effective table rides the reply to POST /telemetry as `printers`,
+//   like `settings`; nothing here pushes to a device.
+//   GET  /pmr/desktop-printers?pharmacy_id= admin  §7's reading: what each desktop's Windows
+//                                       printer list actually holds, and how old that is.
+//                                       Written only by the Proxmox collector's outward push.
+//   GET  /printer-queues?pharmacy_id=   admin  the intended queues + their assignments
+//   POST /printer-queues                admin  create/edit one queue (section 2 enforced
+//                                       server-side over the whole resulting table)
+//   DELETE /printer-queues/:id          admin  drop one queue
+//   POST /printer-queues/test-print     admin  test print addressed by (counter, queue)
+//   POST /printers/assign               admin  queue -> desktop. STAGES ONLY: it can never
+//                                       reach a counter, and applying is the promote verb
+//   POST /counters/:id/printing-promote admin|OPERATOR  section 4's named verb. Stages a
+//                                       counter.printing-promote job held to the site's
+//                                       overnight window; `now: true` needs the operator
+//                                       token and the site's name typed, like apply-now
+//   -- the site build lifecycle --
+//   GET  /pharmacies/:id/capture        admin  the capture held for this site, or null
+//   POST /pharmacies/:id/capture        admin  the capture tool reporting what it took
+//   GET  /pharmacies/:id/import         admin  the import run, or null. last_poll_at is the
+//                                       only thing separating running from lost
+//   POST /pharmacies/:id/import         admin  the import executor reporting progress; a
+//                                       'queued' report is REFUSED when the node is short
+//   GET  /proxmox-node-capacity         admin  per-node/pool headroom + the site cost
+//   ── the capture kit (src/shared/captureToken.js) ───────────────────────────
+//   ⛔ The kit runs on a PHARMACY'S OWN PC and carries NO Supabase key, NO estate master
+//   token and NO operator token — only a ninety-minute bearer, minted from a site-bound
+//   ticket, good for exactly three things. None of its routes takes a site parameter: the
+//   pharmacy is a property of the ticket, so the kit cannot name another one.
+//   POST /pharmacies/:id/capture-ticket OPERATOR  issue the kit's ticket. Refused during the
+//                                       site's opening hours, and the ticket's expiry is
+//                                       clamped to the moment the pharmacy reopens
+//   GET  /pharmacies/:id/capture-ticket admin  the tickets held for this site (never a secret)
+//   DELETE /capture-tickets/:id         admin|OPERATOR  revoke a ticket AND every token it minted
+//   POST /capture/token                 TICKET the only route the ticket secret works on:
+//                                       exchange it for a scoped token. Redeemable a bounded
+//                                       number of times, because the guest-agent install
+//                                       reboots the PC mid-capture
+//   GET  /capture/sites                 CAPTURE sites:list    — the site this ticket admits
+//   GET  /capture/slots                 CAPTURE slots:read    — which roles are already taken
+//   POST /capture/register              CAPTURE capture:write — register/resume a capture and
+//                                       be told where to upload. It CANNOT create or modify a
+//                                       pharmacy; it registers against a site that exists
+//   ── the three OLDER paths that can also interrupt a live counter ───────────
+//   These predate the job ladder and could each sign a member of staff out with the shared
+//   admin token alone. They take EITHER credential; whether the operator one is REQUIRED
+//   depends on what the body asks for, so the handler decides and the dispatch only supplies
+//   the identity. See the block above the action route.
+//   POST /counters/:id/action           admin|OPERATOR  operator token required for
+//                                       'reboot' and 'restart-kiosk'
+//   PUT|POST /counters/:id/boot-target  admin|OPERATOR  staged by default (interrupts
+//                                       nobody); when:"now" requires the operator token
+//   DELETE /counters/:id/boot-target/staged  admin  withdraw a staged change
+//   PUT|PATCH /counters/:id             admin|OPERATOR  operator token required when the
+//                                       save CHANGES a session setting
 
 const http = require('node:http');
 const crypto = require('node:crypto');
@@ -49,6 +134,7 @@ const handlers = require('./handlers');
 const config = require('../shared/config');
 const log = require('../shared/log');
 const { makeStore } = require('../shared/store');
+const captureToken = require('../shared/captureToken');
 
 // ── helpers ──────────────────────────────────────────────────────────
 
@@ -114,6 +200,47 @@ function authField(req, cfg) {
   return timingSafeEqual(tok, cfg.fieldEnrollToken);
 }
 
+// ── WHO IS ASKING, derived from the credential and never from the body ─────────────────
+// Both of these answer a question the request used to answer about ITSELF.
+//
+// authProxmoxNode: which node is reporting. POST /proxmox/report is authenticated by the
+// estate MASTER token, which all three nodes share — so before this, the only thing deciding
+// which node's jobs a caller collected was `p.node`, a string in its own request body. A
+// scoped per-node token makes the name a property of the secret. The master token still
+// authenticates the route (inventory must keep flowing), but it identifies nobody, so it
+// receives no jobs: see proxmoxReport.
+//
+// Returns the node NAME, or null. Compared against every configured secret rather than
+// short-circuiting on the first mismatch, so the reply time does not narrow the search.
+function authProxmoxNode(req, cfg) {
+  const tok = bearer(req);
+  if (!tok) return null;
+  let found = null;
+  for (const cred of cfg.proxmoxNodeTokens || []) {
+    if (timingSafeEqual(tok, cred.secret)) found = cred.name;
+  }
+  return found;
+}
+
+// authPmrOperator: WHICH PERSON is applying a disruptive job during opening hours. The
+// route it guards suspends the one rule this whole feature exists to enforce — Watchman
+// never signs a member of staff out on its own — so the row has to record a person, and a
+// name the browser typed into `by` is not one. The master admin token is deliberately NOT
+// accepted: it is shared, it is in the browser, and "watchman did it" records nothing.
+//
+// Unset config means no operator can be identified, which means apply-now is refused. That
+// is the correct direction for a route whose effect is a pharmacist signed out
+// mid-consultation.
+function authPmrOperator(req, cfg) {
+  const tok = bearer(req);
+  if (!tok) return null;
+  let found = null;
+  for (const cred of cfg.pmrOperatorTokens || []) {
+    if (timingSafeEqual(tok, cred.secret)) found = cred.name;
+  }
+  return found;
+}
+
 // Auth for the PMR gateway agent: the master admin token OR the scoped GATEWAY_PULL_TOKEN.
 // Read-only manifest pull, so the gateway can carry the scoped key instead of the estate master.
 function authGateway(req, cfg) {
@@ -121,6 +248,45 @@ function authGateway(req, cfg) {
   const tok = bearer(req);
   if (!tok || !cfg.gatewayPullToken) return false;
   return timingSafeEqual(tok, cfg.gatewayPullToken);
+}
+
+// ── ⛔ THE CAPTURE KIT'S TOKEN, AND THE THREE THINGS IT MAY DO ──────────────
+// The kit runs on a PHARMACY'S OWN PC. It carries no Supabase key (that key decodes to
+// "role":"service_role" and bypasses row-level security entirely), no estate master token, no
+// operator token and no per-node token. It carries a bearer minted from a site-bound ticket,
+// good for ninety minutes, that may do exactly three things.
+//
+// ⛔ THE SCOPE IS ENFORCED AT THE ROUTE, NOT BY CONVENTION, AND IN THAT ORDER:
+//
+//   1. capabilityForRoute() is consulted FIRST. On any path outside the three-entry table it
+//      returns null, and this function is never called at all — so a capture token presented
+//      to /fleet, /pharmacies, /pmr/jobs or /proxmox/report is not a credential that lacks a
+//      permission, it is not a recognised credential there in the first place. It falls
+//      through to the ordinary 401 exactly as a random string would.
+//   2. The token row must CARRY the capability that route requires.
+//   3. The handler asserts the same capability again for itself (captureCapOk in handlers.js).
+//   4. The column carries a CHECK constraint restricting the list to a subset of the three, so
+//      a token with a fourth capability cannot be stored, and therefore cannot be presented.
+//
+// Four locks, one list (captureToken.CAPABILITIES). Adding a capability means changing all of
+// them on purpose, which is the point.
+//
+// Returns the token row (with its pharmacy binding) or null. The SITE comes from this row and
+// never from a path, a query or a body — which is why none of the three routes takes a site
+// parameter at all.
+async function authCaptureToken(req, store, capability) {
+  if (!capability) return null;
+  if (typeof store.getCaptureTokenByHash !== 'function') return null;
+  const tok = bearer(req);
+  if (!tok) return null;
+  // Hashed, exactly as a device token is: what is stored is a digest, so a database read
+  // cannot hand anybody a working credential.
+  const row = await store.getCaptureTokenByHash(sha256Hex(tok));
+  if (!row) return null;
+  // Lock 2. The store already refused a revoked/expired token and a token whose TICKET was
+  // revoked or expired; this is the capability itself.
+  if (!captureToken.hasCapability(row, capability)) return null;
+  return row;
 }
 
 // Field auth for the RELAY PROXY only, which is loaded by an <iframe> and by that page's own
@@ -181,7 +347,13 @@ function createServer({ store, config: cfg }) {
     }
 
     // Base context shared with every handler. Body/device/params filled per route.
-    const ctx = { req, res, store, config: cfg, log, query, body: '', device: null, params: {} };
+    // `actor` and `executorNode` are filled ONLY by the dispatch, and only from a
+    // credential — never from a body or a query string. A handler that reads them is reading
+    // a verified identity; nothing else in this object is one.
+    const ctx = {
+      req, res, store, config: cfg, log, query, body: '', device: null, params: {},
+      actor: null, executorNode: null, capture: null,
+    };
 
     try {
       // GET /healthz — open, no auth.
@@ -194,6 +366,48 @@ function createServer({ store, config: cfg }) {
       // platform health checks probe.
       if (method === 'GET' && pathname === '/') {
         return await handlers.adminUi(ctx);
+      }
+
+      // ══ THE CAPTURE KIT ═══════════════════════════════════════════════════
+      // A credential class of its own, kept together and kept FIRST so the whole of what a
+      // token from a pharmacy PC can reach is visible in one screenful.
+      //
+      // ⛔ NONE OF THESE TAKES A SITE PARAMETER. The pharmacy is a property of the ticket the
+      // token was minted from, which is what makes "site picked from a live Watchman list,
+      // never typed" true by construction rather than by discipline: there is no field in
+      // which the kit could name another pharmacy.
+      //
+      // POST /capture/token — the ONE route the TICKET secret works on. It is not a capture
+      // capability and deliberately appears in no capability list: the ticket buys a token and
+      // nothing else. Kept out of CAPTURE_ROUTES for that reason.
+      if (method === 'POST' && pathname === '/capture/token') {
+        ctx.body = await readBody(req);
+        return await handlers.captureTokenMint(ctx);
+      }
+      // The three capabilities, and there are three. The table in captureToken.js decides
+      // which capability a path requires; a path that is not in it is not a capture route at
+      // all, and a capture bearer presented there is just an unrecognised string.
+      const captureCap = captureToken.capabilityForRoute(method, pathname);
+      if (captureCap) {
+        const tok = await authCaptureToken(req, store, captureCap);
+        if (!tok) return json(res, 401, { ok: false, error: 'unauthorized' });
+        // ⚠️ FILLED ONLY BY THE DISPATCH, ONLY FROM A CREDENTIAL — like ctx.actor and
+        // ctx.executorNode. A handler reading ctx.capture is reading a verified site binding.
+        ctx.capture = tok;
+        // Best-effort audit stamp. It must never fail the call it is recording.
+        if (typeof store.touchCaptureToken === 'function') {
+          Promise.resolve(store.touchCaptureToken(tok.id, captureCap)).catch(() => {});
+        }
+        if (captureCap === 'sites:list') return await handlers.captureSitesList(ctx);
+        if (captureCap === 'slots:read') return await handlers.captureSlotsRead(ctx);
+        if (captureCap === 'capture:write') {
+          ctx.body = await readBody(req);
+          return await handlers.captureRegister(ctx);
+        }
+        // Unreachable while the table and this switch agree. If they ever stop agreeing, the
+        // answer is a refusal, not a fall-through into the rest of the dispatch carrying an
+        // authenticated capture token.
+        return json(res, 403, { ok: false, error: 'unauthorized' });
       }
 
       // ── device routes ────────────────────────────────────────────
@@ -330,12 +544,70 @@ function createServer({ store, config: cfg }) {
       if (mPharm && method === 'DELETE') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mPharm[1]) };
+        // The body is READ on a DELETE, which is unusual and deliberate: it carries the
+        // typed site name the server now checks (B4). Reading it here rather than in the
+        // handler keeps every body-parsing decision in the dispatch, as elsewhere in this
+        // file. A client that cannot send a DELETE body may use ?confirm= instead.
+        ctx.body = await readBody(req);
         return await handlers.pharmacyDelete(ctx);
       }
 
       if (method === 'GET' && pathname === '/printers/lan') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         return await handlers.lanPrinters(ctx);
+      }
+      // ── the printer model (docs/pmr-printer-contract.md §1) ────────────────
+      // A DIFFERENT object from /printers, which is the discovery feed. These are the queues
+      // Watchman intends a counter to have — the set sent as `printers` on the telemetry
+      // reply — and they are keyed by the physical device, so a rename is a rename.
+      //
+      // Registered BEFORE /printers/:id so the fixed suffix is not swallowed by the id
+      // pattern, the same specificity rule the counter routes carry.
+      // GET /printer-devices?pharmacy_id= — §1's PHYSICAL devices, keyed by the identity a
+      // rename cannot orphan. Routed because store.listPrinterDevices() was implemented and
+      // exported with no route at all, which made §3's three-valued `status` — written by the
+      // telemetry tick on every counter check-in — write-only (B10).
+      if (method === 'GET' && pathname === '/printer-devices') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return await handlers.printerDevicesList(ctx);
+      }
+      if (method === 'GET' && pathname === '/printer-queues') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return await handlers.printerQueuesList(ctx);
+      }
+      // §7: what each DESKTOP says is in its Windows printer list. READ ONLY, and it cannot be
+      // anything else — the reading is written by the Proxmox collector's outward push and
+      // Vigilant has no route back to a node, so this route reaches nothing and interrupts
+      // nobody. The shared admin token is the right credential for it.
+      if (method === 'GET' && pathname === '/pmr/desktop-printers') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return await handlers.desktopPrintersList(ctx);
+      }
+      if (method === 'POST' && pathname === '/printer-queues') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return await handlers.printerQueueUpsert(ctx);
+      }
+      // Test print addressed by (counter, queue), for a queue with no discovery row yet.
+      // BEFORE /printer-queues/:id — 'test-print' would otherwise match as an id.
+      if (method === 'POST' && pathname === '/printer-queues/test-print') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return await handlers.printerQueueTestPrint(ctx);
+      }
+      const mPrinterQueue = /^\/printer-queues\/([^/]+)$/.exec(pathname);
+      if (mPrinterQueue && method === 'DELETE') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPrinterQueue[1]) };
+        return await handlers.printerQueueDelete(ctx);
+      }
+      // The assignment: queue -> desktop. STAGES ONLY — it writes what the tick will send and
+      // raises the promotion job, and it cannot reach the counter or restart a session, so
+      // the shared admin token is the right credential for it.
+      if (method === 'POST' && pathname === '/printers/assign') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return await handlers.printerAssign(ctx);
       }
       const mPrinterTest = /^\/printers\/([^/]+)\/test-print$/.exec(pathname);
       if (mPrinterTest && method === 'POST') {
@@ -361,6 +633,81 @@ function createServer({ store, config: cfg }) {
         ctx.params = { id: decodeURIComponent(mPhVms[1]) };
         ctx.body = await readBody(req);
         return await handlers.pharmacyVmAttach(ctx);
+      }
+      // ── the site build lifecycle ──────────────────────────────────────────
+      // Two READS a build checklist depends on, and the writes that make them answerable.
+      // Both reads ALWAYS emit their key, even as null: the front end does `r.capture ?? null`
+      // and an omitted key becomes a confident "nothing held" instead of "we cannot tell".
+      // BEFORE /pharmacies/:id so the suffix is not swallowed.
+      const mPhCapture = /^\/pharmacies\/([^/]+)\/capture$/.exec(pathname);
+      if (mPhCapture && method === 'GET') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPhCapture[1]) };
+        return await handlers.siteCaptureGet(ctx);
+      }
+      if (mPhCapture && method === 'POST') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPhCapture[1]) };
+        ctx.body = await readBody(req);
+        return await handlers.siteCaptureSet(ctx);
+      }
+      // ── the capture kit's ticket ──────────────────────────────────────────
+      // BEFORE /pharmacies/:id, like the rest of this block, so the suffix is not swallowed.
+      const mPhTicket = /^\/pharmacies\/([^/]+)\/capture-ticket$/.exec(pathname);
+      if (mPhTicket && method === 'GET') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPhTicket[1]) };
+        return await handlers.captureTicketList(ctx);
+      }
+      if (mPhTicket && method === 'POST') {
+        // ⛔ A NAMED PERSON, AND THE SHARED ADMIN TOKEN IS NOT ENOUGH — the same rule
+        // apply-now carries, for a related reason. This route hands out a credential that will
+        // run on a machine we do not own, at a pharmacy, out of hours; a row that records
+        // "watchman issued it" records nothing, and the estate master token is shared and sits
+        // in a browser. Unset PMR_OPERATOR_TOKENS therefore means no ticket can be issued at
+        // all, which is the correct direction.
+        const actor = authPmrOperator(req, cfg);
+        if (!actor) {
+          return json(res, 401, {
+            ok: false,
+            error: 'issuing a capture ticket needs a named per-operator token '
+                 + '(PMR_OPERATOR_TOKENS) — the shared admin token is not accepted, because the '
+                 + 'ticket authorises a credential to run on a pharmacy PC and the record has to '
+                 + 'name a person',
+          });
+        }
+        ctx.actor = actor;
+        ctx.params = { id: decodeURIComponent(mPhTicket[1]) };
+        ctx.body = await readBody(req);
+        return await handlers.captureTicketIssue(ctx);
+      }
+      // DELETE /capture-tickets/:id — the kill switch. Admin OR operator: revoking is the safe
+      // direction and must never be the thing nobody on shift can do.
+      const mCapTicket = /^\/capture-tickets\/([^/]+)$/.exec(pathname);
+      if (mCapTicket && method === 'DELETE') {
+        const actor = authPmrOperator(req, cfg);
+        if (!actor && !authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.actor = actor;
+        ctx.params = { id: decodeURIComponent(mCapTicket[1]) };
+        return await handlers.captureTicketRevoke(ctx);
+      }
+      const mPhImport = /^\/pharmacies\/([^/]+)\/import$/.exec(pathname);
+      if (mPhImport && method === 'GET') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPhImport[1]) };
+        return await handlers.siteImportGet(ctx);
+      }
+      if (mPhImport && method === 'POST') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mPhImport[1]) };
+        ctx.body = await readBody(req);
+        return await handlers.siteImportSet(ctx);
+      }
+      // Node headroom. Nothing in the estate feed reported it, which is why "Watchman refuses
+      // a site it cannot host and names the resource short" was not implementable.
+      if (method === 'GET' && pathname === '/proxmox-node-capacity') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return await handlers.proxmoxNodeCapacity(ctx);
       }
       // Preview the dnsmasq drop-in a site's network settings produce (read-only).
       const mPhGwCfg = /^\/pharmacies\/([^/]+)\/gateway-config$/.exec(pathname);
@@ -482,12 +829,49 @@ function createServer({ store, config: cfg }) {
         ctx.body = await readBody(req);
         return await handlers.counterEnrolPi(ctx);
       }
+      // ⚠️ THE THREE ROUTES THAT CAN INTERRUPT A LIVE DISPENSING SESSION (D1/D2/D3).
+      // POST /counters/:id/action, PUT /counters/:id/boot-target and the settings half of
+      // PATCH /counters/:id could each sign a member of staff out with only the shared
+      // estate token and a name the caller typed into `by`. They now take TWO credentials,
+      // the same shape POST /proxmox/report uses and for the same reason:
+      //
+      //   an OPERATOR token (PMR_OPERATOR_TOKENS) names a person, so it may interrupt;
+      //   the shared ADMIN token authenticates the route — everything non-interrupting on
+      //   these paths must keep working — but it identifies nobody, so it may not.
+      //
+      // Which of the two is REQUIRED depends on what the request asks for, and that is in
+      // the body: 'restart-agent' interrupts nobody, 'reboot' does; a staged boot target
+      // interrupts nobody, when:"now" does; changing the printer poll interval interrupts
+      // nobody, changing colour depth does. So the dispatch cannot decide it — it hands the
+      // handler an identity when one was proved and null when it was not, and the handler
+      // refuses through requireDeliberateInterruption(). ctx.actor is the ONLY thing
+      // downstream may treat as this caller's identity; `by` in the body is never read on an
+      // interrupting branch.
       const mCounterAction = /^\/counters\/([^/]+)\/action$/.exec(pathname);
       if (mCounterAction && method === 'POST') {
-        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        const actor = authPmrOperator(req, cfg);
+        if (!actor && !authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.actor = actor;
         ctx.params = { id: decodeURIComponent(mCounterAction[1]) };
         ctx.body = await readBody(req);
         return await handlers.counterAction(ctx);
+      }
+      // ── §4 of docs/pmr-printer-contract.md: the named promote verb ────────
+      // "printing-promote is the named verb that swaps the staged table live and restarts the
+      // session as ONE action." DUAL-CREDENTIAL, and for exactly the reason the block above
+      // POST /counters/:id/action gives: staging a promotion interrupts nobody and the shared
+      // admin token is enough for it, but releasing one during opening hours signs a member of
+      // staff out and has to be recorded against a person. The handler decides which of the
+      // two the request is asking for, because that is in the body (`now`), and it refuses
+      // through the same requireDeliberateInterruption() the other interrupting routes use.
+      const mCounterPromote = /^\/counters\/([^/]+)\/printing-promote$/.exec(pathname);
+      if (mCounterPromote && method === 'POST') {
+        const actor = authPmrOperator(req, cfg);
+        if (!actor && !authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.actor = actor;
+        ctx.params = { id: decodeURIComponent(mCounterPromote[1]) };
+        ctx.body = await readBody(req);
+        return await handlers.printingPromote(ctx);
       }
       // Support screen sharing. BEFORE /counters/:id for the same specificity reason.
       const mCounterSupport = /^\/counters\/([^/]+)\/support$/.exec(pathname);
@@ -502,17 +886,38 @@ function createServer({ store, config: cfg }) {
         ctx.params = { id: decodeURIComponent(mCounterSupport[1]) };
         return await handlers.counterSupportStatus(ctx);
       }
-      // Boot target BEFORE /counters/:id, same specificity reason as enrol-pi.
+      // Withdraw a STAGED boot target. Registered before the plain boot-target route because
+      // it is the more specific path. Un-scheduling something that has not happened
+      // interrupts nobody, so the shared admin token is enough.
+      const mCounterBootStaged = /^\/counters\/([^/]+)\/boot-target\/staged$/.exec(pathname);
+      if (mCounterBootStaged && method === 'DELETE') {
+        const actor = authPmrOperator(req, cfg);
+        if (!actor && !authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.actor = actor;
+        ctx.params = { id: decodeURIComponent(mCounterBootStaged[1]) };
+        return await handlers.counterCancelBootTargetStage(ctx);
+      }
+      // Boot target BEFORE /counters/:id, same specificity reason as enrol-pi. PUT as well as
+      // POST: the default is now a STAGED write, which is an idempotent statement of the
+      // wanted target rather than a command, and the contract table calls it PUT/POST.
+      // Dual-credential — see the block above the action route.
       const mCounterBoot = /^\/counters\/([^/]+)\/boot-target$/.exec(pathname);
-      if (mCounterBoot && method === 'POST') {
-        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+      if (mCounterBoot && (method === 'POST' || method === 'PUT')) {
+        const actor = authPmrOperator(req, cfg);
+        if (!actor && !authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.actor = actor;
         ctx.params = { id: decodeURIComponent(mCounterBoot[1]) };
         ctx.body = await readBody(req);
         return await handlers.counterSetBootTarget(ctx);
       }
       const mCounter = /^\/counters\/([^/]+)$/.exec(pathname);
       if (mCounter && (method === 'PUT' || method === 'PATCH')) {
-        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        // Dual-credential for the SETTINGS half only — see the block above the action route.
+        // Every other field on this route (label, status, notes, vmid…) is unchanged and
+        // still takes the shared admin token.
+        const actor = authPmrOperator(req, cfg);
+        if (!actor && !authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.actor = actor;
         ctx.params = { id: decodeURIComponent(mCounter[1]) };
         ctx.body = await readBody(req);
         return await handlers.counterUpdate(ctx);
@@ -520,18 +925,158 @@ function createServer({ store, config: cfg }) {
       if (mCounter && method === 'DELETE') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.params = { id: decodeURIComponent(mCounter[1]) };
+        // Same as the pharmacy delete: the body carries the typed confirmation (B4).
+        ctx.body = await readBody(req);
         return await handlers.counterDelete(ctx);
       }
 
       // ── Proxmox discovery (admin) ──────────────────────────────────────────
       if (method === 'POST' && pathname === '/proxmox/report') {
-        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        // TWO credentials, and they are NOT equivalent (S9). A per-node token names the
+        // caller, so that caller may be handed jobs and may close its own jobs' results. The
+        // estate master token authenticates the same route — three collectors have shared it
+        // for a long time and inventory must not stop — but it identifies nobody, so a
+        // caller using it gets no jobs and cannot report on any. ctx.executorNode is the
+        // ONLY thing downstream may treat as this caller's identity.
+        const node = authProxmoxNode(req, cfg);
+        if (!node && !authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.executorNode = node;
         ctx.body = await readBody(req);
         return await handlers.proxmoxReport(ctx);
       }
       if (method === 'GET' && pathname === '/proxmox-vms') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
         return await handlers.proxmoxList(ctx);
+      }
+
+      // ── the PMR control plane ──────────────────────────────────────────────
+      // Opening hours, intended state and jobs. Every EXECUTOR path here rides a reply to a
+      // call something already makes outward — the Pi's POST /telemetry and the collector's
+      // POST /proxmox/report — so the only routes registered below are the operator's, plus
+      // ONE device route for a counter to report what it did.
+
+      // ⛔ OPENING HOURS: THE ONE WRITE THAT DECIDES WHAT EVERY OTHER GATE PERMITS (A2).
+      //
+      // Reading them is admin. WRITING them is an OPERATOR act, and the reason is the whole
+      // point of the feature: every interruption path in this service — the job claim, the
+      // nightly pass, the boot-target promoter, the three counter routes — asks
+      // pmr_disruptive_allowed(), and pmr_disruptive_allowed() asks these tables. Hardening
+      // the doors and leaving the lock's own configuration on a shared token and a name typed
+      // into the body means the ceremony can be walked round: mark Tuesday closed, wait for
+      // midnight, and the estate restarts a trading counter with nobody's name on it.
+      //
+      // store.pg.js states the harm in its own words — a stale 'closed' weekday marker on a
+      // day that now trades "makes an unattended restart legal on a trading morning" — so
+      // these three writes take the same credential apply-now takes, the actor comes from the
+      // credential, and the handler asks for the typed site name when the edit would NEWLY
+      // arm the nightly restart on a day that currently forbids it.
+      //
+      // DUAL-CREDENTIAL like the counter routes rather than operator-only: GET must keep
+      // working for the browser holding the shared token, and the dispatch cannot tell a read
+      // from a write for POST/PUT without the method — so ctx.actor is set only for an
+      // operator token and the HANDLER refuses a write without one.
+      const mHours = /^\/pharmacies\/([^/]+)\/hours$/.exec(pathname);
+      if (mHours && method === 'GET') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mHours[1]) };
+        return await handlers.siteHoursGet(ctx);
+      }
+      if (mHours && (method === 'PUT' || method === 'POST')) {
+        const actor = authPmrOperator(req, cfg);
+        if (!actor && !authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.actor = actor;
+        ctx.params = { id: decodeURIComponent(mHours[1]) };
+        ctx.body = await readBody(req);
+        return await handlers.siteHoursSet(ctx);
+      }
+      const mHoursExc = /^\/pharmacies\/([^/]+)\/hours\/exception$/.exec(pathname);
+      if (mHoursExc && (method === 'PUT' || method === 'POST')) {
+        const actor = authPmrOperator(req, cfg);
+        if (!actor && !authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.actor = actor;
+        ctx.params = { id: decodeURIComponent(mHoursExc[1]) };
+        ctx.body = await readBody(req);
+        return await handlers.siteHoursExceptionSet(ctx);
+      }
+      if (mHoursExc && method === 'DELETE') {
+        const actor = authPmrOperator(req, cfg);
+        if (!actor && !authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.actor = actor;
+        ctx.params = { id: decodeURIComponent(mHoursExc[1]) };
+        // ⚠️ A BODY ON A DELETE, and it is read on purpose: the typed site name has to travel
+        // on the wire for the same reason it does everywhere else — a confirmation dialog
+        // that lives only in the browser is not a boundary. on_date stays in the query string.
+        ctx.body = await readBody(req);
+        return await handlers.siteHoursExceptionDelete(ctx);
+      }
+
+      // Intended state (admin) — what Watchman WANTS for a subject.
+      if (method === 'GET' && pathname === '/pmr/intent') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return await handlers.pmrIntentList(ctx);
+      }
+      if ((method === 'PUT' || method === 'POST') && pathname === '/pmr/intent') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return await handlers.pmrIntentSet(ctx);
+      }
+      const mIntent = /^\/pmr\/intent\/([^/]+)$/.exec(pathname);
+      if (mIntent && method === 'DELETE') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mIntent[1]) };
+        return await handlers.pmrIntentDelete(ctx);
+      }
+
+      // POST /pmr/job-result (DEVICE) — a counter Pi reporting what it did. Registered
+      // before the admin job routes so the more specific literal path wins.
+      if (method === 'POST' && pathname === '/pmr/job-result') {
+        const device = await authDevice(req, store);
+        if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.device = device;
+        ctx.body = await readBody(req);
+        return await handlers.pmrJobResult(ctx);
+      }
+
+      // Jobs (admin).
+      if (method === 'GET' && pathname === '/pmr/jobs') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        return await handlers.pmrJobsList(ctx);
+      }
+      if (method === 'POST' && pathname === '/pmr/jobs') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return await handlers.pmrJobCreate(ctx);
+      }
+      // The hours override — "apply it now, and I know it signs the member of staff out".
+      const mJobApply = /^\/pmr\/jobs\/([^/]+)\/apply-now$/.exec(pathname);
+      if (mJobApply && method === 'POST') {
+        // ⚠️ THE ONE ROUTE THAT WILL NOT TAKE THE ADMIN TOKEN (B6/S7). Everything else here
+        // is gated by the shared estate token because everything else is routine. This one
+        // releases a disruptive job during opening hours — it signs a member of staff out of
+        // a live dispensing session — and the row that records it has to name a PERSON. A
+        // name in the request body is not a person; it is a string the browser chose, and
+        // the browser is where the shared token already lives.
+        const actor = authPmrOperator(req, cfg);
+        if (!actor) {
+          return json(res, 401, {
+            ok: false,
+            error: 'apply-now needs a named operator credential (PMR_OPERATOR_TOKENS), not '
+                 + 'the shared admin token — this signs a member of staff out and the '
+                 + 'override is recorded against a person',
+          });
+        }
+        // Set by the dispatch from the CREDENTIAL. The handler must not read `by` from the
+        // body, and does not.
+        ctx.actor = actor;
+        ctx.params = { id: decodeURIComponent(mJobApply[1]) };
+        ctx.body = await readBody(req);
+        return await handlers.pmrJobApplyNow(ctx);
+      }
+      const mJob = /^\/pmr\/jobs\/([^/]+)$/.exec(pathname);
+      if (mJob && method === 'DELETE') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { id: decodeURIComponent(mJob[1]) };
+        return await handlers.pmrJobCancel(ctx);
       }
 
       // ── printers ───────────────────────────────────────────────────────────
@@ -747,18 +1292,34 @@ function createServer({ store, config: cfg }) {
       // GET|POST /devices/:serial/config-jobs (admin) — list / author review-gated config-push
       // jobs. Matched before the bare /devices/:serial route (defence in depth; the bare regex
       // can't match a path with a further /segment anyway).
+      //
+      // ⚠️ DUAL-CREDENTIAL SINCE A6. An operator token names a PERSON and sets ctx.actor; the
+      // shared admin token still authenticates both calls. Which one was used is recorded on
+      // the row (config_jobs.created_by_credential), because the two-person rule on approve
+      // can only be a real rule if BOTH names were proved by a secret rather than typed into
+      // a body. Neither call is refused for holding only the admin token — authoring a draft
+      // serves no router, and refusing here would push the estate onto SSH.
       const mCfgJobs = /^\/devices\/([^/]+)\/config-jobs$/.exec(pathname);
       if (mCfgJobs && (method === 'GET' || method === 'POST')) {
-        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        const actor = authPmrOperator(req, cfg);
+        if (!actor && !authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.actor = actor;
         ctx.params = { serial: decodeURIComponent(mCfgJobs[1]) };
         if (method === 'POST') ctx.body = await readBody(req);
         return method === 'GET' ? handlers.configJobsList(ctx) : handlers.configJobCreate(ctx);
       }
 
-      // POST /config-jobs/:id/approve (admin) — two-person approval of a draft.
+      // POST /config-jobs/:id/approve (admin | OPERATOR) — approval of a draft.
+      //
+      // ⚠️ IT IS A TWO-PERSON RULE ONLY WITH TWO CREDENTIALS (A6). An operator token here
+      // makes the approver a proved person; the shared admin token makes them a name in a
+      // body, and the handler says so on the response (`two_person: false`) instead of
+      // claiming a guarantee it did not obtain.
       const mCfgApprove = /^\/config-jobs\/([^/]+)\/approve$/.exec(pathname);
       if (method === 'POST' && mCfgApprove) {
-        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        const actor = authPmrOperator(req, cfg);
+        if (!actor && !authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.actor = actor;
         ctx.params = { id: decodeURIComponent(mCfgApprove[1]) };
         ctx.body = await readBody(req);
         return await handlers.configJobApprove(ctx);

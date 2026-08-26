@@ -472,7 +472,7 @@ function makeMemStore(_config) {
   // Approve a DRAFT -> 'approved' (the only status a device will pull). Returns the updated
   // row, or null if the job doesn't exist; throws if it isn't a draft (the caller checks
   // status + the two-person rule first, but defend the transition here too).
-  async function approveConfigJob(jobId, approvedBy) {
+  async function approveConfigJob(jobId, approvedBy, approvedByCredential) {
     const job = configJobs.get(jobId);
     if (!job) return null;
     if (job.status !== 'draft') {
@@ -480,6 +480,10 @@ function makeMemStore(_config) {
     }
     job.status = 'approved';
     job.approved_by = approvedBy != null ? approvedBy : null;
+    // Whether that name was PROVED by an operator credential or typed into the body under the
+    // shared admin token (A6). Mirrors the column in store.pg.js; false is the honest default
+    // because an unstated attribution is an unproved one.
+    job.approved_by_credential = approvedByCredential === true;
     job.approved_at = iso();
     return { ...job };
   }

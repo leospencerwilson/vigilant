@@ -11,7 +11,11 @@
 #      (pre-snapshot + dead-man's-switch rollback + Safe-Mode import), then report.
 #
 # IMPORTANT changes vs the old script:
-#   * NO secrets in the payload. The old script sent the PPPoE password — removed.
+#   * The PPPoE password is sent again (slow tick only) ON REQUEST, so support can read the
+#     credential without a second system. It was previously removed as a security fix; it now
+#     rides the slow tick, and the server keeps it OFF the Realtime-published state (stored on
+#     `devices`, stripped from device_state.raw, served masked like the WiFi PSK). No OTHER
+#     secrets are sent.
 #   * Per-device token, not a shared X-API-Key.
 #   * Real per-port byte/packet/error/drop counters → enables throughput graphs.
 #
@@ -184,7 +188,7 @@
 }
 :local lteJson $vigilantLteJson
 
-# WAN / routing (public IP only — NEVER the password)
+# WAN / routing (public IP here; the PPPoE password is read separately, slow-tick only, below)
 :local publicIp "null"
 :do { :local ic [/ip cloud get public-address]; :if ([:len $ic] > 0) do={ :set publicIp $ic } } on-error={}
 :if ($publicIp = "null") do={
@@ -195,6 +199,25 @@
 :if ([:len [/interface find name="pppoe-out1"]] > 0) do={ :set pppoeUp [/interface get [find name="pppoe-out1"] running] }
 :local pppSessions [:len [/ppp active find]]
 :local dhcpLeases  [:len [/ip dhcp-server lease find]]
+
+# ── PPPoE password (SECRET — slow tick only) ─────────────────────────
+# Historically this script sent the PPPoE password, it was removed as a security fix, and it is
+# now re-added ON REQUEST so support can read the credential without a second system. It is a
+# genuine secret, so we treat it carefully: read it ONLY on the slow tick (it never changes
+# between ticks, and reading + shipping it every second is needless exposure) and emit it into
+# the core body ONLY on that same slow tick (below). The server stores it on `devices` (which is
+# NOT Realtime-published and carries no `authenticated` grant) and strips it from
+# device_state.raw, so the secret never rides a Realtime broadcast. as-value is not used; a plain
+# get returns the stored password. Degrades to null on any error / no pppoe-client.
+:local pppoePwJson "null"
+:if ($doSlow) do={
+    :do {
+        :local pcc [/interface/pppoe-client find name="pppoe-out1"]
+        :if ([:len $pcc] > 0) do={
+            :set pppoePwJson ("\"" . [$vigilantClean [/interface/pppoe-client get [:pick $pcc 0] password]] . "\"")
+        }
+    } on-error={ :set pppoePwJson "null" }
+}
 
 # ── L2TP management tunnels (l2tp-CLIENT only) ───────────────────────
 # Emit each OUTBOUND l2tp tunnel this router dials as {name,address,running}. address is the
@@ -543,6 +566,9 @@
 :set core ($core . "\"voltage\":\"" . $volt . "\",\"fan1_speed\":\"" . $fan1 . "\",\"write_sect_total\":\"" . $writeSect . "\",")
 :set core ($core . "\"firmware_current\":\"" . $fwCur . "\",\"firmware_upgrade\":\"" . $fwUpg . "\",\"ntp_synced\":" . $ntpSynced . ",")
 :set core ($core . "\"public_ip\":\"" . $publicIp . "\",\"pppoe_running\":" . $pppoeUp . ",\"ppp_sessions\":" . $pppSessions . ",\"dhcp_leases\":" . $dhcpLeases . ",")
+# PPPoE password: emitted ONLY on the slow tick (see the read above). Omitting the key on fast
+# ticks is a valid partial — the server keeps the previously-stored value when the key is absent.
+:if ($doSlow) do={ :set core ($core . "\"pppoe_password\":" . $pppoePwJson . ",") }
 :set core ($core . "\"l2tp_tunnels\":" . $l2tpJson . ",")
 :set core ($core . "\"lte\":" . $lteJson . "}")
 [$vigilantPost $core "telemetry-core" $vigilantCC]

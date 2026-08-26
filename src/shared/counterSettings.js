@@ -14,17 +14,24 @@
 // The whitelist is CLOSED: an unknown key is an ERROR, not a silently dropped field, so a
 // typo in the UI surfaces at once instead of appearing to save and doing nothing.
 
+// `interrupts: true` marks a key whose CHANGE restarts the kiosk session on the device — i.e.
+// signs the member of staff at that counter out. It is a property of the key, declared here
+// next to the value spec, because that is the one place every layer already reads. See
+// INTERRUPTING_SETTING_KEYS below for what it gates.
 const SPECS = {
   // ── session options — read by the kiosk launcher; a change needs a kiosk restart ──
-  smartcard:         { type: 'bool', default: true },                     // FreeRDP /smartcard
-  printer_redirect:  { type: 'bool', default: true },                     // FreeRDP /printer:...
-  clipboard:         { type: 'bool', default: true },                     // FreeRDP +clipboard
-  bpp:               { type: 'enum', default: 16, values: [16, 24, 32] }, // FreeRDP /bpp:N
+  // Every key in this group carries interrupts: true. If you add one here, add the flag.
+  smartcard:         { type: 'bool', default: true, interrupts: true },   // FreeRDP /smartcard
+  printer_redirect:  { type: 'bool', default: true, interrupts: true },   // FreeRDP /printer:...
+  clipboard:         { type: 'bool', default: true, interrupts: true },   // FreeRDP +clipboard
+  bpp:               { type: 'enum', default: 16, values: [16, 24, 32], interrupts: true }, // /bpp:N
   // 0 does NOT mean "off" here, it means NEVER blank (xset s off -dpms noblank). A counter
   // that blanks mid-consultation is a support call, so never-blank is the default.
-  blank_after_min:   { type: 'int',  default: 0,  min: 0,  max: 120 },
+  blank_after_min:   { type: 'int',  default: 0,  min: 0,  max: 120, interrupts: true },
 
   // ── agent options — applied live by the agent's own loop, no restart ──
+  // No interrupts flag anywhere below: these are picked up by the agent's own loop on the
+  // next tick and the kiosk session never notices.
   report_interval_s: { type: 'int',  default: 30, min: 10, max: 900 },
   // For these two, 0 DISABLES the poll entirely, which is why the floor is 0 rather than
   // the smallest useful cadence.
@@ -62,6 +69,50 @@ const SPECS = {
 };
 
 const COUNTER_SETTING_KEYS = Object.keys(SPECS);
+
+// ── WHICH OF THESE SIGNS A MEMBER OF STAFF OUT (D3) ──────────────────────────
+// The split at the top of SPECS is not cosmetic and it is not documentation: the Pi's
+// apply_settings() writes the SESSION keys into the kiosk conf file and returns "changed",
+// and the caller then restarts the kiosk — deliberately once, folded together with a boot
+// target arriving on the same tick, so the counter is interrupted once and not twice
+// (agent/pi/vigilant-pi-agent.py:1720-1726). THE FOLDING IS RIGHT AND MUST STAY.
+//
+// What was missing is that the WRITE had no gate at all. Saving `bpp` from the edit modal at
+// 11:00 on a trading Tuesday restarted the kiosk at that counter roughly thirty seconds
+// later, with no hours check, no typed confirmation and a `by` the browser chose. The agent
+// keys (report interval, poll cadences, screenshot cadence, relay, VNC minutes) are applied
+// live by the agent's own loop and interrupt nothing, so they must NOT be dragged through
+// the same gate — a support engineer turning screenshots off for a site that has not agreed
+// to them should not have to type a pharmacy name.
+//
+// Derived from SPECS rather than written out twice: a new session option that someone forgot
+// to add here would be a change that signs staff out with no gate, which is precisely the
+// hole being closed.
+const INTERRUPTING_SETTING_KEYS = Object.freeze(
+  COUNTER_SETTING_KEYS.filter((k) => SPECS[k].interrupts === true)
+);
+
+// WHICH KEYS IN THIS SAVE WOULD ACTUALLY INTERRUPT THE COUNTER.
+//
+// ⚠️ IT COMPARES VALUES, IT DOES NOT LIST THE KEYS THAT WERE SENT. The edit modal saves the
+// whole form, so every save carries all five session options — and gating on "the body
+// mentions bpp" would demand a typed pharmacy name to change the printer poll interval. The
+// Pi restarts the kiosk only when the conf file's CONTENT changes, so the server's gate is
+// tied to the same thing: a value that differs from what is stored.
+//
+// `stored` is the raw settings column (defaults NOT merged) and `requested` is the already
+// VALIDATED patch. Both are compared through effectiveCounterSettings so a key that has
+// never been set is compared against the default the device is actually running, not against
+// undefined — otherwise the first-ever save of `smartcard: true` would read as a change on a
+// counter that has had smartcards on all along.
+//
+// Returns the changed key names, in SPECS order. An empty array means this save lands
+// without anybody at that counter noticing.
+function interruptingSettingChanges(stored, requested) {
+  const before = effectiveCounterSettings(stored);
+  const after = effectiveCounterSettings(Object.assign({}, stored, requested || {}));
+  return INTERRUPTING_SETTING_KEYS.filter((k) => before[k] !== after[k]);
+}
 
 const COUNTER_SETTINGS_DEFAULTS = Object.freeze(
   COUNTER_SETTING_KEYS.reduce((acc, k) => { acc[k] = SPECS[k].default; return acc; }, {})
@@ -141,6 +192,8 @@ function effectiveCounterSettings(stored) {
 module.exports = {
   COUNTER_SETTING_KEYS,
   COUNTER_SETTINGS_DEFAULTS,
+  INTERRUPTING_SETTING_KEYS,
+  interruptingSettingChanges,
   validateCounterSettings,
   effectiveCounterSettings,
 };

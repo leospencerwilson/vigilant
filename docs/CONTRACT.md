@@ -121,9 +121,34 @@ log, never crash.
     "smartcard": true, "printer_redirect": true, "clipboard": true,   // kiosk session
     "bpp": 16, "blank_after_min": 0,                                  // 0 = never blank
     "report_interval_s": 30, "printer_every": 15, "discover_every": 8 // agent loop; 0 = off
-  }
+  },
+
+  // kind='counter-pi' only. THE WHOLE EFFECTIVE PRINTER TABLE for this Pi, every tick, like
+  // "settings". The agent renders it to /var/lib/wcn/printers.tab.NEXT and restarts nothing;
+  // the live file is swapped by the counter.printing-promote job, which signs the member of
+  // staff out and is therefore gated on the site's overnight window.
+  //
+  // ⛔ docs/pmr-printer-contract.md IS THE SOURCE OF TRUTH for this format and there are five
+  // owners of it. src/shared/printerQueues.js is the server's copy and the ONLY validator on
+  // this side; it re-runs §2 over the whole effective table and sends NOTHING if any line
+  // fails, because "a table is a SET: refuse it entirely if any line is bad".
+  //
+  // ⛔ ABSENT means the server has no opinion — do nothing. An EMPTY table is never sent:
+  // `printers: []` is defined as "leave the staged file alone" and must NEVER be read as "no
+  // printers here", because the launcher's fallback turns a file with no valid lines back
+  // into a derived set.
+  "printers": [
+    { "queue": "Label-ZD421", "driver": "ZDesigner ZD420-203dpi ZPL", "flags": ["default"] }
+  ]
 }
 ```
+
+`printers` carries exactly three fields per line: `queue` (`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`,
+max 63), `driver` (printable ASCII 1..128, **NO COMMA** — comma is FreeRDP's own field
+separator inside `/printer:`) and `flags` (closed set: `default` only, at most one per table).
+At most 32 queues per Pi. The agent reports back at `peripherals.printers_attached` —
+deliberately NESTED, because a top-level key the ingest does not allowlist would 400 the whole
+telemetry POST and silently stop the counter reporting.
 
 The agent reports back what it has ACTUALLY applied as `settings_applied` in its payload.
 Nothing needs to parse it: the whole raw body is persisted to `device_state.raw`, which
@@ -261,7 +286,54 @@ OFFLINE_AFTER_S=120
 HISTORY_RAW_RETENTION_H=24
 NEIGHBOR_TTL_S=86400
 STORE_KIND=pg            # 'pg' | 'mem'
+
+# ── the PMR control plane ──────────────────────────────────────────────────
+ENABLE_PMR_CONTROL_PLANE=false   # off by default: this pass SIGNS PHARMACY STAFF OUT
+PMR_SUPPORT_INBOX=               # the one alert: "a counter will not open". Unset = nobody is told
+PMR_NIGHTLY_WINDOW_H=1           # how late after LOCAL midnight a missed night may still be scheduled
+PMR_OPENING_LEAD_MIN=60          # how long BEFORE a site opens the verification runs
+
+# ── identities, as opposed to assertions ───────────────────────────────────
+# WHICH NODE is reporting, derived from the credential and never from the request body.
+# The estate master token still authenticates POST /proxmox/report for INVENTORY, but it
+# names nobody, so a caller using it receives NO jobs and may close NO job results.
+PROXMOX_NODE_TOKENS=             # "temeraire:<secret>,node2:<secret>"
+# WHICH PERSON is interrupting a live dispensing session. POST /pmr/jobs/:id/apply-now takes
+# ONLY these — the shared admin token is refused, because a row that records "watchman did
+# it" records nothing. Unset = apply-now is refused outright.
+#
+# ⚠️ AND THE SAME CREDENTIAL NOW GUARDS THE THREE OLDER PATHS THAT CAN DO THE SAME THING.
+# Each takes EITHER token; the operator one is required only for the branch that interrupts,
+# so nothing routine on these routes stops working:
+#   POST /counters/:id/action                'reboot' and 'restart-kiosk' (not restart-agent
+#                                            or clear-failed)
+#   PUT|POST /counters/:id/boot-target       when:"now" only. The DEFAULT, when:"overnight",
+#                                            stages the change and pushes nothing.
+#   PUT|PATCH /counters/:id                  only when the save CHANGES a session setting
+#                                            (smartcard, printer_redirect, clipboard, bpp,
+#                                            blank_after_min). Agent settings are unaffected.
+# On every one of them the actor is taken from the CREDENTIAL and `by` in the body is
+# ignored, and the site's name must be typed into `confirm` when the site is open or its
+# hours do not resolve. Unset = those branches are refused; the rest of each route works.
+PMR_OPERATOR_TOKENS=             # "leo.wilson:<secret>,someone.else:<secret>"
 ```
+
+## Two capability floors, and the deploy order they impose
+
+Handing a job out **is** the claim on both executor paths — it rides a reply to a poll the
+executor already makes, and there is no ack. An executor that cannot parse its job key
+therefore *swallows* the job: pending → claimed → expired, silently. So neither path hands
+out work below a version the executor reports about itself.
+
+| executor | key it must parse | reports | floor | shipped build reports |
+|---|---|---|---|---|
+| counter Pi | `pmr_job` on the `/telemetry` reply | `agent_version` in the telemetry body | `PMR_JOB_AGENT_VERSION` = 2 | 1 — **no jobs are handed out** |
+| Proxmox node | `jobs` on the `/proxmox/report` reply | `collector_version` at the top level of the report body | `PMR_JOB_COLLECTOR_VERSION` = 2 | nothing → read as 0 — **no jobs are handed out** |
+
+Both are the executor's own claim about itself, and that is acceptable because the failure
+direction is "a capable executor is offered no work", never the reverse. The control plane is
+therefore **inert on both paths until the executors ship**, which is the safe order: turn the
+server side on first, watch jobs sit as `pending`, then raise each floor with its build.
 
 ## Tests (must pass under `node --test`, NO external Postgres)
 

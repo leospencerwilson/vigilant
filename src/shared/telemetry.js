@@ -14,6 +14,9 @@
 
 const { z } = require("zod");
 const transform = require("./transform.js");
+// The server-side owner of docs/pmr-printer-contract.md sections 2 and 3. Nothing here
+// restates a rule that file holds.
+const printerQueues = require("./printerQueues.js");
 
 // ─────────────────────────── schema ───────────────────────────
 // Tolerant: most fields optional + nullable, unknown keys ignored. We deliberately
@@ -341,6 +344,24 @@ function normalize(raw) {
     // on every tick — the alert added with it could never fire, and the UI could never show a
     // broken shim. Same trap as the logs line above, hit a second time.
     smartcard_stack: normalizeSmartcardStack(p.smartcard_stack),
+    // ── §3 of docs/pmr-printer-contract.md ──────────────────────────────────
+    // What is actually PLUGGED IN to a counter, at `peripherals.printers_attached`.
+    //
+    // ⚠️ NESTED, AND DELIBERATELY SO — the contract says why: "a top-level key the ingest
+    // does not allowlist would 400 the WHOLE telemetry POST and silently stop the counter
+    // reporting". `peripherals` is already carried through to device_state.raw wholesale, so
+    // the agent needed no ingest change to send it and a new key inside it can never 400 a
+    // tick. This line does not change that; it lifts the printer half OUT of the blob into a
+    // cleaned, bounded shape the store can write to real rows.
+    //
+    // ⚠️ AND THIS LIST IS AN ALLOWLIST — the trap the `logs` and `smartcard_stack` lines
+    // above both record, hit twice already. A field not named here is silently dropped, so
+    // the handler sees undefined and writes nothing. That is exactly why this line exists
+    // rather than the handler reaching into `raw` for itself.
+    //
+    // null (not {}) when the agent said nothing about printers at all, which is every agent
+    // build predating §3.
+    peripheral_printers: printerQueues.normalizePeripheralPrinters(p.peripherals),
     // CHUNKED TELEMETRY: did the raw payload carry a system/core block? When false this is a
     // detail-only chunk and the handler must NOT overwrite device_state with nulls — it only
     // bumps last_seen_at. Computed from raw-key presence (see hasCoreFields), NOT from the

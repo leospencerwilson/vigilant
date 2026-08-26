@@ -1,0 +1,19 @@
+[Unit]
+Description=Run the Vigilant Proxmox collector every 15 minutes
+
+[Timer]
+# 15 minutes matches what is deployed on wcn-dreadnaught and what the Watchman UI tells the reader.
+# ⚠️ Do not shorten this without checking pvedaemon: its default pool is 3 workers, the collector
+# already runs 3 of its own, and a node that is slow to answer holds those slots for the whole pass.
+# Tripling the rate would contend with an engineer running qm or the Proxmox UI on a node that
+# hosts live pharmacy desktops.
+OnBootSec=2min
+OnUnitActiveSec=15min
+# The readings are 1/7/30-day averages; nothing here needs to fire on the second, and letting
+# systemd spread the wakeup keeps it off the node's busy moments.
+AccuracySec=30s
+RandomizedDelaySec=30s
+Unit=vigilant-proxmox-collector.service
+
+[Install]
+WantedBy=timers.target

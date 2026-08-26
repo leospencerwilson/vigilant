@@ -105,7 +105,7 @@ function makePgStore(poolOrConfig) {
       // router), and without it every such caller needs a second query.
       `SELECT id, serial, identity, site_name, customer, model, ros_version, wan_type,
               tags, expected, poll_interval_s, poll_until, agent_version, enrolled_at, notes,
-              kind
+              kind, pppoe_password
          FROM devices
         WHERE serial = $1`,
       [serial]
@@ -1026,10 +1026,14 @@ function makePgStore(poolOrConfig) {
     const sha =
       f.rsc_sha256 != null && f.rsc_sha256 !== '' ? f.rsc_sha256 : transform.sha256Hex(rsc);
     return one(
+      // NINE values for the nine columns. created_by_credential records whether that name was
+      // PROVED by an operator token or typed into the body under the shared admin token — see
+      // the A6 block on the table in db/schema.sql. It defaults FALSE here for the same reason
+      // it defaults false on the column: an unstated attribution is an unproved one.
       `INSERT INTO config_jobs
          (device_id, target_tag, is_canary, kind, rsc_text, rsc_sha256, status,
-          confirm_window_s, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,'draft',$7,$8)
+          confirm_window_s, created_by, created_by_credential)
+       VALUES ($1,$2,$3,$4,$5,$6,'draft',$7,$8,$9)
        RETURNING *`,
       [
         f.device_id || null,
@@ -1040,19 +1044,21 @@ function makePgStore(poolOrConfig) {
         sha,
         f.confirm_window_s != null ? f.confirm_window_s : 300,
         f.created_by || 'unknown',
+        f.created_by_credential === true,
       ]
     );
   }
 
   // Approve a DRAFT -> 'approved'. The WHERE status='draft' guard makes this a no-op (returns
   // null) if the job was already advanced/cancelled, so a double-approve can't reopen it.
-  async function approveConfigJob(jobId, approvedBy) {
+  async function approveConfigJob(jobId, approvedBy, approvedByCredential) {
     return one(
       `UPDATE config_jobs
-          SET status = 'approved', approved_by = $2, approved_at = now()
+          SET status = 'approved', approved_by = $2, approved_at = now(),
+              approved_by_credential = $3
         WHERE id = $1 AND status = 'draft'
         RETURNING *`,
-      [jobId, approvedBy != null ? approvedBy : null]
+      [jobId, approvedBy != null ? approvedBy : null, approvedByCredential === true]
     );
   }
 
@@ -1665,6 +1671,18 @@ function makePgStore(poolOrConfig) {
     );
   }
 
+  // The PPPoE password (a secret) reported on the agent's slow tick. Same write discipline as
+  // setDeviceIdentity: the WHERE ... IS DISTINCT FROM makes an unchanged value a no-op, so the
+  // per-tick fleet load never turns into a write storm. Stored on devices (not device_state) so
+  // it stays off the Realtime publication — the caller must also keep it out of device_state.raw.
+  async function setDevicePppoePassword(deviceId, pw) {
+    return one(
+      `UPDATE devices SET pppoe_password = $2 WHERE id = $1 AND pppoe_password IS DISTINCT FROM $2
+       RETURNING id`,
+      [deviceId, pw == null ? null : String(pw)]
+    );
+  }
+
   // Operator-editable device metadata. `customer` is the one that matters: the audited
   // MikroTik→company link lives in the field app's own database, so Vigilant can only know
   // it if it is written across — which is what makes customer-scoped tag rules possible.
@@ -1888,9 +1906,44 @@ function makePgStore(poolOrConfig) {
 
   // Cascades to counters (FK ON DELETE CASCADE). The Pis' `devices` rows survive —
   // deleting a pharmacy record should not silently unenroll hardware that still exists.
-  async function deletePharmacy(id) {
-    const r = await q(`DELETE FROM pharmacies WHERE id = $1`, [id]);
-    return { deleted: r.rowCount || 0 };
+  // ⚠️ THE TYPED CONFIRMATION IS ENFORCED HERE, IN THE STATEMENT (B4). It used to be
+  // enforced by a `disabled` attribute on a button, which is not a boundary: DELETE
+  // /pharmacies/:id called this unconditionally, and this deleted the row — cascading every
+  // counter, printer, VM registration, hours row and job for a pharmacy that may have been
+  // dispensing at the time. With no user roles anywhere in Watchman, that dialog was the
+  // ONLY thing standing between a mis-click and a live site, so it has to exist on the wire
+  // and be checked by the server.
+  //
+  // Two guards, and they answer different questions:
+  //   confirm  did a human deliberately name THIS site? Compared trimmed and case-folded
+  //            against pharmacies.name inside the DELETE, so there is no window between the
+  //            check and the delete in which the name could change.
+  //   force    a LIVE site needs a second, separate act. Status is a fact about whether
+  //            people are dispensing on it right now; a typed name is not consent to that.
+  //
+  // Returns enough for the caller to say WHICH refusal it was — 404, wrong name, or live —
+  // because "nothing happened" is the answer that gets retried harder.
+  async function deletePharmacy(idOrCode, opts = {}) {
+    const confirm = typeof opts.confirm === 'string' ? opts.confirm : '';
+    const r = await one(
+      `WITH target AS (
+         SELECT id, name, status FROM pharmacies
+          WHERE ($1 ~ '^[0-9]+$' AND id = ($1)::bigint) OR upper(code) = upper($1)
+       ), gone AS (
+         DELETE FROM pharmacies p USING target t
+          WHERE p.id = t.id
+            AND btrim($2) <> ''
+            AND lower(btrim(t.name)) = lower(btrim($2))
+            AND (t.status <> 'live' OR $3::boolean)
+         RETURNING p.id
+       )
+       SELECT (SELECT count(*) FROM target)::int AS found,
+              (SELECT count(*) FROM gone)::int   AS deleted,
+              (SELECT t.name   FROM target t LIMIT 1) AS name,
+              (SELECT t.status FROM target t LIMIT 1) AS status`,
+      [String(idOrCode), confirm, !!opts.force]
+    );
+    return r || { found: 0, deleted: 0, name: null, status: null };
   }
 
   async function listCounters(pharmacyId) {
@@ -1934,9 +1987,38 @@ function makePgStore(poolOrConfig) {
     return updated ? getCounter(id) : null;
   }
 
-  async function deleteCounter(id) {
-    const r = await q(`DELETE FROM counters WHERE id = $1`, [id]);
-    return { deleted: r.rowCount || 0 };
+  // The same boundary as deletePharmacy, for the same reason (B4). Deleting a counter drops
+  // its Pi's link, its boot target, its settings and every job addressed to it.
+  //
+  // A counter has no single obvious name, so THREE spellings are accepted and any of them
+  // counts as having named this counter deliberately: its label, "counter <n>", or
+  // "<SITE CODE> counter <n>". A blank confirmation is never one of them.
+  async function deleteCounter(id, opts = {}) {
+    const confirm = typeof opts.confirm === 'string' ? opts.confirm : '';
+    const r = await one(
+      `WITH target AS (
+         SELECT c.id, c.n, c.label, c.status, p.code AS site_code
+           FROM counters c JOIN pharmacies p ON p.id = c.pharmacy_id
+          WHERE c.id = $1
+       ), gone AS (
+         DELETE FROM counters c USING target t
+          WHERE c.id = t.id
+            AND btrim($2) <> ''
+            AND lower(btrim($2)) IN (
+                  lower(btrim(COALESCE(t.label, ''))),
+                  lower('counter ' || t.n),
+                  lower(t.site_code || ' counter ' || t.n))
+            AND (t.status <> 'live' OR $3::boolean)
+         RETURNING c.id
+       )
+       SELECT (SELECT count(*) FROM target)::int AS found,
+              (SELECT count(*) FROM gone)::int   AS deleted,
+              (SELECT COALESCE(NULLIF(btrim(COALESCE(t.label, '')), ''), 'counter ' || t.n)
+                 FROM target t LIMIT 1) AS name,
+              (SELECT t.status FROM target t LIMIT 1) AS status`,
+      [id, confirm, !!opts.force]
+    );
+    return r || { found: 0, deleted: 0, name: null, status: null };
   }
 
   // Attach an already-created Vigilant device (the Pi) to a counter. Token minting
@@ -2080,16 +2162,101 @@ function makePgStore(poolOrConfig) {
     return getCounter(counter.id);
   }
 
+  // Reshape the flat capacity columns from listPharmacyVms into the one nested object the UI
+  // consumes. Kept as a function rather than inlined because three code paths return this list
+  // (list, attach, detach) and they must not drift apart.
+  //
+  // Postgres returns bigint and numeric as STRINGS to node-postgres — '208734650368' rather
+  // than a number — so every reading is coerced here. Without it the UI compares a string
+  // against a threshold and 88% full sorts below 9%.
+  function shapeVmCapacity(row) {
+    const {
+      // ALIASED at every call site, so the row's own top-level `mem_max_bytes` — which is
+      // COALESCE(capacity, the hypervisor's configured maxmem) and is therefore populated for
+      // VMs with no guest agent — is NOT destructured away into the capacity block. Without a
+      // top-level one the estate's 12 GB server / 6 GB desktop standard cannot be checked at
+      // all on the VMs that have no agent, which is most of them.
+      capacity_cores, capacity_mem_max_bytes,
+      cpu_pct_1d, cpu_pct_7d, cpu_pct_30d,
+      mem_bytes_1d, mem_bytes_7d, mem_bytes_30d, mem_pressure_1d,
+      disk_mount, disk_used_bytes, disk_total_bytes,
+      disk_used_1d, disk_used_7d, disk_used_30d, disk_source,
+      capacity_rrd_error, capacity_sampled_at,
+      ...vm
+    } = row;
+    const n = (x) => (x == null || !Number.isFinite(Number(x)) ? null : Number(x));
+    // sampled_at is NOT NULL in the table, so its absence means the LEFT JOIN found no row at
+    // all: this VM has never been sampled. That is a different fact from "sampled, and the
+    // readings were empty", and only the first may render as "no data yet".
+    if (capacity_sampled_at == null) {
+      vm.capacity = null;
+      return vm;
+    }
+    vm.capacity = {
+      cores: n(capacity_cores),
+      memMaxBytes: n(capacity_mem_max_bytes),
+      cpu: { d1: n(cpu_pct_1d), d7: n(cpu_pct_7d), d30: n(cpu_pct_30d) },
+      mem: { d1: n(mem_bytes_1d), d7: n(mem_bytes_7d), d30: n(mem_bytes_30d) },
+      memPressure1d: n(mem_pressure_1d),
+      // NULL, not zero, when the guest agent could not be asked. VMs 302/303/304 have no agent
+      // and their disk is genuinely unknown; a 0 here would render as an empty healthy disk.
+      disk: disk_source !== 'agent' ? null : {
+        mount: disk_mount == null ? null : String(disk_mount),
+        usedBytes: n(disk_used_bytes),
+        totalBytes: n(disk_total_bytes),
+        source: 'agent',
+        d1: n(disk_used_1d), d7: n(disk_used_7d), d30: n(disk_used_30d),
+      },
+      // Additive to the agreed contract, and load-bearing: several readings above survive a
+      // failed pass by COALESCE, so the UI needs to be able to see how old they are.
+      sampledAt: capacity_sampled_at,
+      // Why the CPU/RAM figures above are the age they are. sampledAt only advances on a pass
+      // that carried an RRD reading, so a stalled sampledAt plus a populated rrdError is the
+      // pair that tells an engineer the RRD path is broken rather than the VM being idle.
+      rrdError: capacity_rrd_error == null ? null : String(capacity_rrd_error),
+    };
+    return vm;
+  }
+
   async function listPharmacyVms(pharmacyId) {
-    return rows(
+    const list = await rows(
+      // The hypervisor columns come through here because this is what the site hub reads —
+      // without them the VM layer is the only one in the section with nothing observed about
+      // it, and `ip` above is DERIVED from the site index rather than seen. guest_ips is the
+      // only reading that reflects what Windows actually did with its address.
+      //
+      // ALIAS `cap`, NOT `pv`: `pv` is already proxmox_vms on the line above, and reusing it
+      // raises 42712 "table name pv specified more than once", which 500s this query on all
+      // three of its callers (list, attach, detach) and takes the site's VMs tab down.
+      //
+      // LEFT JOIN, and it must stay one: a VM with no guest agent legitimately has no capacity
+      // row, and an inner join would make it VANISH from its site rather than show as unknown.
+      //
+      // cap.cores and cap.seen-style columns are ALIASED — an unqualified second `cores` or
+      // `seen_at` in the same SELECT silently wins in the result object (node-postgres keeps
+      // the last), so the UI would start reading the capacity write time as the inventory one.
       `SELECT v.vmid, v.ip, v.role, v.source, v.counter_id, v.address_overridden,
-              pv.name, pv.status, pv.node, pv.template
+              -- The CONFIGURED memory size, from pharmacy_vms_v: the capacity pass's reading
+              -- when there is one, the hypervisor's own maxmem otherwise. NULL means neither
+              -- knows, which the UI must read as "not established" and never as 0.
+              v.mem_max_bytes,
+              pv.name, pv.status, pv.node, pv.template,
+              pv.agent_enabled, pv.agent_ok, pv.agent_error, pv.agent_checked_at,
+              pv.guest_os, pv.guest_ips, pv.onboot, pv.seen_at,
+              cap.cores AS capacity_cores, cap.mem_max_bytes AS capacity_mem_max_bytes,
+              cap.cpu_pct_1d, cap.cpu_pct_7d, cap.cpu_pct_30d,
+              cap.mem_bytes_1d, cap.mem_bytes_7d, cap.mem_bytes_30d, cap.mem_pressure_1d,
+              cap.disk_mount, cap.disk_used_bytes, cap.disk_total_bytes,
+              cap.disk_used_1d, cap.disk_used_7d, cap.disk_used_30d, cap.disk_source,
+              cap.rrd_error AS capacity_rrd_error, cap.sampled_at AS capacity_sampled_at
          FROM pharmacy_vms_v v
          LEFT JOIN proxmox_vms pv ON pv.vmid = v.vmid
+         LEFT JOIN pmr_vm_capacity cap ON cap.vmid = v.vmid
         WHERE v.pharmacy_id = $1
         ORDER BY v.vmid`,
       [pharmacyId]
     );
+    return list.map(shapeVmCapacity);
   }
 
   // Attach an extra VM to a site. ON CONFLICT so re-attaching corrects the address instead
@@ -2145,7 +2312,13 @@ function makePgStore(poolOrConfig) {
          boot_set_at = now(),
          -- Cleared deliberately: until the Pi confirms the NEW target it has not applied it,
          -- and leaving the old timestamp would read as "already done".
-         boot_applied_at = NULL
+         boot_applied_at = NULL,
+         -- ⚠️ AND ANY STAGED CHANGE IS WITHDRAWN (D2). An operator who applies a target now
+         -- has superseded whatever was queued for tonight; leaving it would let the promoter
+         -- overwrite their choice at 22:00 and restart the counter a second time for a
+         -- decision that was already reversed.
+         boot_next_pending = false,
+         boot_next_vmid    = NULL
        FROM resolved
        WHERE c.id = resolved.id AND resolved.ip IS NOT NULL
        RETURNING c.id`,
@@ -2161,11 +2334,121 @@ function makePgStore(poolOrConfig) {
     const updated = await one(
       `UPDATE counters SET
          boot_vmid = NULL, boot_target = NULL, boot_set_by = $2, boot_set_at = now(),
-         boot_applied_at = NULL
+         boot_applied_at = NULL,
+         -- Supersedes anything staged, for the same reason setCounterBootTarget does.
+         boot_next_pending = false, boot_next_vmid = NULL
        WHERE id = $1 RETURNING id`,
       [id, nz(by)]
     );
     return updated ? getCounter(id) : null;
+  }
+
+  // ── the STAGED boot target (D2) ───────────────────────────────────────────
+  // Record the choice and push NOTHING. The live columns are untouched, so the directive on
+  // the next telemetry tick still carries the OLD target and the counter is not interrupted.
+  // promoteCounterBootTargets() below moves it across when the site's gate opens.
+  //
+  // `vmid` null means "stage a return to the site's PMR server" — the staged form of
+  // clearCounterBootTarget. It is distinguished from "nothing staged" by boot_next_pending,
+  // not by a sentinel vmid: see the schema comment for why a magic 0 was refused.
+  //
+  // ⚠️ THE VMID IS RESOLVED HERE TOO, EVEN THOUGH NOTHING IS PUSHED YET. The same B5 shape
+  // setCounterBootTarget has: a vmid outside the site's registered list yields no row, the
+  // UPDATE matches nothing, and the caller reports a refusal. Refusing at STAGE time is the
+  // point — an operator who is told at 11:00 that the VM is not registered can fix it, while
+  // one told at 22:00 by a promoter that silently skipped the row is told by nobody. The
+  // address itself is resolved AGAIN at promotion, so a VM renumbered overnight cannot be
+  // applied from a stale reading.
+  async function stageCounterBootTarget(id, f = {}) {
+    const r = f || {};
+    const wantClear = r.vmid == null;
+    const updated = await one(
+      `WITH ctx AS (
+         SELECT c.id, c.pharmacy_id FROM counters c WHERE c.id = $1
+       ), resolved AS (
+         SELECT ctx.id, v.ip
+           FROM ctx
+           LEFT JOIN pharmacy_vms_v v
+                  ON v.pharmacy_id = ctx.pharmacy_id AND v.vmid = $2
+       )
+       UPDATE counters c SET
+         boot_next_vmid    = $2,
+         boot_next_pending = true,
+         boot_next_by      = $3,
+         boot_next_at      = now()
+       FROM resolved
+       WHERE c.id = resolved.id
+         -- A staged CLEAR needs no VM to resolve; a staged switch does.
+         AND ($4::boolean OR resolved.ip IS NOT NULL)
+       RETURNING c.id`,
+      [id, wantClear ? null : r.vmid, nz(r.by), wantClear]
+    );
+    return updated ? getCounter(id) : null;
+  }
+
+  // Withdraw a staged change. Returns the counter either way when the row exists — nothing
+  // staged is not an error, it is the state the caller asked for.
+  async function cancelCounterBootTargetStage(id, by) {
+    const updated = await one(
+      `UPDATE counters SET
+         boot_next_vmid = NULL, boot_next_pending = false,
+         boot_next_by = $2, boot_next_at = now()
+       WHERE id = $1 RETURNING id`,
+      [id, nz(by)]
+    );
+    return updated ? getCounter(id) : null;
+  }
+
+  // ── THE PROMOTER: one statement, the gate inside it ───────────────────────
+  // Copy every staged boot target whose site's overnight window is open RIGHT NOW into the
+  // live columns. From that moment the ordinary directive carries the new target on the next
+  // tick and the Pi restarts the kiosk — which is the whole point, at an hour when there is
+  // nobody at the counter to notice.
+  //
+  // ⚠️ THE GATE IS EVALUATED INSIDE THE STATEMENT, not read and then acted on. Exactly the
+  // reason the job claim is written this way: the worker is not a singleton, and a
+  // read-then-decide-then-write would let two passes promote (and therefore restart) the
+  // same counter twice. pmr_disruptive_allowed() is the SAME function the job claim gates
+  // on, so a boot target and a session restart can never disagree about when the night is.
+  //
+  // It runs on EVERY worker pass rather than only in the nightly claim, and that is what
+  // makes a site trading until 01:00 work: at 00:30 the gate is shut and nothing moves, at
+  // 01:00 it opens and the next pass promotes. Idempotent — after promotion
+  // boot_next_pending is false, so a second pass matches nothing.
+  //
+  // A staged switch whose VM stopped being registered in the meantime resolves to no address
+  // and is LEFT STAGED rather than applied or discarded: the row stays visible in Watchman
+  // as pending, which is the state that gets somebody to look.
+  async function promoteCounterBootTargets() {
+    const promoted = await rows(
+      `WITH due AS (
+         SELECT c.id, c.pharmacy_id, c.boot_next_vmid,
+                v.ip AS next_ip
+           FROM counters c
+           LEFT JOIN pharmacy_vms_v v
+                  ON c.boot_next_vmid IS NOT NULL
+                 AND v.pharmacy_id = c.pharmacy_id AND v.vmid = c.boot_next_vmid
+          WHERE c.boot_next_pending
+            AND pmr_disruptive_allowed(c.pharmacy_id, now())
+            -- A staged clear (vmid NULL) needs no resolution; a staged switch does.
+            AND (c.boot_next_vmid IS NULL OR v.ip IS NOT NULL)
+       )
+       UPDATE counters c SET
+         boot_vmid   = d.boot_next_vmid,
+         boot_target = CASE WHEN d.boot_next_vmid IS NULL THEN NULL
+                            ELSE d.next_ip || ':3389' END,
+         boot_set_by = COALESCE(c.boot_next_by, 'watchman') || ' (staged)',
+         boot_set_at = now(),
+         -- Cleared for the same reason setCounterBootTarget clears it: until the Pi reports
+         -- the NEW target it has not applied it, and a stale stamp reads as "already done".
+         boot_applied_at   = NULL,
+         boot_next_pending = false,
+         boot_next_vmid    = NULL
+       FROM due d
+        WHERE c.id = d.id
+       RETURNING c.id, c.pharmacy_id, c.boot_vmid, c.boot_target`
+    );
+    return { promoted: promoted.length, counters: promoted };
   }
 
   // ── editable per-thin-client options ───────────────────────────────────────
@@ -2637,6 +2920,953 @@ function makePgStore(poolOrConfig) {
     return { printers: uniq.length };
   }
 
+  // ── THE PRINTER MODEL (docs/pmr-printer-contract.md §1) ────────────────────
+  //
+  // ⛔ The four objects live in pmr_printer_devices / pmr_printer_queues /
+  // pmr_printer_assignments; `printers` above is the DISCOVERY feed and is untouched by
+  // everything below. See the block above those tables in db/schema.sql for why both exist.
+  //
+  // ⚠️ THE RULES ARE NOT RESTATED HERE. Every §2 check is src/shared/printerQueues.js's, and
+  // it is handed IN to the write paths as `checkSite` so the validation and the write happen
+  // inside ONE transaction. That is not ceremony: two operators saving queues on the same
+  // counter at the same time would otherwise each validate a table neither of them ends up
+  // with, and §2's "refuse it entirely if any line is bad" would be enforced against a
+  // snapshot rather than against what the Pi is actually sent.
+
+  // What the Pi is reporting is PLUGGED IN (§3). Written from the telemetry tick and from
+  // nothing else — an operator never types one of these in.
+  //
+  // The identity key is computed here from fields the caller has already cleaned, because
+  // the two USB kinds are mechanical:
+  //   a usable serial  -> 'usb-serial:<serial>'          survives a rename AND a move
+  //   no usable serial -> 'usb-path:<counter>:<path>'    does not survive a move, and says so
+  // WHICH serials are usable is a JS decision (printerQueues.usableSerial) — whole production
+  // runs ship the same placeholder string, and one of those becoming a key would merge two
+  // physical printers into one row.
+  async function reportCounterPrinters(deviceId, records) {
+    if (!isUuid(deviceId)) return { printers_attached: 0 };
+    const counter = await one(
+      `SELECT id, pharmacy_id FROM counters WHERE pi_device_id = $1`, [deviceId]
+    );
+    if (!counter) return { printers_attached: 0 };
+    const list = Array.isArray(records) ? records : [];
+    const keyOfRec = (r) => (r.usable_serial
+      ? `usb-serial:${String(r.usable_serial).toLowerCase()}`
+      : `usb-path:${counter.id}:${String(r.usb_path).toLowerCase()}`);
+    // Deduped on the identity the row will be stored under, so two interfaces of one device
+    // cannot produce two rows and then fight over the same ON CONFLICT target inside one
+    // statement — Postgres rejects that outright ("cannot affect row a second time").
+    const uniq = dedupeBy(list.filter((r) => r && r.usb_path), keyOfRec);
+    if (!uniq.length) return { printers_attached: 0, counter_id: counter.id };
+    await tx(async (client) => {
+      await bulkInsert(
+        client,
+        `INSERT INTO pmr_printer_devices (pharmacy_id, identity_kind, identity_key,
+                                          device_serial, device_usb_path, host_counter_id,
+                                          vendor_id, product_id, manufacturer, product,
+                                          raw_serial, protocol, status, observed_queue,
+                                          last_seen_at)`,
+        `ON CONFLICT (pharmacy_id, identity_key) DO UPDATE SET
+           host_counter_id = EXCLUDED.host_counter_id,
+           device_usb_path = EXCLUDED.device_usb_path,
+           vendor_id       = COALESCE(EXCLUDED.vendor_id,    pmr_printer_devices.vendor_id),
+           product_id      = COALESCE(EXCLUDED.product_id,   pmr_printer_devices.product_id),
+           manufacturer    = COALESCE(EXCLUDED.manufacturer, pmr_printer_devices.manufacturer),
+           product         = COALESCE(EXCLUDED.product,      pmr_printer_devices.product),
+           raw_serial      = COALESCE(EXCLUDED.raw_serial,   pmr_printer_devices.raw_serial),
+           protocol        = COALESCE(EXCLUDED.protocol,     pmr_printer_devices.protocol),
+           status          = EXCLUDED.status,
+           observed_queue  = EXCLUDED.observed_queue,
+           last_seen_at    = now()`,
+        14,
+        uniq.map((r) => [
+          counter.pharmacy_id,
+          r.usable_serial ? 'usb-serial' : 'usb-path',
+          keyOfRec(r),
+          nz(r.usable_serial),
+          String(r.usb_path),
+          counter.id,
+          nz(r.vendor_id), nz(r.product_id), nz(r.manufacturer), nz(r.product),
+          nz(r.serial), nz(r.protocol), nz(r.status), nz(r.queue),
+        ]),
+        placeholders(14, 'now()')
+      );
+    });
+    return { printers_attached: uniq.length, counter_id: counter.id };
+  }
+
+  async function listPrinterDevices(pharmacyId) {
+    if (pharmacyId == null) {
+      return rows(`SELECT * FROM pmr_printer_devices ORDER BY pharmacy_id, identity_key`, []);
+    }
+    return rows(
+      `SELECT * FROM pmr_printer_devices WHERE pharmacy_id = $1 ORDER BY identity_key`,
+      [pharmacyId]
+    );
+  }
+
+  // The INTENDED queues for a site, with the assignment attached by the key they share.
+  //
+  // ⭐ (counter_id, queue) is the join, because a queue name is unique ON ONE PI and not
+  // across a site — two counters may each hold a queue called `Label`, and joining on the
+  // name alone would cross-share their assignments.
+  async function listPrinterQueues(pharmacyId) {
+    const where = pharmacyId == null ? '' : 'WHERE q.pharmacy_id = $1';
+    return rows(
+      `SELECT q.id, q.pharmacy_id, q.counter_id, q.device_id, q.device_serial,
+              q.device_usb_path, q.device_address, q.queue, q.driver, q.flags,
+              q.notes, q.set_by, q.created_at, q.updated_at,
+              a.vmids AS assigned_vmids,
+              c.n     AS counter_n,
+              c.label AS counter_label
+         FROM pmr_printer_queues q
+         LEFT JOIN pmr_printer_assignments a
+                ON a.counter_id = q.counter_id AND a.queue = q.queue
+         LEFT JOIN counters c ON c.id = q.counter_id
+         ${where}
+        ORDER BY q.counter_id, q.queue`,
+      pharmacyId == null ? [] : [pharmacyId]
+    );
+  }
+
+  // Every counter's EFFECTIVE table at one site, as Map(counter_id -> [lines]). This is what
+  // the write paths re-validate and what the tick sends; ONE definition, in
+  // pmr_counter_printer_table_v.
+  async function siteEffectiveTables(client, pharmacyId) {
+    const r = await client.query(
+      `SELECT counter_id, host_counter_id, queue, driver, flags
+         FROM pmr_counter_printer_table_v
+        WHERE pharmacy_id = $1
+        ORDER BY counter_id, is_local DESC, queue`,
+      [pharmacyId]
+    );
+    const byCounter = new Map();
+    for (const row of r.rows) {
+      if (!byCounter.has(row.counter_id)) byCounter.set(row.counter_id, []);
+      byCounter.get(row.counter_id).push({
+        queue: row.queue,
+        driver: row.driver,
+        flags: Array.isArray(row.flags) ? row.flags : [],
+        host_counter_id: row.host_counter_id,
+      });
+    }
+    return byCounter;
+  }
+
+  // WHICH COUNTERS' TABLES ACTUALLY CHANGED.
+  //
+  // The reason this is computed rather than assumed: promoting a table SIGNS A MEMBER OF
+  // STAFF OUT (§4), so a save that changes counter 1's table must not queue a sign-out at
+  // counters 2 and 3 as well. The set is taken BEFORE and AFTER the write inside the same
+  // transaction and compared line for line — including the flags and the ORDER, because the
+  // order sets the /printer: flag order the launcher emits and printers.tab is compared byte
+  // for byte on the device.
+  function tableFingerprints(byCounter) {
+    const out = new Map();
+    for (const [counterId, lines] of byCounter.entries()) {
+      out.set(counterId, lines.map((l) => `${l.queue}\t${l.driver}\t${(l.flags || []).join(',')}`).join('\n'));
+    }
+    return out;
+  }
+
+  function changedCounters(before, after) {
+    const changed = [];
+    const ids = new Set([...before.keys(), ...after.keys()]);
+    for (const id of ids) {
+      if ((before.get(id) || '') !== (after.get(id) || '')) changed.push(id);
+    }
+    return changed.sort((a, b) => a - b);
+  }
+
+  // ⛔ THE WHOLE-TABLE CHECK, RUN OVER EVERY COUNTER AT THE SITE, INSIDE THE WRITE.
+  //
+  // Not just the counter being edited: a queue built on counter 1 and shared to counter 2's
+  // desktop lands in counter 2's table, so a save on 1 can only be judged by looking at 2.
+  // That is also the case that produces the interesting refusal — both counters holding a
+  // queue called `Label` is the NORMAL pattern (§1), and sharing one onto the other's desk
+  // puts two `Label` lines in one table, which §2 refuses for the whole table.
+  //
+  // `checkSite(counterId, lines)` is printerQueues.validatePrinterTable, passed in by the
+  // caller. Throwing rolls the transaction back, so a refused table is never written.
+  async function assertSiteTablesValid(client, pharmacyId, checkSite) {
+    if (typeof checkSite !== 'function') return;
+    const tables = await siteEffectiveTables(client, pharmacyId);
+    for (const [counterId, lines] of tables.entries()) {
+      const verdict = checkSite(counterId, lines);
+      if (verdict && verdict.ok === false) {
+        const err = new Error(verdict.error);
+        err.code = 'PRINTER_TABLE_REFUSED';
+        err.counter_id = counterId;
+        throw err;
+      }
+    }
+  }
+
+  // Create or edit ONE intended queue. `id` present = edit that row; absent = upsert by the
+  // key the contract gives us, (counter_id, queue).
+  //
+  // Returns null when the subject does not resolve — the counter does not exist, or it
+  // belongs to another pharmacy. REFUSED rather than guessed at, exactly as
+  // setCounterBootTarget refuses a vmid outside the site's registered list.
+  async function upsertPrinterQueue(f = {}, checkSite) {
+    const pharmacyId = Number(f.pharmacy_id);
+    const counterId = Number(f.counter_id);
+    if (!Number.isInteger(pharmacyId) || !Number.isInteger(counterId)) return null;
+    return tx(async (client) => {
+      const counter = (await client.query(
+        `SELECT id FROM counters WHERE id = $1 AND pharmacy_id = $2`, [counterId, pharmacyId]
+      )).rows[0];
+      if (!counter) return null;
+      const before = tableFingerprints(await siteEffectiveTables(client, pharmacyId));
+
+      // Link the queue to the physical device when one is visible, so a rename later is a
+      // rename and not a new printer. Matched on the identity columns in the order §1 ranks
+      // them; a queue with no match is perfectly legal and keeps device_id NULL.
+      const device = (await client.query(
+        `SELECT id FROM pmr_printer_devices
+          WHERE pharmacy_id = $1
+            AND (($2::text IS NOT NULL AND device_serial = $2)
+              OR ($3::text IS NOT NULL AND device_address = $3)
+              OR ($4::text IS NOT NULL AND host_counter_id = $5 AND device_usb_path = $4))
+          ORDER BY (device_serial IS NOT NULL AND device_serial = $2) DESC
+          LIMIT 1`,
+        [pharmacyId, nz(f.device_serial), nz(f.device_address), nz(f.device_usb_path), counterId]
+      )).rows[0];
+
+      // ELEVEN values for the eleven columns below. Counted against the placeholder list on
+      // both statements — this file has twice shipped an INSERT whose bound values and $n
+      // list disagreed, and both times it was a column added to one side only.
+      const args = [
+        pharmacyId, counterId, device ? device.id : null,
+        nz(f.device_serial), nz(f.device_usb_path), nz(f.device_address),
+        f.queue, f.driver, f.flags || [], nz(f.notes), nz(f.by) || 'watchman',
+      ];
+      // ⛔ THE COLLISION THE TABLE VALIDATOR NEVER GETS TO SEE (B1). Renaming a queue onto a
+      // name already held on that counter violates UNIQUE (counter_id, queue) INSIDE the
+      // UPDATE — before assertSiteTablesValid() runs, and before the duplicate could be
+      // reported as the whole-table refusal it really is. Postgres raises 23505, nothing in
+      // this file caught it, and an operator retyping a name got a 500.
+      //
+      // Turned into the SAME error shape the whole-table check throws, so both duplicates —
+      // the one caught here and the one caught by §2 across a site's shared queues — reach the
+      // caller as one 409 with one sentence, and the handler needs no second branch.
+      //
+      // 23505 is caught rather than pre-checked with a SELECT: a pre-check is a race, and this
+      // path already runs inside a transaction whose whole job is to make the write and its
+      // validation atomic.
+      const asRefusal = (err) => {
+        if (!err || err.code !== '23505') return err;
+        const refusal = new Error(
+          `counter ${counterId} already has a queue called ${JSON.stringify(f.queue)} — §2: a `
+          + 'duplicate queue name is refused for the WHOLE table. Rename or remove the '
+          + 'existing one first; two lines for one queue would emit two /printer: flags '
+          + 'naming the same Windows printer.'
+        );
+        refusal.code = 'PRINTER_TABLE_REFUSED';
+        refusal.counter_id = counterId;
+        return refusal;
+      };
+
+      let saved;
+      if (f.id != null && Number.isInteger(Number(f.id))) {
+        // $1..$11 are `args`; $12 is the row id appended below. Twelve in, twelve bound.
+        //
+        // ⚠️ THIS IS THE ARM THAT CAN HIT 23505. The INSERT arm below carries ON CONFLICT
+        // (counter_id, queue) DO UPDATE and therefore cannot; a RENAME has no such clause,
+        // because "make this row be called X" and "merge this row into the existing X" are
+        // different instructions and silently doing the second would lose a queue.
+        try {
+          saved = (await client.query(
+            `UPDATE pmr_printer_queues SET
+               counter_id = $2, device_id = $3, device_serial = $4, device_usb_path = $5,
+               device_address = $6, queue = $7, driver = $8, flags = $9::text[],
+               notes = $10, set_by = $11
+              WHERE id = $12 AND pharmacy_id = $1
+             RETURNING *`,
+            [...args, Number(f.id)]
+          )).rows[0];
+        } catch (err) {
+          throw asRefusal(err);
+        }
+        if (!saved) return null;
+      } else {
+        saved = (await client.query(
+          `INSERT INTO pmr_printer_queues
+             (pharmacy_id, counter_id, device_id, device_serial, device_usb_path,
+              device_address, queue, driver, flags, notes, set_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::text[],$10,$11)
+           ON CONFLICT (counter_id, queue) DO UPDATE SET
+             device_id       = EXCLUDED.device_id,
+             device_serial   = EXCLUDED.device_serial,
+             device_usb_path = EXCLUDED.device_usb_path,
+             device_address  = EXCLUDED.device_address,
+             driver          = EXCLUDED.driver,
+             flags           = EXCLUDED.flags,
+             notes           = COALESCE(EXCLUDED.notes, pmr_printer_queues.notes),
+             set_by          = EXCLUDED.set_by
+           RETURNING *`,
+          args
+        )).rows[0];
+      }
+      await assertSiteTablesValid(client, pharmacyId, checkSite);
+      const after = tableFingerprints(await siteEffectiveTables(client, pharmacyId));
+      return Object.assign({}, saved, { changed_counters: changedCounters(before, after) });
+    });
+  }
+
+  // Removing a queue cannot introduce a duplicate or a second default, but the site's tables
+  // are re-validated anyway: the check is cheap, and having exactly one place where a write
+  // can leave an invalid table is worth more than skipping it here.
+  async function deletePrinterQueue(id, checkSite) {
+    if (!Number.isInteger(Number(id))) return { deleted: 0 };
+    return tx(async (client) => {
+      const row = (await client.query(
+        `SELECT id, pharmacy_id FROM pmr_printer_queues WHERE id = $1`, [Number(id)]
+      )).rows[0];
+      if (!row) return { deleted: 0 };
+      const before = tableFingerprints(await siteEffectiveTables(client, row.pharmacy_id));
+      const gone = (await client.query(
+        `DELETE FROM pmr_printer_queues WHERE id = $1
+         RETURNING id, pharmacy_id, counter_id, queue`,
+        [Number(id)]
+      )).rows[0];
+      if (!gone) return { deleted: 0 };
+
+      // ⛔ AND THE ASSIGNMENT GOES WITH IT (B6). pmr_printer_assignments is keyed by
+      // (counter_id, queue) with no foreign key to this row — deliberately, because §1 says a
+      // NAME is not an identity and an assignment must survive the discovery row being
+      // re-created. But the consequence, unhandled, was that deleting a queue left its share
+      // set orphaned under the same name: re-creating a queue called `Label` on the same
+      // counter silently INHERITED whatever desktops the old one had been shared to, and the
+      // person creating it saw a new queue that was already on somebody's screen.
+      //
+      // CLEARED, NOT DOCUMENTED. The alternative was to say so in the delete response and
+      // leave the row, and that is the worse of the two: an inherited share is invisible in
+      // the UI at the moment it matters (creating the queue), so a sentence on a response
+      // nobody reads a week earlier does not prevent it. "No opinion" is the correct state
+      // after a delete, and setPrinterAssignment() already treats a missing row as exactly
+      // that, so the state is reachable again the moment somebody wants it.
+      //
+      // Inside the same transaction as the delete: a queue that is gone and a share set that
+      // survives it is precisely the half-applied state this rollback protects against.
+      const orphaned = await client.query(
+        `DELETE FROM pmr_printer_assignments WHERE counter_id = $1 AND queue = $2
+         RETURNING vmids`,
+        [gone.counter_id, gone.queue]
+      );
+
+      await assertSiteTablesValid(client, gone.pharmacy_id, checkSite);
+      const after = tableFingerprints(await siteEffectiveTables(client, gone.pharmacy_id));
+      return {
+        deleted: 1,
+        queue: gone,
+        // What was cleared with it, so the response can say so rather than the operator
+        // discovering it by finding the printer gone from a desktop.
+        assignment_cleared: orphaned.rowCount > 0,
+        assignment_was_shared_to: orphaned.rows[0] ? orphaned.rows[0].vmids : null,
+        changed_counters: changedCounters(before, after),
+      };
+    });
+  }
+
+  // ── the assignment (§1: queue -> desktop) ─────────────────────────────────
+  // Keyed by (counter_id, queue) — NOT by a printers row id, because §1 says a name is not an
+  // identity and a discovery row id can name a queue that no longer exists. `printer_id` is
+  // stored as a HINT when the caller happens to have one.
+  //
+  // vmids null CLEARS the row, which is the only way to say "no opinion" again after having
+  // said something; [] is stored and means "shared to nothing". Two different instructions,
+  // both reachable.
+  //
+  // Returns null when the counter does not resolve.
+  async function setPrinterAssignment(f = {}, checkSite) {
+    const counterId = Number(f.counter_id);
+    if (!Number.isInteger(counterId)) return null;
+    return tx(async (client) => {
+      const counter = (await client.query(
+        `SELECT id, pharmacy_id FROM counters WHERE id = $1`, [counterId]
+      )).rows[0];
+      if (!counter) return null;
+      const before = tableFingerprints(await siteEffectiveTables(client, counter.pharmacy_id));
+
+      let saved = null;
+      if (f.vmids === null || f.vmids === undefined) {
+        await client.query(
+          `DELETE FROM pmr_printer_assignments WHERE counter_id = $1 AND queue = $2`,
+          [counterId, f.queue]
+        );
+      } else {
+        // SIX values for the six columns; set_at is the column's own default on insert and
+        // now() on update.
+        saved = (await client.query(
+          `INSERT INTO pmr_printer_assignments
+             (pharmacy_id, counter_id, queue, printer_id, vmids, set_by)
+           VALUES ($1,$2,$3,$4,$5::int[],$6)
+           ON CONFLICT (counter_id, queue) DO UPDATE SET
+             pharmacy_id = EXCLUDED.pharmacy_id,
+             printer_id  = COALESCE(EXCLUDED.printer_id, pmr_printer_assignments.printer_id),
+             vmids       = EXCLUDED.vmids,
+             set_by      = EXCLUDED.set_by,
+             set_at      = now()
+           RETURNING *`,
+          [counter.pharmacy_id, counterId, f.queue,
+            f.printer_id == null ? null : Number(f.printer_id),
+            f.vmids, nz(f.by) || 'watchman']
+        )).rows[0];
+      }
+      // The assignment decides which counters' tables a queue lands in, so this check matters
+      // MORE here than on the queue write itself.
+      await assertSiteTablesValid(client, counter.pharmacy_id, checkSite);
+      const after = tableFingerprints(await siteEffectiveTables(client, counter.pharmacy_id));
+      return {
+        counter_id: counterId,
+        pharmacy_id: counter.pharmacy_id,
+        queue: f.queue,
+        vmids: saved ? saved.vmids : null,
+        assignment: saved,
+        // The counters whose EFFECTIVE table this changed. Promotion signs a member of staff
+        // out, so only these get a job — a save on counter 1 must not restart counters 2 and 3.
+        changed_counters: changedCounters(before, after),
+      };
+    });
+  }
+
+  async function listPrinterAssignments(pharmacyId) {
+    return rows(
+      `SELECT * FROM pmr_printer_assignments WHERE pharmacy_id = $1 ORDER BY counter_id, queue`,
+      [Number(pharmacyId)]
+    );
+  }
+
+  // ── what the tick sends (§2) ──────────────────────────────────────────────
+  // The EFFECTIVE table for ONE Pi. Returns [] when this device is not a counter Pi or the
+  // site intends no queues for it — the CALLER decides what an empty set means on the wire,
+  // and §2 is unambiguous that it must not be sent as `printers: []`.
+  async function getCounterPrinterTableForDevice(deviceId) {
+    if (!isUuid(deviceId)) return [];
+    return rows(
+      `SELECT queue, driver, flags, host_counter_id, is_local
+         FROM pmr_counter_printer_table_v
+        WHERE pi_device_id = $1
+        ORDER BY is_local DESC, queue`,
+      [deviceId]
+    );
+  }
+
+  // Is a staged printer table waiting at this counter? Read from the Pi's own telemetry
+  // (§3's print_tab_pending), which is what "needs a session restart at this counter" means.
+  // Tri-state: null when the agent has never reported it.
+  async function getCounterPrintTabState(counterId) {
+    return one(
+      `SELECT c.id AS counter_id, c.pharmacy_id, c.pi_device_id,
+              (ds.raw -> 'peripherals' ->> 'print_tab_pending')::boolean AS print_tab_pending,
+              ds.raw -> 'peripherals' -> 'print_tab_live' AS print_tab_live,
+              ds.raw -> 'peripherals' -> 'print_tab_next' AS print_tab_next,
+              ds.last_seen_at
+         FROM counters c
+         LEFT JOIN device_state ds ON ds.device_id = c.pi_device_id
+        WHERE c.id = $1`,
+      [Number(counterId)]
+    );
+  }
+
+  // ── the site build lifecycle ──────────────────────────────────────────────
+  // Both reads answer null when nothing is held, and the HANDLER always emits the key: the
+  // front end does `r.capture ?? null`, so an omitted key becomes a confident "no capture
+  // held" instead of "we could not tell".
+  async function getSiteCapture(pharmacyId) {
+    return one(`SELECT * FROM pmr_site_captures WHERE pharmacy_id = $1`, [Number(pharmacyId)]);
+  }
+
+  // NINE values for the nine columns. Every tri-state is written straight through, so a NULL
+  // from the capture tool stays NULL — "we did not establish it" is not "no".
+  async function setSiteCapture(pharmacyId, f = {}) {
+    return one(
+      `INSERT INTO pmr_site_captures
+         (pharmacy_id, started_at, uploaded_at, source_hostname, disk_gb,
+          guest_agent_installed, printers_cleared, taken_by, out_of_hours)
+       VALUES ($1, COALESCE($2::timestamptz, now()), $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (pharmacy_id) DO UPDATE SET
+         started_at            = COALESCE(EXCLUDED.started_at, pmr_site_captures.started_at),
+         uploaded_at           = COALESCE(EXCLUDED.uploaded_at, pmr_site_captures.uploaded_at),
+         source_hostname       = COALESCE(EXCLUDED.source_hostname, pmr_site_captures.source_hostname),
+         disk_gb               = COALESCE(EXCLUDED.disk_gb, pmr_site_captures.disk_gb),
+         guest_agent_installed = COALESCE(EXCLUDED.guest_agent_installed, pmr_site_captures.guest_agent_installed),
+         printers_cleared      = COALESCE(EXCLUDED.printers_cleared, pmr_site_captures.printers_cleared),
+         taken_by              = COALESCE(EXCLUDED.taken_by, pmr_site_captures.taken_by),
+         out_of_hours          = COALESCE(EXCLUDED.out_of_hours, pmr_site_captures.out_of_hours)
+       RETURNING *`,
+      [Number(pharmacyId), nz(f.started_at), nz(f.uploaded_at), nz(f.source_hostname),
+        nz(f.disk_gb), nz(f.guest_agent_installed), nz(f.printers_cleared),
+        nz(f.taken_by), nz(f.out_of_hours)]
+    );
+  }
+
+  // ── the site row as a PROJECTION of the role runs ─────────────────────────
+  // ⛔ WHY THIS IS NOT setSiteCapture. That one COALESCEs every field, so a tool reporting a
+  // fragment cannot erase an earlier report — correct for a tool, and WRONG for a projection.
+  // A roll-up that recomputes printers_cleared as "not established" MUST be able to clear a
+  // stale true; otherwise pmr_site_captures keeps handing a build checklist an all-clear that
+  // the runs underneath it no longer support, which is the exact false negative the tri-states
+  // exist to prevent.
+  //
+  // started_at is still COALESCEd: it is the moment the FIRST capture at this site began, and
+  // a recomputation must not move it later.
+  async function setSiteCaptureRollUp(pharmacyId, f = {}) {
+    return one(
+      `INSERT INTO pmr_site_captures
+         (pharmacy_id, started_at, uploaded_at, source_hostname, disk_gb,
+          guest_agent_installed, printers_cleared, taken_by, out_of_hours)
+       VALUES ($1, COALESCE($2::timestamptz, now()), $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (pharmacy_id) DO UPDATE SET
+         started_at            = LEAST(pmr_site_captures.started_at,
+                                       COALESCE(EXCLUDED.started_at, pmr_site_captures.started_at)),
+         uploaded_at           = EXCLUDED.uploaded_at,
+         source_hostname       = EXCLUDED.source_hostname,
+         disk_gb               = EXCLUDED.disk_gb,
+         guest_agent_installed = EXCLUDED.guest_agent_installed,
+         printers_cleared      = EXCLUDED.printers_cleared,
+         taken_by              = EXCLUDED.taken_by,
+         out_of_hours          = EXCLUDED.out_of_hours
+       RETURNING *`,
+      [Number(pharmacyId), nz(f.started_at), nz(f.uploaded_at), nz(f.source_hostname),
+        nz(f.disk_gb), nz(f.guest_agent_installed), nz(f.printers_cleared),
+        nz(f.taken_by), nz(f.out_of_hours)]
+    );
+  }
+
+  async function getSiteImport(pharmacyId) {
+    return one(`SELECT * FROM pmr_site_imports WHERE pharmacy_id = $1`, [Number(pharmacyId)]);
+  }
+
+  // EIGHT values for the nine columns: last_poll_at is now() on both arms and is never taken
+  // from the caller.
+  //
+  // ⚠️ last_poll_at IS STAMPED ON EVERY REPORT, whatever else the executor said. It is the
+  // only thing separating a running import from a dead one — the executor polls OUTWARD, so
+  // nothing here can ask — and an import that stopped reporting must go quiet in the data
+  // rather than keep a stale "running" that looks alive.
+  async function setSiteImport(pharmacyId, f = {}) {
+    return one(
+      `INSERT INTO pmr_site_imports
+         (pharmacy_id, state, pct, node, vmid, started_at, finished_at, error, last_poll_at)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()), $7, $8, now())
+       ON CONFLICT (pharmacy_id) DO UPDATE SET
+         state        = EXCLUDED.state,
+         pct          = EXCLUDED.pct,
+         node         = COALESCE(EXCLUDED.node, pmr_site_imports.node),
+         vmid         = COALESCE(EXCLUDED.vmid, pmr_site_imports.vmid),
+         started_at   = COALESCE(pmr_site_imports.started_at, EXCLUDED.started_at),
+         finished_at  = CASE WHEN EXCLUDED.state IN ('done','failed')
+                             THEN COALESCE(EXCLUDED.finished_at, now())
+                             ELSE NULL END,
+         error        = EXCLUDED.error,
+         last_poll_at = now()
+       RETURNING *`,
+      [Number(pharmacyId), f.state, nz(f.pct), nz(f.node), nz(f.vmid),
+        nz(f.started_at), nz(f.finished_at), nz(f.error)]
+    );
+  }
+
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // THE CAPTURE KIT'S CREDENTIALS
+  // ══════════════════════════════════════════════════════════════════════════
+  //
+  // ⛔ THE CAPTURE TOOL CARRIES NO SUPABASE KEY AND NO ESTATE TOKEN. It runs on a pharmacy's
+  // own PC. What it carries is a short-lived scoped token with exactly three capabilities,
+  // minted from a site-bound ticket, and Vigilant does every CRM read server-side on its
+  // behalf. See src/shared/captureToken.js for the lifetimes and the reasoning.
+
+  // Issue a ticket. The caller has ALREADY judged the out-of-hours window (the handler asks
+  // openingHours through captureToken.judgeCaptureWindow) — this writes the decision down.
+  // expires_at arrives pre-clamped to the site's closed window; it is not recomputed here,
+  // because two implementations of "when does this pharmacy open" is one more than nobody can
+  // get wrong.
+  async function createCaptureTicket(pharmacyId, f = {}) {
+    return one(
+      `INSERT INTO pmr_capture_tickets
+         (pharmacy_id, secret_hash, issued_by, expires_at, window_closes_at, redeem_max, note)
+       VALUES ($1, $2, $3, $4::timestamptz, $5::timestamptz, COALESCE($6, 12), $7)
+       RETURNING *`,
+      [Number(pharmacyId), String(f.secret_hash), String(f.issued_by),
+        f.expires_at, nz(f.window_closes_at), nz(f.redeem_max), nz(f.note)]
+    );
+  }
+
+  async function listCaptureTickets(pharmacyId) {
+    // ⛔ secret_hash IS NOT SELECTED. Not because a hash is a credential — it is not — but
+    // because the moment it appears in a list payload someone will build a lookup on it, and
+    // the property that makes this safe is that nothing but the redeem statement ever touches
+    // it.
+    return rows(
+      `SELECT id, pharmacy_id, issued_by, issued_at, expires_at, window_closes_at,
+              redeem_max, redeem_count, last_redeemed_at, revoked_at, revoked_by, note
+         FROM pmr_capture_tickets
+        WHERE pharmacy_id = $1
+        ORDER BY issued_at DESC
+        LIMIT 50`,
+      [Number(pharmacyId)]
+    );
+  }
+
+  // Revoking is the kill switch: it stops future redemptions AND kills every token the ticket
+  // has already minted, in one statement. A revoke that left live tokens behind would be a
+  // kill switch that does not kill anything for another ninety minutes.
+  async function revokeCaptureTicket(id, by) {
+    if (!isUuid(id)) return null;
+    return tx(async (client) => {
+      const r = await client.query(
+        `UPDATE pmr_capture_tickets
+            SET revoked_at = COALESCE(revoked_at, now()), revoked_by = COALESCE(revoked_by, $2)
+          WHERE id = $1
+          RETURNING *`,
+        [id, nz(by)]
+      );
+      if (!r.rows.length) return null;
+      await client.query(
+        `UPDATE pmr_capture_tokens SET revoked_at = COALESCE(revoked_at, now())
+          WHERE ticket_id = $1 AND revoked_at IS NULL`,
+        [id]
+      );
+      return r.rows[0];
+    });
+  }
+
+  // ── redeem: ticket secret -> a scoped token ───────────────────────────────
+  //
+  // ⛔ ONE STATEMENT DECIDES AND CLAIMS. The eligibility test (not revoked, not expired,
+  // budget remaining) is INSIDE the UPDATE that spends the budget, so two kit instances
+  // redeeming the same ticket at the same instant cannot both be told "you have 1 redemption
+  // left". This is the same reason the PMR job claim evaluates its gate inside the claiming
+  // statement rather than around it.
+  //
+  // ⛔ THE CAPABILITY LIST IS NOT A PARAMETER THE CALLER CHOOSES FREELY. It is bound as an
+  // array and the column carries a CHECK restricting it to a subset of the three, so a caller
+  // that passed a fourth string gets a constraint violation rather than a wider token.
+  //
+  // Returns { ticket, token } or a NAMED refusal { refused: '<reason>' } — never a bare null,
+  // because "no such ticket", "revoked", "expired" and "spent" are four different things to
+  // tell an engineer standing in a pharmacy at 2am.
+  async function redeemCaptureTicket(secretHash, f = {}) {
+    const caps = Array.isArray(f.capabilities) ? f.capabilities : [];
+    return tx(async (client) => {
+      const spent = await client.query(
+        `UPDATE pmr_capture_tickets
+            SET redeem_count = redeem_count + 1, last_redeemed_at = now()
+          WHERE secret_hash = $1
+            AND revoked_at IS NULL
+            AND expires_at > now()
+            AND redeem_count < redeem_max
+          RETURNING *`,
+        [String(secretHash || '')]
+      );
+      if (!spent.rows.length) {
+        // The claim failed. Read the row (if any) purely to SAY WHY. This read cannot race
+        // usefully — whatever it finds, no budget was spent — and a refusal that names the
+        // reason is the difference between an engineer reissuing a ticket and an engineer
+        // driving home.
+        const look = await client.query(
+          `SELECT revoked_at, expires_at, redeem_count, redeem_max
+             FROM pmr_capture_tickets WHERE secret_hash = $1`,
+          [String(secretHash || '')]
+        );
+        if (!look.rows.length) return { refused: 'no-such-ticket' };
+        const t = look.rows[0];
+        if (t.revoked_at) return { refused: 'revoked' };
+        if (new Date(t.expires_at).getTime() <= Date.now()) return { refused: 'expired' };
+        if (Number(t.redeem_count) >= Number(t.redeem_max)) return { refused: 'spent' };
+        return { refused: 'unavailable' };
+      }
+      const ticket = spent.rows[0];
+      // ⛔ THE TOKEN NEVER OUTLIVES THE TICKET, AND THE CLAMP IS IN THE STATEMENT. LEAST of
+      // the ordinary TTL and the ticket's own expiry — computed here rather than in the
+      // caller so the value tested by the auth query is the value that was written, and so a
+      // ticket clamped to twenty minutes before opening cannot mint a ninety-minute token.
+      // That clamp is what stops the closed-window bound leaking through a last-minute mint.
+      const tok = await client.query(
+        `INSERT INTO pmr_capture_tokens
+           (ticket_id, pharmacy_id, token_hash, capabilities, expires_at)
+         VALUES ($1, $2, $3, $4::text[],
+                 LEAST(now() + make_interval(secs => $5::int), $6::timestamptz))
+         RETURNING *`,
+        [ticket.id, ticket.pharmacy_id, String(f.token_hash), caps,
+          Number(f.token_ttl_s) > 0 ? Number(f.token_ttl_s) : 900, ticket.expires_at]
+      );
+      return { ticket, token: tok.rows[0] };
+    });
+  }
+
+  // The hot path: authenticate one kit call. ONE lookup, and it joins the ticket so a token
+  // whose ticket was revoked or has expired dies with it rather than outliving it by up to
+  // ninety minutes.
+  //
+  // ⚠️ IT ALSO RETURNS THE PHARMACY, because every capture route resolves its site from HERE
+  // and never from a request body. That is the whole point of the ticket: the kit is
+  // physically unable to name another pharmacy.
+  async function getCaptureTokenByHash(tokenHash) {
+    return one(
+      `SELECT t.id, t.ticket_id, t.pharmacy_id, t.capabilities, t.issued_at, t.expires_at,
+              t.last_used_at, t.revoked_at,
+              k.issued_by AS ticket_issued_by, k.expires_at AS ticket_expires_at,
+              p.code AS pharmacy_code, p.name AS pharmacy_name
+         FROM pmr_capture_tokens t
+         JOIN pmr_capture_tickets k ON k.id = t.ticket_id
+         JOIN pharmacies p          ON p.id = t.pharmacy_id
+        WHERE t.token_hash = $1
+          AND t.revoked_at IS NULL
+          AND t.expires_at > now()
+          AND k.revoked_at IS NULL
+          AND k.expires_at > now()`,
+      [String(tokenHash || '')]
+    );
+  }
+
+  // Stamped after a call is authorised, with the capability it exercised. Failure here must
+  // never fail the call it is recording, so it is fire-and-forget at the call site.
+  async function touchCaptureToken(id, capability) {
+    if (!isUuid(id)) return null;
+    return one(
+      `UPDATE pmr_capture_tokens SET last_used_at = now(), last_capability = $2
+        WHERE id = $1 RETURNING id`,
+      [id, nz(capability)]
+    );
+  }
+
+  // ── what the kit is allowed to see ────────────────────────────────────────
+  // The 'sites:list' read. Scoped to the pharmacy the TOKEN names — which is exactly one row.
+  // It is a LIST because the kit renders a picker and the engineer confirms rather than types;
+  // the kit cannot widen it, and no request parameter reaches this query.
+  async function listCaptureSitesForToken(pharmacyId) {
+    return rows(
+      `SELECT p.id, p.code, p.name, p.status, p.idx, p.prefix_len, p.subnet,
+              p.server_ip, p.proxmox_node, p.srv_vmid, p.pmr_system
+         FROM pharmacies p
+        WHERE p.id = $1`,
+      [Number(pharmacyId)]
+    );
+  }
+
+  // The 'slots:read' read: which role slots at this site are already spoken for, and by what.
+  //
+  // THREE SOURCES, because a slot is taken if ANY of them says so and a picker that showed a
+  // free slot which the register call then refused would waste an engineer's night:
+  //   * a capture RUN already registered for that role;
+  //   * a COUNTER row (the real addressable slot — n maps to the .11–.20 band);
+  //   * for the server, the site's own srv_vmid.
+  async function listCaptureSlots(pharmacyId) {
+    const id = Number(pharmacyId);
+    const [runs, counters, ph] = await Promise.all([
+      rows(
+        `SELECT role_kind, role_slot, ticket_id, started_at, uploaded_at, taken_by, source_pc_name
+           FROM pmr_capture_runs WHERE pharmacy_id = $1
+          ORDER BY role_kind, role_slot`,
+        [id]
+      ),
+      rows(
+        `SELECT n, label, status, vmid FROM counters WHERE pharmacy_id = $1 ORDER BY n`,
+        [id]
+      ),
+      one(`SELECT id, code, idx, prefix_len, server_ip, srv_vmid FROM pharmacies WHERE id = $1`, [id]),
+    ]);
+    return { runs, counters, pharmacy: ph };
+  }
+
+  async function listCaptureRuns(pharmacyId) {
+    return rows(
+      `SELECT * FROM pmr_capture_runs WHERE pharmacy_id = $1
+        ORDER BY role_kind, role_slot NULLS FIRST`,
+      [Number(pharmacyId)]
+    );
+  }
+
+  // ── the 'capture:write' write ─────────────────────────────────────────────
+  //
+  // ⛔ IT REGISTERS A CAPTURE AGAINST A SITE THAT ALREADY EXISTS. There is no INSERT INTO
+  // pharmacies anywhere on this path and there must never be one: pharmacy_id is bound from
+  // the token, the FK refuses an id that is not a live site, and no column of `pharmacies` is
+  // written. A kit credential that could create a pharmacy could create the site it then
+  // claims to have captured.
+  //
+  // ⛔ AND IT REFUSES A DUPLICATE ROLE — in the database, not in a handler. The partial unique
+  // indexes make (site, server) and (site, client, slot) unique, so the ON CONFLICT below is
+  // an UPDATE only when the SAME TICKET is re-registering (a resume after the guest-agent
+  // reboot). A DIFFERENT ticket hitting the same slot raises, and the caller turns that into a
+  // 409 naming who holds it. Two engineers picking Client 03 at the same site is precisely the
+  // race a SELECT-then-INSERT would lose.
+  //
+  // out_of_hours is passed in by the handler, decided from the SITE'S OWN HOURS server-side.
+  // It is never read from the kit's body: a tool asserting its own compliance is not evidence.
+  async function upsertCaptureRun(pharmacyId, f = {}) {
+    const kind = f.role_kind === 'server' ? 'server' : 'client';
+    const slot = kind === 'server' ? null : Number(f.role_slot);
+    const conflictTarget = kind === 'server'
+      ? '(pharmacy_id) WHERE role_kind = \'server\''
+      : '(pharmacy_id, role_slot) WHERE role_kind = \'client\'';
+    return one(
+      `INSERT INTO pmr_capture_runs
+         (pharmacy_id, role_kind, role_slot, ticket_id, started_at, uploaded_at,
+          source_pc_name, disk_gb, image_format, image_sha256, bytes_total, bytes_sent,
+          upload_target, guest_agent_installed, printers_cleared, slimmed, taken_by,
+          out_of_hours, failed_reason)
+       VALUES ($1, $2, $3, $4, COALESCE($5::timestamptz, now()), $6,
+               $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+       ON CONFLICT ${conflictTarget} DO UPDATE SET
+         -- ⛔ THE OWNERSHIP GUARD, IN THE STATEMENT. A row already owned by ANOTHER ticket is
+         -- not updated: the WHERE below fails the conflict action, the statement returns no
+         -- row, and the caller answers 409. Only the ticket that started this run may resume
+         -- it — which is exactly what a resume after a reboot is.
+         ticket_id             = COALESCE(EXCLUDED.ticket_id, pmr_capture_runs.ticket_id),
+         uploaded_at           = COALESCE(EXCLUDED.uploaded_at, pmr_capture_runs.uploaded_at),
+         source_pc_name        = COALESCE(EXCLUDED.source_pc_name, pmr_capture_runs.source_pc_name),
+         disk_gb               = COALESCE(EXCLUDED.disk_gb, pmr_capture_runs.disk_gb),
+         image_format          = COALESCE(EXCLUDED.image_format, pmr_capture_runs.image_format),
+         image_sha256          = COALESCE(EXCLUDED.image_sha256, pmr_capture_runs.image_sha256),
+         bytes_total           = COALESCE(EXCLUDED.bytes_total, pmr_capture_runs.bytes_total),
+         -- ⚠️ PROGRESS ONLY EVER GOES FORWARD. A resumed transfer that reports its own
+         -- restart offset must not make the record say less work has been done than last time.
+         bytes_sent            = GREATEST(COALESCE(EXCLUDED.bytes_sent, 0),
+                                          COALESCE(pmr_capture_runs.bytes_sent, 0)),
+         upload_target         = COALESCE(EXCLUDED.upload_target, pmr_capture_runs.upload_target),
+         -- ⚠️ TRI-STATES WRITE STRAIGHT THROUGH WHEN STATED AND ARE LEFT ALONE WHEN NOT. A
+         -- NULL from the kit means "not established on this call", not "no" — so it must not
+         -- overwrite a true, and a false must be able to overwrite a true (a later pass found
+         -- printers after all).
+         guest_agent_installed = COALESCE(EXCLUDED.guest_agent_installed, pmr_capture_runs.guest_agent_installed),
+         printers_cleared      = COALESCE(EXCLUDED.printers_cleared, pmr_capture_runs.printers_cleared),
+         slimmed               = COALESCE(EXCLUDED.slimmed, pmr_capture_runs.slimmed),
+         taken_by              = COALESCE(EXCLUDED.taken_by, pmr_capture_runs.taken_by),
+         out_of_hours          = COALESCE(EXCLUDED.out_of_hours, pmr_capture_runs.out_of_hours),
+         failed_reason         = EXCLUDED.failed_reason
+       WHERE pmr_capture_runs.ticket_id IS NOT DISTINCT FROM EXCLUDED.ticket_id
+       RETURNING *`,
+      [Number(pharmacyId), kind, slot, nz(f.ticket_id), nz(f.started_at), nz(f.uploaded_at),
+        nz(f.source_pc_name), nz(f.disk_gb), nz(f.image_format), nz(f.image_sha256),
+        nz(f.bytes_total), nz(f.bytes_sent), nz(f.upload_target),
+        nz(f.guest_agent_installed), nz(f.printers_cleared), nz(f.slimmed), nz(f.taken_by),
+        nz(f.out_of_hours), nz(f.failed_reason)]
+    );
+  }
+
+  // Who holds a role slot, for the 409 that refuses a duplicate. A refusal that cannot say
+  // "Client 03 was captured at 01:12 by leo.wilson" is a refusal an engineer will assume is a
+  // bug and work around.
+  async function getCaptureRunForRole(pharmacyId, kind, slot) {
+    if (kind === 'server') {
+      return one(
+        `SELECT * FROM pmr_capture_runs WHERE pharmacy_id = $1 AND role_kind = 'server'`,
+        [Number(pharmacyId)]
+      );
+    }
+    return one(
+      `SELECT * FROM pmr_capture_runs
+        WHERE pharmacy_id = $1 AND role_kind = 'client' AND role_slot = $2`,
+      [Number(pharmacyId), Number(slot)]
+    );
+  }
+
+  // ── the upload destination, reported by the node that owns it ─────────────
+  // Vigilant has no route to the Proxmox API, so this arrives on the reply-bearing push the
+  // collector already makes. Same rule as job hand-out.
+  async function reportCaptureDropTargets(list) {
+    const arr = Array.isArray(list) ? list : [];
+    const uniq = dedupeBy(arr.filter((n) => n && n.node && n.dir), (n) => String(n.node));
+    if (!uniq.length) return { capture_drop_targets: 0 };
+    await tx(async (client) => {
+      for (const t of uniq) {
+        await client.query(
+          `INSERT INTO pmr_capture_drop_targets
+             (node, storage_name, dir, fs_type, free_bytes, total_bytes, writable, read_error, reported_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
+           ON CONFLICT (node) DO UPDATE SET
+             storage_name = EXCLUDED.storage_name,
+             dir          = EXCLUDED.dir,
+             fs_type      = EXCLUDED.fs_type,
+             -- ⛔ WRITTEN AS REPORTED, INCLUDING NULL. Never COALESCEd onto the previous
+             -- value: a node that has stopped being able to read its own drop directory must
+             -- go quiet in the data rather than keep a stale free-space figure that looks
+             -- like a current one. Same rule as proxmox_node_capacity.
+             free_bytes   = EXCLUDED.free_bytes,
+             total_bytes  = EXCLUDED.total_bytes,
+             writable     = EXCLUDED.writable,
+             read_error   = EXCLUDED.read_error,
+             reported_at  = now()`,
+          [t.node, nz(t.storage_name), t.dir, nz(t.fs_type), nz(t.free_bytes),
+            nz(t.total_bytes), nz(t.writable), nz(t.read_error)]
+        );
+      }
+    });
+    return { capture_drop_targets: uniq.length };
+  }
+
+  async function getCaptureDropTarget(node) {
+    if (!node) return null;
+    return one(`SELECT * FROM pmr_capture_drop_targets WHERE node = $1`, [String(node)]);
+  }
+
+  async function listCaptureDropTargets() {
+    return rows(`SELECT * FROM pmr_capture_drop_targets ORDER BY node`, []);
+  }
+
+  // ── node headroom ─────────────────────────────────────────────────────────
+  // ⛔ A FIGURE THE COLLECTOR DID NOT ESTABLISH IS WRITTEN AS NULL. Never 0, and never left
+  // at its previous value: "the pool is full" and "we could not read the pool" are different
+  // facts, and a COALESCE here would turn the second into a confident stale first.
+  async function listNodeCapacity() {
+    return rows(
+      `SELECT node, storage_name, mem_total_bytes, mem_free_bytes,
+              storage_total_bytes, storage_free_bytes, cpu_cores, read_error, measured_at
+         FROM proxmox_node_capacity
+        ORDER BY node, storage_name`,
+      []
+    );
+  }
+
+  // EIGHT values for the nine columns: measured_at is now() and is never taken from the
+  // caller — a collector's own clock deciding how fresh its reading looks is how a stale
+  // number passes for a current one.
+  async function reportNodeCapacity(list) {
+    const arr = Array.isArray(list) ? list : [];
+    const uniq = dedupeBy(
+      arr.filter((n) => n && n.node && n.storage_name),
+      // ⚠️ \x00 AS AN ESCAPE, NEVER AS A LITERAL BYTE (B7). This separator was written as a
+      // raw NUL in the source, which makes grep classify the WHOLE FILE as binary and return
+      // NOTHING for every pattern in it — so the next person searching for a method here concludes
+      // it is missing when it is four thousand lines above them. The escape is the same byte to
+      // JavaScript and an ordinary text file to everything else.
+      //
+      // The byte itself is deliberate: it is the one character that cannot appear in a Proxmox
+      // node name or a storage name, so ("wcn1","zfs-a") and ("wcn1-zfs","a") cannot collide.
+      (n) => `${n.node}\x00${n.storage_name}`
+    );
+    if (!uniq.length) return { nodes: 0 };
+    await tx(async (client) => {
+      await bulkInsert(
+        client,
+        `INSERT INTO proxmox_node_capacity (node, storage_name, mem_total_bytes, mem_free_bytes,
+                                            storage_total_bytes, storage_free_bytes, cpu_cores,
+                                            read_error, measured_at)`,
+        `ON CONFLICT (node, storage_name) DO UPDATE SET
+           mem_total_bytes     = EXCLUDED.mem_total_bytes,
+           mem_free_bytes      = EXCLUDED.mem_free_bytes,
+           storage_total_bytes = EXCLUDED.storage_total_bytes,
+           storage_free_bytes  = EXCLUDED.storage_free_bytes,
+           cpu_cores           = EXCLUDED.cpu_cores,
+           read_error          = EXCLUDED.read_error,
+           measured_at         = now()`,
+        8,
+        uniq.map((n) => [
+          String(n.node), String(n.storage_name),
+          nz(n.mem_total_bytes), nz(n.mem_free_bytes),
+          nz(n.storage_total_bytes), nz(n.storage_free_bytes),
+          nz(n.cpu_cores), nz(n.read_error),
+        ]),
+        placeholders(8, 'now()')
+      );
+    });
+    return { nodes: uniq.length };
+  }
+
   // ── discovered Proxmox VMs ─────────────────────────────────────────────────
   // Pushed by a collector running ON a Proxmox node (Vigilant has no route to the
   // management VLAN, and inverting the direction avoids opening one).
@@ -2648,13 +3878,35 @@ function makePgStore(poolOrConfig) {
     await tx(async (client) => {
       await bulkInsert(
         client,
-        `INSERT INTO proxmox_vms (vmid, node, name, status, vlan_tag, macs, cores, maxmem, maxdisk, uptime_s, template, seen_at)`,
+        `INSERT INTO proxmox_vms (vmid, node, name, status, vlan_tag, macs, cores, maxmem, maxdisk, uptime_s, template,
+                                  agent_enabled, agent_ok, agent_error, agent_checked_at, guest_os, guest_ips, onboot, seen_at)`,
+        // COALESCE on everything the collector can fail to read. It reports a VM from
+        // /cluster/resources even when the per-VM config call failed, and it OMITS the keys it
+        // could not establish rather than sending blanks — so without COALESCE one transient
+        // node hiccup overwrote a VM's stored vlan_tag with NULL and silently unlinked it from
+        // its pharmacy, because the reconciler joins on vlan_tag. The identity columns that
+        // always arrive (node/name/status/template) are still overwritten unconditionally.
+        //
+        // agent_checked_at is NOT coalesced onto now(): it is only ever set by a pass that
+        // actually probed, so an un-probed tick leaves the previous timestamp in place and the
+        // reading correctly ages.
         `ON CONFLICT (vmid) DO UPDATE SET
            node = EXCLUDED.node, name = EXCLUDED.name, status = EXCLUDED.status,
-           vlan_tag = EXCLUDED.vlan_tag, macs = EXCLUDED.macs, cores = EXCLUDED.cores,
-           maxmem = EXCLUDED.maxmem, maxdisk = EXCLUDED.maxdisk,
-           uptime_s = EXCLUDED.uptime_s, template = EXCLUDED.template, seen_at = now()`,
-        11,
+           vlan_tag = COALESCE(EXCLUDED.vlan_tag, proxmox_vms.vlan_tag),
+           macs = CASE WHEN jsonb_array_length(EXCLUDED.macs) > 0 THEN EXCLUDED.macs ELSE proxmox_vms.macs END,
+           cores = COALESCE(EXCLUDED.cores, proxmox_vms.cores),
+           maxmem = COALESCE(EXCLUDED.maxmem, proxmox_vms.maxmem),
+           maxdisk = COALESCE(EXCLUDED.maxdisk, proxmox_vms.maxdisk),
+           uptime_s = EXCLUDED.uptime_s, template = EXCLUDED.template,
+           agent_enabled = COALESCE(EXCLUDED.agent_enabled, proxmox_vms.agent_enabled),
+           agent_ok = COALESCE(EXCLUDED.agent_ok, proxmox_vms.agent_ok),
+           agent_error = COALESCE(EXCLUDED.agent_error, proxmox_vms.agent_error),
+           agent_checked_at = COALESCE(EXCLUDED.agent_checked_at, proxmox_vms.agent_checked_at),
+           guest_os = COALESCE(EXCLUDED.guest_os, proxmox_vms.guest_os),
+           guest_ips = CASE WHEN jsonb_array_length(EXCLUDED.guest_ips) > 0 THEN EXCLUDED.guest_ips ELSE proxmox_vms.guest_ips END,
+           onboot = COALESCE(EXCLUDED.onboot, proxmox_vms.onboot),
+           seen_at = now()`,
+        18,
         uniq.map((v) => [
           Number(v.vmid), nz(v.node), nz(v.name), nz(v.status),
           v.vlan_tag == null ? null : Number(v.vlan_tag),
@@ -2664,11 +3916,328 @@ function makePgStore(poolOrConfig) {
           v.maxdisk == null ? null : Number(v.maxdisk),
           v.uptime_s == null ? null : Number(v.uptime_s),
           v.template === true,
+          // Tri-state all the way down: undefined (the collector could not ask) and a real
+          // false are different answers, and only the second may ever render as "no".
+          v.agent_enabled == null ? null : Boolean(v.agent_enabled),
+          v.agent_ok == null ? null : Boolean(v.agent_ok),
+          nz(v.agent_error),
+          v.agent_checked_at == null ? null : new Date(Number(v.agent_checked_at) * 1000),
+          nz(v.guest_os),
+          JSON.stringify(Array.isArray(v.guest_ips) ? v.guest_ips : []),
+          v.onboot == null ? null : Boolean(v.onboot),
         ]),
-        placeholders(11, 'now()')
+        placeholders(18, 'now()')
       );
     });
     return { vms: uniq.length };
+  }
+
+  // ── PMR VM capacity ────────────────────────────────────────────────────────
+  // Written by the same collector pass, from the same POST, but kept in its own table and its
+  // own call: proxmox_vms is inventory (what exists, what it is linked to) and this is a
+  // reading (how full it is). They fail independently — the RRD can be readable on a VM whose
+  // guest agent is dead, and vice versa.
+  //
+  // Called AFTER reportProxmoxVms so a capacity row is never the first thing that mentions a
+  // vmid.
+  async function reportProxmoxCapacity(list) {
+    const arr = Array.isArray(list) ? list : [];
+    const uniq = dedupeBy(arr.filter((v) => v && Number.isFinite(Number(v.vmid))), (v) => Number(v.vmid));
+    if (!uniq.length) return { capacity_rows: 0, disk_samples: 0 };
+
+    // A row is only a DISK reading if the agent actually answered with both numbers. Anything
+    // else is 'unknown' with empty columns — never 0, which would render as a healthy disk on a
+    // VM nobody can see inside. (VM 305 is a live dispensing server at 88% full; the failure
+    // mode being guarded here is the opposite reading.)
+    const withDisk = (v) =>
+      v.disk_source === 'agent' &&
+      Number.isFinite(Number(v.disk_used_bytes)) &&
+      Number.isFinite(Number(v.disk_total_bytes)) &&
+      Number(v.disk_total_bytes) > 0 &&
+      typeof v.disk_mount === 'string' && v.disk_mount.trim() !== '';
+    const num = (x) => (x == null || !Number.isFinite(Number(x)) ? null : Number(x));
+
+    const samples = uniq.filter(withDisk);
+    // vmid -> the name this pass observed, for the rebuild wipe below.
+    const vmids = uniq.map((v) => Number(v.vmid));
+    const names = uniq.map((v) => nz(v.name));
+    await tx(async (client) => {
+      // PROXMOX RECYCLES VMIDS, and both tables here are keyed on vmid. A rebuilt VM 305 on a
+      // fresh 100 GB disk inherits ~3,300 samples averaging 208 GB under the same vmid and the
+      // same 'C:\' mountpoint, so disk_used_30d comes out ABOVE disk_total_bytes and the UI
+      // paints a solid red 100% bar for five weeks on a disk that is nearly empty.
+      //
+      // So: a vmid observed under a DIFFERENT name is a different VM, and its inherited history
+      // is dropped before anything is written. Both sides must go — the samples (which back the
+      // averages) and the capacity row itself (which holds the already-computed averages, and
+      // the CPU/RAM figures the upsert below COALESCEs onto).
+      //
+      // Guarded on both names being known: NULL on either side is "we did not observe a name",
+      // which is not evidence of a rebuild and must never wipe a live VM's history.
+      // Samples first, capacity second — the second statement re-reads the OLD name, which is
+      // still there because only the samples have gone.
+      const rebuilt =
+        `SELECT cur.vmid FROM pmr_vm_capacity cur
+           JOIN unnest($1::int[], $2::text[]) AS i(vmid, name) ON i.vmid = cur.vmid
+          WHERE cur.name IS NOT NULL AND i.name IS NOT NULL AND cur.name <> i.name`;
+      await client.query(
+        `DELETE FROM pmr_vm_disk_samples s USING (${rebuilt}) r WHERE s.vmid = r.vmid`,
+        [vmids, names]
+      );
+      await client.query(
+        `DELETE FROM pmr_vm_capacity c USING (${rebuilt}) r WHERE c.vmid = r.vmid`,
+        [vmids, names]
+      );
+
+      await bulkInsert(
+        client,
+        `INSERT INTO pmr_vm_capacity (vmid, node, name, cores, mem_max_bytes,
+                                      cpu_pct_1d, cpu_pct_7d, cpu_pct_30d,
+                                      mem_bytes_1d, mem_bytes_7d, mem_bytes_30d, mem_pressure_1d,
+                                      disk_mount, disk_used_bytes, disk_total_bytes, disk_source,
+                                      rrd_error, sampled_at, updated_at)`,
+        // Two different rules in one SET list, and the difference is deliberate:
+        //
+        // CPU/RAM are COALESCEd, like agent_ok on proxmox_vms — a tick where the RRD read
+        // failed but the agent answered must not blank a good average.
+        //
+        // THE DISK COLUMNS ARE NOT. They are written unconditionally, together, from the same
+        // reading, so disk_source can never disagree with the numbers beside it. COALESCEing
+        // them would leave last month's byte count sitting next to disk_source = 'unknown',
+        // which reads as a current measurement and is a lie about a live pharmacy server.
+        //
+        // sampled_at is CONDITIONAL, and that is the whole point of it. The collector omits the
+        // row when it established NOTHING, but a VM whose RRD path is broken while its guest
+        // agent still answers sends a disk-only row every tick — and stamping now() on that
+        // advanced the timestamp over CPU/RAM figures the SET list had just COALESCEd, so the
+        // UI printed "sampled 2m ago" over numbers frozen since the RRD died, indefinitely.
+        // It now only advances when the incoming row actually CARRIED an RRD reading, and
+        // rrd_error (written unconditionally, so a repaired path clears it) says why when it
+        // did not.
+        `ON CONFLICT (vmid) DO UPDATE SET
+           node = EXCLUDED.node, name = EXCLUDED.name,
+           cores = COALESCE(EXCLUDED.cores, pmr_vm_capacity.cores),
+           mem_max_bytes = COALESCE(EXCLUDED.mem_max_bytes, pmr_vm_capacity.mem_max_bytes),
+           cpu_pct_1d = COALESCE(EXCLUDED.cpu_pct_1d, pmr_vm_capacity.cpu_pct_1d),
+           cpu_pct_7d = COALESCE(EXCLUDED.cpu_pct_7d, pmr_vm_capacity.cpu_pct_7d),
+           cpu_pct_30d = COALESCE(EXCLUDED.cpu_pct_30d, pmr_vm_capacity.cpu_pct_30d),
+           mem_bytes_1d = COALESCE(EXCLUDED.mem_bytes_1d, pmr_vm_capacity.mem_bytes_1d),
+           mem_bytes_7d = COALESCE(EXCLUDED.mem_bytes_7d, pmr_vm_capacity.mem_bytes_7d),
+           mem_bytes_30d = COALESCE(EXCLUDED.mem_bytes_30d, pmr_vm_capacity.mem_bytes_30d),
+           mem_pressure_1d = COALESCE(EXCLUDED.mem_pressure_1d, pmr_vm_capacity.mem_pressure_1d),
+           disk_mount = EXCLUDED.disk_mount,
+           disk_used_bytes = EXCLUDED.disk_used_bytes,
+           disk_total_bytes = EXCLUDED.disk_total_bytes,
+           disk_source = EXCLUDED.disk_source,
+           rrd_error = EXCLUDED.rrd_error,
+           sampled_at = CASE
+             WHEN COALESCE(EXCLUDED.cpu_pct_1d, EXCLUDED.cpu_pct_7d, EXCLUDED.cpu_pct_30d,
+                           EXCLUDED.mem_pressure_1d) IS NOT NULL
+               OR COALESCE(EXCLUDED.mem_bytes_1d, EXCLUDED.mem_bytes_7d,
+                           EXCLUDED.mem_bytes_30d) IS NOT NULL
+             THEN now() ELSE pmr_vm_capacity.sampled_at END,
+           updated_at = now()`,
+        // 17 BOUND PARAMS. sampled_at and updated_at are the 18th and 19th COLUMNS but are
+        // supplied as literals by the trailing argument below, so they are not counted here.
+        17,
+        uniq.map((v) => [
+          Number(v.vmid), nz(v.node), nz(v.name),
+          num(v.cores), num(v.mem_max_bytes),
+          num(v.cpu_pct_1d), num(v.cpu_pct_7d), num(v.cpu_pct_30d),
+          num(v.mem_bytes_1d), num(v.mem_bytes_7d), num(v.mem_bytes_30d),
+          num(v.mem_pressure_1d),
+          withDisk(v) ? String(v.disk_mount).trim() : null,
+          withDisk(v) ? Number(v.disk_used_bytes) : null,
+          withDisk(v) ? Number(v.disk_total_bytes) : null,
+          // CHECK-constrained to these two values; anything else would abort the transaction.
+          withDisk(v) ? 'agent' : 'unknown',
+          nz(v.rrd_error),
+        ]),
+        // ONE string, TWO literals — placeholders() joins its parts with commas, so this
+        // renders `,now(), now()` and fills both trailing columns. The count above (17) must
+        // stay equal to the number of values in each .map() row: they are separate literals,
+        // nothing derives one from the other, and a mismatch makes every tick 500 at bind time.
+        placeholders(17, 'now(), now()')
+      );
+
+      // Our own disk history. Proxmox keeps none — its RRD `disk` is always 0 for a qemu VM —
+      // so the 1d/7d/30d disk averages can only be computed from samples we accumulate here.
+      // sampled_at defaults to now(), which is the TRANSACTION timestamp, so every row written
+      // by one tick shares an instant and the PK cannot collide within it.
+      if (samples.length) {
+        await bulkInsert(
+          client,
+          // `name` rides along so the averages join can refuse to blend a rebuilt VM's history
+          // with its predecessor's under a recycled vmid.
+          `INSERT INTO pmr_vm_disk_samples (vmid, mountpoint, name, used_bytes, total_bytes)`,
+          // A re-POST of the same tick must be a no-op, not a duplicate-key error that takes
+          // the whole report down with it.
+          `ON CONFLICT DO NOTHING`,
+          5,
+          samples.map((v) => [
+            Number(v.vmid), String(v.disk_mount).trim(), nz(v.name),
+            Number(v.disk_used_bytes), Number(v.disk_total_bytes),
+          ]),
+          placeholders(5)
+        );
+      }
+
+      // Recompute the disk averages for exactly the VMs this report touched.
+      //
+      // Joined on mountpoint as well as vmid: if a VM's largest filesystem changes (a disk was
+      // grown, or D: overtook C:), the average must not silently blend two different volumes.
+      // Joined on NAME too, for the recycled-vmid case handled by the wipe at the top of this
+      // transaction — belt and braces, so a sample that predates the wipe can never be averaged
+      // into a different VM's reading. avg() over bigint returns numeric, so it is rounded back
+      // to a whole byte count.
+      //
+      // A WINDOW THE HISTORY CANNOT COVER IS NULL, NOT AN AVERAGE OF WHAT WE HAPPEN TO HAVE.
+      // Fifteen minutes after deploy every sample falls inside all three windows, so a plain
+      // AVG returns d1 = d7 = d30 and the UI draws three confident equal bars — an engineer
+      // reads "88% for a month, no action" off fifteen minutes of data. `first_at` is the
+      // oldest sample for this (vmid, mountpoint, name), and each window is only written once
+      // that sample is genuinely as old as the window is long.
+      //
+      // first_at is therefore taken over the UNFILTERED history and the 30-day cut moved into
+      // its own FILTER: with the old `WHERE sampled_at >= now() - interval '30 days'` in place,
+      // min(sampled_at) could never be 30 days old and d30 would be NULL forever. Retention
+      // below keeps 35 days, which is what leaves room for the test to pass.
+      await client.query(
+        `UPDATE pmr_vm_capacity c
+            SET disk_used_1d  = CASE WHEN s.first_at <= now() - interval '1 day'  THEN s.d1  END,
+                disk_used_7d  = CASE WHEN s.first_at <= now() - interval '7 days' THEN s.d7  END,
+                disk_used_30d = CASE WHEN s.first_at <= now() - interval '30 days' THEN s.d30 END,
+                updated_at    = now()
+           FROM (
+             SELECT vmid, mountpoint, name,
+                    min(sampled_at)                                                                       AS first_at,
+                    round(avg(used_bytes) FILTER (WHERE sampled_at >= now() - interval '1 day'))::bigint   AS d1,
+                    round(avg(used_bytes) FILTER (WHERE sampled_at >= now() - interval '7 days'))::bigint  AS d7,
+                    round(avg(used_bytes) FILTER (WHERE sampled_at >= now() - interval '30 days'))::bigint AS d30
+               FROM pmr_vm_disk_samples
+              WHERE vmid = ANY($1::int[])
+              GROUP BY vmid, mountpoint, name
+           ) s
+          WHERE c.vmid = s.vmid AND c.disk_mount = s.mountpoint
+            AND c.name IS NOT DISTINCT FROM s.name`,
+        [vmids]
+      );
+
+      // Retention. 35 days, not 30: the month window needs a full 30 days of samples behind it
+      // at all times, so the table is trimmed with slack rather than exactly at the boundary.
+      await client.query(
+        `DELETE FROM pmr_vm_disk_samples WHERE sampled_at < now() - interval '35 days'`
+      );
+    });
+    return { capacity_rows: uniq.length, disk_samples: samples.length };
+  }
+
+  // ── §7 · the desktop's own Windows printer list ────────────────────────────
+  // Same pass, same POST, its own table and its own call — for the same reason capacity has
+  // one: this is a READING and proxmox_vms is inventory, and they fail independently. A
+  // desktop whose guest agent answers get-osinfo can still refuse guest-exec.
+  //
+  // Called AFTER reportProxmoxVms, so a printer row is never the first thing in the database
+  // that mentions a vmid.
+  //
+  // ⛔ EVERY NAME REACHES SQL AS A BOUND PARAMETER AND AS NOTHING ELSE. These strings came out
+  // of a Windows box: they are attacker-shaped input by construction. Nothing below builds SQL
+  // from a name, and the ingest has already bounded their length, stripped control characters
+  // and capped the list.
+  async function reportProxmoxVmPrinters(list) {
+    const arr = Array.isArray(list) ? list : [];
+    const uniq = dedupeBy(arr.filter((v) => v && Number.isFinite(Number(v.vmid))), (v) => Number(v.vmid));
+    if (!uniq.length) return { printer_rows: 0, printer_lists: 0 };
+
+    // A row only carries a LIST if the ingest handed us an array AND a time it was read. The
+    // contract makes collected_at required, so a list we cannot date is not a list we may
+    // present — it is written as an error with no reading, which the UI renders as unknown.
+    const withList = (v) => Array.isArray(v.printers) && v.read_at != null;
+    const vmids = uniq.map((v) => Number(v.vmid));
+    const names = uniq.map((v) => nz(v.name));
+
+    await tx(async (client) => {
+      // PROXMOX RECYCLES VMIDS, and this table is keyed on vmid. A rebuilt VM 305 would
+      // otherwise inherit the previous machine's printer list and go on showing it, correctly
+      // aged and completely wrong, until the new one is read. Same guard and same reasoning as
+      // the capacity path above: both names must be known, because a NULL on either side is
+      // "we did not observe a name" and is not evidence of a rebuild.
+      await client.query(
+        `DELETE FROM pmr_vm_printers p
+           USING (SELECT cur.vmid FROM pmr_vm_printers cur
+                    JOIN unnest($1::int[], $2::text[]) AS i(vmid, name) ON i.vmid = cur.vmid
+                   WHERE cur.name IS NOT NULL AND i.name IS NOT NULL AND cur.name <> i.name) r
+           WHERE p.vmid = r.vmid`,
+        [vmids, names]
+      );
+
+      await bulkInsert(
+        client,
+        `INSERT INTO pmr_vm_printers (vmid, node, name, printers, read_at, source, error, updated_at)`,
+        // printers and read_at MOVE TOGETHER, and both are COALESCEd. A pass that could not
+        // read the guest leaves the last good list in place with its own true timestamp, so
+        // the modal keeps showing what it knew and ages it honestly — rather than blanking to
+        // "unknown" every time one call fails, or worse, stamping now() over a stale list.
+        //
+        // COALESCE is safe for the real-empty answer: '{}' is not NULL, so a guest that lists
+        // no printers overwrites a previous list exactly as it should.
+        //
+        // `error` is NOT COALESCEd — it is written unconditionally, so a repaired path clears
+        // it. `source` follows the list, because it describes the list.
+        `ON CONFLICT (vmid) DO UPDATE SET
+           node = EXCLUDED.node, name = EXCLUDED.name,
+           printers = COALESCE(EXCLUDED.printers, pmr_vm_printers.printers),
+           read_at  = COALESCE(EXCLUDED.read_at,  pmr_vm_printers.read_at),
+           source   = CASE WHEN EXCLUDED.printers IS NOT NULL
+                           THEN EXCLUDED.source ELSE pmr_vm_printers.source END,
+           error    = EXCLUDED.error,
+           updated_at = now()`,
+        // 7 BOUND PARAMS. updated_at is the 8th COLUMN and is supplied as the literal now() by
+        // the trailing argument below, so it is not counted here. The number must stay equal to
+        // the length of every row in the .map() — nothing derives one from the other, and a
+        // mismatch makes every tick 500 at bind time. That bug has shipped twice in this file.
+        7,
+        uniq.map((v) => [
+          Number(v.vmid), nz(v.node), nz(v.name),
+          // text[] binds straight from a JS array of strings. Never interpolated.
+          withList(v) ? v.printers.map((s) => String(s)) : null,
+          withList(v) ? v.read_at : null,
+          withList(v) ? (v.source || 'guest-agent') : null,
+          nz(v.error),
+        ]),
+        // NOT placeholders(): the two nullable non-scalar columns carry an explicit cast, the
+        // same way flags::text[] and the job-args bind do above. A bare NULL parameter inside
+        // the COALESCE in the SET list has no column to take its type from, and Postgres
+        // answers that with "could not determine data type of parameter" — at bind time, on
+        // every tick, for the one row shape that is most common (a VM with no reading).
+        // updated_at is the 8th COLUMN, filled by the literal now(), and binds nothing.
+        (o) => `($${o},$${o + 1},$${o + 2},$${o + 3}::text[],$${o + 4}::timestamptz,`
+             + `$${o + 5},$${o + 6},now())`
+      );
+    });
+    return { printer_rows: uniq.length, printer_lists: uniq.filter(withList).length };
+  }
+
+  // ── the per-site read the printers modal polls ─────────────────────────────
+  // Every VM the site's thin clients can be pointed at, each with its printer reading or with
+  // the reading's absence stated. pharmacy_vms_v rather than the desktops alone: the modal
+  // looks a desktop up BY VMID, so an extra row costs nothing and a missing row is exactly the
+  // failure this feed is clearing.
+  //
+  // LEFT JOIN, and it must stay one. A desktop with no reading has to appear WITH A NULL, not
+  // vanish — an omitted key becomes a confident "no printers" in the UI.
+  async function listDesktopPrinters(pharmacyId) {
+    return await rows(
+      `SELECT v.vmid, v.role, v.source AS vm_source, v.counter_id,
+              pv.name, pv.node, pv.status, pv.agent_ok, pv.agent_error,
+              pr.printers, pr.read_at, pr.source AS printer_source, pr.error AS printer_error
+         FROM pharmacy_vms_v v
+         LEFT JOIN proxmox_vms pv ON pv.vmid = v.vmid
+         LEFT JOIN pmr_vm_printers pr ON pr.vmid = v.vmid
+        WHERE v.pharmacy_id = $1
+        ORDER BY v.vmid`,
+      [pharmacyId]
+    );
   }
 
   // Fill in what discovery can prove, and report what it cannot resolve.
@@ -2707,14 +4276,27 @@ function makePgStore(poolOrConfig) {
       const m = /-cl0*(\d+)$/i.exec(v.name || '');
       if (!m) continue;
       const n = Number(m[1]);
-      const counter = await one(`SELECT id, vmid FROM counters WHERE pharmacy_id = $1 AND n = $2`, [v.pharmacy_id, n]);
+      const counter = await one(`SELECT id, vmid, boot_vmid FROM counters WHERE pharmacy_id = $1 AND n = $2`, [v.pharmacy_id, n]);
       if (!counter) {
         // A desktop VM exists for a counter nobody has recorded — worth knowing, since it
         // means the registry is behind reality rather than ahead of it.
         out.conflicts.push({ kind: 'counter_missing', pharmacy_id: v.pharmacy_id, counter_n: n, discovered: v.vmid, name: v.name });
         continue;
       }
-      if (counter.vmid == null) {
+      // NEVER guess against an explicit choice. This match is made on the `pmr-<code>-cl<n>`
+      // NAME convention, which assumes every position owns a VM named for its own index — and
+      // that is wrong wherever a position opens the site's PMR server instead. At iPharm the
+      // single client VM is called cl01 but belongs to position 2, so this linked vm 306 to
+      // position 1, which boots 305. The result was a phantom registration at an address
+      // (.11) that no VM holds — now provable, because the guest agent reports 306 on .12.
+      //
+      // `boot_vmid` is the directive the platform actually pushes to the Pi. If a position has
+      // one and it names a different VM, the name convention is simply wrong about this site:
+      // report it and leave the record alone.
+      if (counter.boot_vmid != null && counter.boot_vmid !== v.vmid) {
+        out.conflicts.push({ kind: 'counter_boots_other', counter_id: counter.id, counter_n: n,
+          boots: counter.boot_vmid, discovered: v.vmid, name: v.name });
+      } else if (counter.vmid == null) {
         await q(`UPDATE counters SET vmid = $2, vm_hostname = COALESCE(vm_hostname, $3) WHERE id = $1`,
           [counter.id, v.vmid, v.name]);
         out.counters_linked += 1;
@@ -2725,23 +4307,1352 @@ function makePgStore(poolOrConfig) {
     return out;
   }
 
+  // The estate-wide VM Management list. Same capacity join as listPharmacyVms, and it has to be
+  // here: the Desktop UI renders the capacity cell on THESE rows too, and without the join every
+  // one of them read "not reported" permanently — VM 305 at 88% full included — with a tooltip
+  // asserting nothing had ever sampled it. Only the per-site hub tab was ever right.
+  //
+  // ALIAS `cap`, NOT `pv`: `v` is the view here, and a duplicated LEFT JOIN alias in this file
+  // once raised 42712 "table name pv specified more than once" and 500ed three callers. `cap` is
+  // free in this query.
+  //
+  // cap.cores AND cap.sampled_at ARE ALIASED. proxmox_vms_v already exposes `cores` (and its own
+  // `seen_at`), and node-postgres keeps the LAST column of a duplicated name — so an unaliased
+  // cap.cores would silently overwrite the inventory's core count in the result object, and
+  // shapeVmCapacity reads `capacity_sampled_at` by that exact name to decide whether a row was
+  // ever sampled at all.
+  //
+  // LEFT JOIN, and it must stay one: a VM with no guest agent legitimately has no capacity row,
+  // and an inner join would make it VANISH from the estate list rather than show as unknown.
   async function listProxmoxVms() {
-    return rows(`SELECT * FROM proxmox_vms_v ORDER BY vlan_tag NULLS LAST, vmid`, []);
+    const list = await rows(
+      `SELECT v.*,
+              -- Top-level, and ALIASED below, for the reason shapeVmCapacity states: the
+              -- capacity row is absent on every VM without a guest agent, and maxmem is the
+              -- configured size whether or not anyone could ask the guest.
+              COALESCE(cap.mem_max_bytes, v.maxmem) AS mem_max_bytes,
+              cap.cores AS capacity_cores, cap.mem_max_bytes AS capacity_mem_max_bytes,
+              cap.cpu_pct_1d, cap.cpu_pct_7d, cap.cpu_pct_30d,
+              cap.mem_bytes_1d, cap.mem_bytes_7d, cap.mem_bytes_30d, cap.mem_pressure_1d,
+              cap.disk_mount, cap.disk_used_bytes, cap.disk_total_bytes,
+              cap.disk_used_1d, cap.disk_used_7d, cap.disk_used_30d, cap.disk_source,
+              cap.rrd_error AS capacity_rrd_error, cap.sampled_at AS capacity_sampled_at
+         FROM proxmox_vms_v v
+         LEFT JOIN pmr_vm_capacity cap ON cap.vmid = v.vmid
+        ORDER BY v.vlan_tag NULLS LAST, v.vmid`,
+      []
+    );
+    return list.map(shapeVmCapacity);
   }
 
   // Expose the pool so callers (bin/migrate, graceful shutdown) can end() it.
+  // ══════════════════════════════════════════════════════════════════════════
+  // THE PMR CONTROL PLANE — opening hours, intended state, jobs
+  // ══════════════════════════════════════════════════════════════════════════
+
+  // ── opening hours ─────────────────────────────────────────────────────────
+  // THE helper. "Is site X open at time T, when does it next close, when does it next
+  // open, and where did those hours come from?" Everything else in this design calls it:
+  // the API, the UI, the nightly scheduler, and — as pmr_disruptive_allowed() inside the
+  // claim statement — the gate on every disruptive job. (site_open_at(), which this comment
+  // used to name, is deleted: see the block above pmr_disruptive_allowed in db/schema.sql.)
+  //
+  // The decision itself is site_hours_state() in db/schema.sql, not JavaScript here. That
+  // is not tidiness: the gate has to be evaluated INSIDE the statement that claims a job
+  // (the ingest is a 3-worker cluster, and read-then-decide-then-claim would let two
+  // workers hand out the same session restart), and opening hours are timezone-dependent,
+  // so one implementation of BST/GMT is already one more than nobody can get wrong.
+  // ⚠️ `resolved` is selected and must stay selected. It is what carries "we do not know"
+  // out of Postgres and into the serialiser, which then OMITS openNow rather than sending
+  // false — see openingHours.hoursPayload and the asymmetry note in db/schema.sql.
+  //
+  // ⛔ AND `gate_resolved` IS SELECTED, AND IS NOT THE SAME COLUMN (A1). `resolved` is true
+  // for every pharmacy in the estate — site_hours_v hands every unknown weekday the estate
+  // fallback window, and the mere existence of that row satisfies it — so a caller that reads
+  // `resolved` and then decides whether to interrupt a live counter is deciding out of a
+  // guess. That is exactly what requireDeliberateInterruption() was doing, which is what made
+  // its unresolved arm dead code for every real counter. Anything that can sign a member of
+  // staff out reads gate_resolved, through openingHours.gateResolved().
+  async function getSiteHours(pharmacyId, at) {
+    return one(
+      `SELECT is_open, hours_source, next_open_at, next_close_at, site_timezone, resolved,
+              gate_resolved
+         FROM site_hours_state($1, COALESCE($2::timestamptz, now()))`,
+      [pharmacyId, at || null]
+    );
+  }
+
+  // "May an unattended disruptive job run at this site right now, and if not, when?"
+  //
+  // The same two functions the claim query and the job INSERT use, exposed as one read so a
+  // caller can decide BEFORE creating work. The nightly pass asks this once per site: a
+  // pharmacy that never closes has no window at all, and the right response is to record
+  // that and create nothing — not to queue a restart that can only expire.
+  async function siteDisruptiveWindow(pharmacyId, at) {
+    return one(
+      `SELECT pmr_disruptive_allowed($1, COALESCE($2::timestamptz, now()))      AS allowed_now,
+              site_next_disruptive_window($1, COALESCE($2::timestamptz, now())) AS next_window_at,
+              (SELECT s.resolved FROM site_hours_state($1, COALESCE($2::timestamptz, now())) s)
+                AS hours_resolved,
+              -- ⛔ The one the ANSWER above actually depends on (A1). hours_resolved is true
+              -- for every site in the estate and explains nothing; this is why allowed_now is
+              -- false and why next_window_at is null, and the UI needs it to say "nobody has
+              -- entered this site's hours" instead of "it is open".
+              site_hours_gate_resolved($1, COALESCE($2::timestamptz, now()))
+                AS hours_gate_resolved`,
+      [pharmacyId, at || null]
+    );
+  }
+
+  // The effective week as the editor shows it, straight off the one view the resolver
+  // reads — so the screen can never offer hours the gate would then disagree with. A site
+  // with no rows of its own comes back as the estate fallback, labelled 'fallback'.
+  async function listSiteHours(pharmacyId) {
+    return rows(
+      `SELECT wday, opens_s, closes_s, source, label
+         FROM site_hours_v WHERE pharmacy_id = $1
+        ORDER BY wday, opens_s`,
+      [pharmacyId]
+    );
+  }
+
+  // The weekdays somebody has stated the site does NOT trade. Read alongside the week
+  // because the two together are the whole answer: a weekday in neither list is UNKNOWN,
+  // which the view answers with the estate fallback window and the gate answers with "do
+  // not disrupt". Without this list the editor cannot tell an operator which of its blank
+  // days are a decision and which are a gap.
+  async function listSiteClosedDays(pharmacyId) {
+    return rows(
+      `SELECT wday, source, created_by, created_at
+         FROM pharmacy_hours_closed WHERE pharmacy_id = $1 ORDER BY wday`,
+      [pharmacyId]
+    );
+  }
+
+  async function listSiteHoursExceptions(pharmacyId) {
+    return rows(
+      `SELECT on_date, opens_s, closes_s, reason, created_by
+         FROM pharmacy_hours_exceptions
+        WHERE pharmacy_id = $1 AND on_date >= current_date - 30
+        ORDER BY on_date`,
+      [pharmacyId]
+    );
+  }
+
+  // Replace a site's whole week in ONE transaction. Whole-week, never per-row: hours are
+  // only correct as a set (the overlap check in openingHours.validateWeek is a property of
+  // the week, not of a block), and a half-applied edit would leave a site whose Tuesday
+  // came from the new plan and whose Wednesday came from the old one.
+  //
+  // `blocks` must already have been through openingHours.validateWeek — this writes
+  // straight into a table the hours gate reads.
+  async function setSiteHours(pharmacyId, blocks, f = {}) {
+    const list = Array.isArray(blocks) ? blocks : [];
+    const closed = Array.isArray(f.closed_wdays) ? f.closed_wdays : [];
+    const source = f.source === 'voip' ? 'voip' : 'manual';
+    return tx(async (client) => {
+      const site = await client.query(`SELECT id FROM pharmacies WHERE id = $1`, [pharmacyId]);
+      if (!site.rows.length) return null;
+      // Scoped to the SOURCE being written. A VoIP import replaces the rows it owns and
+      // leaves a typed override alone; a manual edit replaces the manual rows. Deleting the
+      // whole site's hours on either path would make an import silently discard an
+      // operator's correction, which is how two sources of truth start disagreeing.
+      await client.query(
+        `DELETE FROM pharmacy_hours WHERE pharmacy_id = $1 AND source = $2`,
+        [pharmacyId, source]
+      );
+      for (const b of list) {
+        await client.query(
+          `INSERT INTO pharmacy_hours
+             (pharmacy_id, wday, opens_s, closes_s, source, voip_rule_id, label, updated_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (pharmacy_id, wday, opens_s) DO UPDATE SET
+             closes_s = EXCLUDED.closes_s, source = EXCLUDED.source,
+             voip_rule_id = EXCLUDED.voip_rule_id, label = EXCLUDED.label,
+             updated_at = now(), updated_by = EXCLUDED.updated_by`,
+          [pharmacyId, b.wday, b.opens_s, b.closes_s, source, nz(b.voip_rule_id), nz(b.label), nz(f.by)]
+        );
+      }
+      // The closed weekdays go in the SAME transaction, for the same reason the blocks do:
+      // "Tuesday has no rows" and "Tuesday is a day we do not trade" are different states,
+      // and a half-applied edit that left the site with the first when the operator meant
+      // the second would make the gate treat a closed day as unknown (harmless) or — the
+      // way that matters — leave a stale closed marker on a day that now trades, which
+      // makes an unattended restart legal on a trading morning.
+      await client.query(
+        `DELETE FROM pharmacy_hours_closed WHERE pharmacy_id = $1 AND source = $2`,
+        [pharmacyId, source]
+      );
+      for (const wday of closed) {
+        await client.query(
+          `INSERT INTO pharmacy_hours_closed (pharmacy_id, wday, source, created_by)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (pharmacy_id, wday) DO UPDATE SET
+             source = EXCLUDED.source, created_by = EXCLUDED.created_by, created_at = now()`,
+          [pharmacyId, wday, source, nz(f.by)]
+        );
+      }
+      return { pharmacy_id: pharmacyId, blocks: list.length, closed_wdays: closed.length, source };
+    });
+  }
+
+  // A bank holiday or a one-off closure. Both times null = closed all day, which is the
+  // common case and the reason this is a separate table from the weekly pattern.
+  async function setSiteHoursException(pharmacyId, f = {}) {
+    return one(
+      `INSERT INTO pharmacy_hours_exceptions
+         (pharmacy_id, on_date, opens_s, closes_s, reason, created_by)
+       VALUES ($1, $2::date, $3, $4, $5, $6)
+       ON CONFLICT (pharmacy_id, on_date) DO UPDATE SET
+         opens_s = EXCLUDED.opens_s, closes_s = EXCLUDED.closes_s,
+         reason = EXCLUDED.reason, created_by = EXCLUDED.created_by
+       RETURNING pharmacy_id, on_date, opens_s, closes_s, reason`,
+      [pharmacyId, f.on_date, f.opens_s == null ? null : f.opens_s,
+        f.closes_s == null ? null : f.closes_s, nz(f.reason), nz(f.by)]
+    );
+  }
+
+  async function deleteSiteHoursException(pharmacyId, onDate) {
+    const r = await q(
+      `DELETE FROM pharmacy_hours_exceptions WHERE pharmacy_id = $1 AND on_date = $2::date`,
+      [pharmacyId, onDate]
+    );
+    return { deleted: r.rowCount || 0 };
+  }
+
+  // The estate fallback window. READ ONLY from the API on purpose: it is one fixed window
+  // for the whole estate, deliberately generous, and the thing it protects is a site nobody
+  // has told us the hours of. Narrowing it is a schema change with a review, not a form.
+  async function getEstateHours() {
+    return one(`SELECT wdays, opens_s, closes_s, updated_at, updated_by FROM estate_hours WHERE id = 1`);
+  }
+
+  // ── intended state ────────────────────────────────────────────────────────
+  // What Watchman WANTS for a subject. `field` and `want` are validated by
+  // pmrVerbs.validateIntent before they get here — this writes into a table a reconciler
+  // acts on, so it must never see an unvalidated value.
+  //
+  // ⚠️ THE SUBJECT IS RESOLVED HERE, NOT TAKEN FROM THE CALLER (B5). PUT /pmr/intent used to
+  // INSERT whatever vmid the body named, while POST /pmr/jobs resolved the same value
+  // through pharmacy_vms_v — so the cheaper route round the back was to write an intent for
+  // any vmid the cluster reports and let the reconciler turn it into a real vm.set-onboot
+  // job on that VM's node. An intent is not a note; it is a standing instruction to a loop
+  // that creates jobs, so it gets the same resolution the job path gets.
+  //
+  // The resolution is a JOIN inside the same statement, for every property createPmrVmJob
+  // relies on: an unregistered vmid produces no row, the INSERT matches nothing, and the
+  // caller reports the 404 the handler already tries to return — rather than a guess.
+  async function setPmrIntent(f = {}) {
+    return one(
+      `WITH subject AS (
+         SELECT p.id AS pharmacy_id,
+                CASE WHEN $1 = 'vm' THEN v.vmid END       AS vmid,
+                CASE WHEN $1 = 'counter' THEN c.id END    AS counter_id
+           FROM pharmacies p
+           -- A vm intent must name a vmid REGISTERED to this pharmacy. The join is dropped
+           -- for every other subject kind by the $1 test, so a counter intent is not asked
+           -- to produce a VM.
+           LEFT JOIN pharmacy_vms_v v ON $1 = 'vm' AND v.pharmacy_id = p.id AND v.vmid = $4
+           -- A counter intent must name a counter AT this pharmacy, for the same reason.
+           LEFT JOIN counters c ON $1 = 'counter' AND c.pharmacy_id = p.id AND c.id = $3
+          WHERE p.id = $2
+            AND ($1 <> 'vm' OR v.vmid IS NOT NULL)
+            AND ($1 <> 'counter' OR c.id IS NOT NULL)
+          -- One row, always. A duplicate here would make ON CONFLICT try to affect the same
+          -- intent row twice in one statement, which Postgres refuses outright.
+          LIMIT 1
+       )
+       INSERT INTO pmr_intent
+         (subject_kind, pharmacy_id, counter_id, vmid, printer_key, field, want, set_by)
+       SELECT $1, sj.pharmacy_id, sj.counter_id, sj.vmid, $5, $6, $7::jsonb, $8
+         FROM subject sj
+       ON CONFLICT (subject_kind, pharmacy_id, COALESCE(counter_id, 0), COALESCE(vmid, 0),
+                    COALESCE(printer_key, ''), field)
+       DO UPDATE SET want = EXCLUDED.want, set_by = EXCLUDED.set_by, set_at = now(),
+         -- Cleared on every change, for the same reason setCounterBootTarget clears
+         -- boot_applied_at: until the world has been read again, the previous reading says
+         -- nothing about the NEW intention, and leaving it would render as "already met".
+         observed = NULL, observed_at = NULL, last_job_id = NULL
+       RETURNING id, subject_kind, pharmacy_id, counter_id, vmid, printer_key, field,
+                 want, observed, observed_at, set_by, set_at`,
+      [f.subject_kind, f.pharmacy_id, f.counter_id == null ? null : f.counter_id,
+        f.vmid == null ? null : f.vmid, nz(f.printer_key), f.field,
+        JSON.stringify(f.want), nz(f.by)]
+    );
+  }
+
+  async function listPmrIntent(pharmacyId) {
+    return rows(
+      `SELECT i.id, i.subject_kind, i.pharmacy_id, i.counter_id, i.vmid, i.printer_key,
+              i.field, i.want, i.observed, i.observed_at, i.last_job_id, i.set_by, i.set_at,
+              (i.observed IS NOT NULL AND i.observed = i.want) AS met
+         FROM pmr_intent i
+        WHERE ($1::bigint IS NULL OR i.pharmacy_id = $1)
+        ORDER BY i.pharmacy_id, i.field, i.vmid NULLS FIRST, i.counter_id NULLS FIRST`,
+      [pharmacyId == null ? null : pharmacyId]
+    );
+  }
+
+  async function deletePmrIntent(id) {
+    const r = await q(`DELETE FROM pmr_intent WHERE id = $1`, [id]);
+    return { deleted: r.rowCount || 0 };
+  }
+
+  // ── creating a job ────────────────────────────────────────────────────────
+  // ARGUMENTS ARE RESOLVED SERVER-SIDE, IN THE SAME STATEMENT AS THE INSERT. This is
+  // setCounterBootTarget's shape and every one of its properties is load-bearing here too:
+  // the caller passes an IDENTIFIER (a counter id, a pharmacy + vmid) and never an address
+  // or a node name; the resolution reads the SAME view the picker offers, so a choice the
+  // UI can show always resolves; an unresolvable target yields no row, the INSERT matches
+  // nothing and the caller reports a REFUSAL rather than a guess; and there is no window in
+  // which a resolved value could be written for a target that stopped being valid.
+  //
+  // The verb, its disruptive/retry flags, its confirming reading and its time limits all
+  // come from the CLOSED allowlist in src/shared/pmrVerbs.js, applied by the caller. This
+  // function never invents any of them, and the DB CHECKs refuse a row that carries a verb
+  // or a confirm kind outside those sets.
+
+  // A job for the Pi on one counter. Resolves the executing device AND the site whose
+  // opening hours will gate it — a job with no pharmacy_id would be ungated, and
+  // pmr_disruptive_allowed() answers FALSE for an unknown site precisely so that case still
+  // waits. (This comment used to credit site_open_at(), which is now deleted — D8.)
+  //
+  // ⚠️ THE HELD JOB'S CLOCK STARTS WHEN THE GATE OPENS (S1/S12). not_before was set by NO
+  // code path, and a deferred disruptive job carried a 5400-second TTL from the moment it
+  // was written — so a restart raised at 11:00 was correctly held by the hours gate, and
+  // then EXPIRED at 12:30, thirteen hours before the midnight the wait-reason sentence had
+  // literally promised the operator. The row said one thing and the timer did another.
+  //
+  // Both are now computed from site_next_disruptive_window(): not_before IS the promise, and
+  // the expiry is that same instant plus the verb's TTL. A job held by the gate cannot
+  // expire before it was ever eligible.
+  //
+  // And if there is NO window — a 24-hour pharmacy — the INSERT deliberately matches nothing
+  // and the caller reports a refusal. Queuing a restart that can only ever expire is how the
+  // pre-opening check ends up emailing about a counter that is perfectly healthy.
+  async function createPmrCounterJob(counterId, f = {}) {
+    return one(
+      `WITH resolved AS (
+         -- The counter's own row is the resolution source. A counter with no thin client
+         -- enrolled yields no row, which the caller reports as a refusal: there is nothing
+         -- to send it to, and inventing a device id is how a job goes to the wrong Pi.
+         SELECT c.id AS counter_id, c.pharmacy_id, c.pi_device_id
+           FROM counters c
+          WHERE c.id = $1 AND c.pi_device_id IS NOT NULL
+       ), gated AS (
+         SELECT r.*,
+                CASE WHEN $4::boolean THEN pmr_disruptive_allowed(r.pharmacy_id, now())
+                     ELSE true END AS allowed_now
+           FROM resolved r
+       ), held AS (
+         SELECT g.*,
+                CASE WHEN g.allowed_now THEN NULL
+                     ELSE site_next_disruptive_window(g.pharmacy_id, now()) END AS hold_until
+           FROM gated g
+       )
+       INSERT INTO pmr_jobs
+         (verb, executor, pi_device_id, pharmacy_id, counter_id, args, disruptive, retry_ok,
+          confirm_kind, confirm_deadline_s, not_before, expires_at, claim_ttl_s, max_attempts,
+          intent_id, created_by)
+       SELECT $2, 'counter-pi', h.pi_device_id, h.pharmacy_id, h.counter_id,
+              $3::jsonb, $4, $5, $6, $7,
+              COALESCE($8::timestamptz, h.hold_until),
+              COALESCE($8::timestamptz, h.hold_until, now()) + make_interval(secs => $9),
+              $10, $11, $12, $13
+         FROM held h
+        WHERE h.allowed_now OR h.hold_until IS NOT NULL
+       RETURNING id, verb, status, disruptive, pharmacy_id, counter_id, not_before,
+                 expires_at, created_at`,
+      [counterId, f.verb, JSON.stringify(f.args || {}), !!f.disruptive, !!f.retry_ok,
+        f.confirm_kind, f.confirm_deadline_s, f.not_before || null, f.ttl_s, f.claim_ttl_s,
+        f.max_attempts == null ? 3 : f.max_attempts,
+        f.intent_id == null ? null : f.intent_id, nz(f.by) || 'watchman']
+    );
+  }
+
+  // A job for the Proxmox node that hosts one VM.
+  //
+  // TWO resolutions, and both matter. `pharmacy_vms_v` decides whether this pharmacy is
+  // allowed to name this vmid at all — the same view the VM picker reads, so a VM
+  // discovered on the site's VLAN but never registered to the site is REFUSED rather than
+  // guessed at. `proxmox_vms` then supplies the NODE, which is what makes the job
+  // deliverable: a node collects only jobs addressed to it, and the node name is never
+  // taken from the caller.
+  //
+  // The resolved vmid and node are merged OVER the caller's args, so a caller-supplied
+  // vmid can never be the one an executor acts against.
+  async function createPmrVmJob(pharmacyId, vmid, f = {}) {
+    return one(
+      `WITH resolved AS (
+         SELECT p.id AS pharmacy_id, v.vmid, pv.node
+           FROM pharmacies p
+           JOIN pharmacy_vms_v v ON v.pharmacy_id = p.id AND v.vmid = $2
+           JOIN proxmox_vms pv   ON pv.vmid = v.vmid AND pv.node IS NOT NULL
+          WHERE p.id = $1
+       )
+       , gated AS (
+         SELECT r.*,
+                CASE WHEN $5::boolean THEN pmr_disruptive_allowed(r.pharmacy_id, now())
+                     ELSE true END AS allowed_now
+           FROM resolved r
+       ), held AS (
+         SELECT g.*,
+                CASE WHEN g.allowed_now THEN NULL
+                     ELSE site_next_disruptive_window(g.pharmacy_id, now()) END AS hold_until
+           FROM gated g
+       )
+       INSERT INTO pmr_jobs
+         (verb, executor, node, pharmacy_id, vmid, args, disruptive, retry_ok,
+          confirm_kind, confirm_deadline_s, not_before, expires_at, claim_ttl_s, max_attempts,
+          intent_id, created_by)
+       SELECT $3, 'proxmox-node', h.node, h.pharmacy_id, h.vmid,
+              $4::jsonb || jsonb_build_object('vmid', h.vmid),
+              $5, $6, $7, $8,
+              COALESCE($9::timestamptz, h.hold_until),
+              COALESCE($9::timestamptz, h.hold_until, now()) + make_interval(secs => $10),
+              $11, $12, $13, $14
+         FROM held h
+        WHERE h.allowed_now OR h.hold_until IS NOT NULL
+       RETURNING id, verb, status, disruptive, pharmacy_id, vmid, node, not_before,
+                 expires_at, created_at`,
+      [pharmacyId, vmid, f.verb, JSON.stringify(f.args || {}), !!f.disruptive, !!f.retry_ok,
+        f.confirm_kind, f.confirm_deadline_s, f.not_before || null, f.ttl_s, f.claim_ttl_s,
+        f.max_attempts == null ? 3 : f.max_attempts,
+        f.intent_id == null ? null : f.intent_id, nz(f.by) || 'watchman']
+    );
+  }
+
+  // ── claiming a job ────────────────────────────────────────────────────────
+  // Handing a job out in a poll reply IS the claim, so it must be atomic with the read.
+  // FOR UPDATE SKIP LOCKED, not read-then-update: the ingest runs a 3-worker cluster and
+  // two of a Pi's ticks (or two nodes' pushes) can land on different processes at once.
+  // claimRelayRequest is the working precedent; config_jobs has no lock because there a job
+  // is claimed by being SERVED to one authenticated device, which does not hold here.
+  //
+  // THREE GATES, all in the one predicate:
+  //   * expires_at — an unclaimed job EXPIRES rather than firing late. A session restart
+  //     queued at midnight must not go off at 09:20 because a Pi came back late.
+  //   * the visibility timeout — a lapsed claim is re-offered ONLY when the verb says it is
+  //     re-runnable, the same idempotent/not distinction claimRelayRequest draws with
+  //     method IN ('GET','HEAD'). Re-handing out a shutdown is not free.
+  //   * pmr_job_wait_reason() — the hours gate, and the ONE definition of it. A disruptive
+  //     job at an open site is skipped here and pmr_jobs_v reports the identical reason, so
+  //     "ready" on the screen and "claimable" in the database cannot drift.
+  //
+  // TWO MORE GATES since, and both close a way this loop could run away:
+  //   * THE ATTEMPTS CAP (B3). retry_ok says a lapsed claim MAY be re-offered; max_attempts
+  //     says how often. counter.session-restart has a 120-second claim TTL inside a
+  //     5400-second life, so without a cap a Pi that took a restart and never reported —
+  //     the ordinary case, because restarting the session can lose the reply — was handed
+  //     the same sign-out forty-five times. The cap is in the predicate AND in
+  //     pmr_job_wait_reason, so the screen says why it stopped.
+  //   * AN OVERRIDDEN JOB IS OFFERED ONCE (B3). override_hours is stored permanently, so
+  //     after an apply-now the hours gate is off for that row FOREVER — and a re-offer
+  //     under a lapsed claim would then fire INSIDE opening hours, repeatedly, which is the
+  //     exact thing the operator authorised once.
+  //
+  // AND ONE CAPABILITY GATE (S10). Handing the job out IS the claim: there is no ack. An
+  // executor that does not understand `pmr_job` therefore SWALLOWS it — pending, claimed,
+  // expired — and the pre-opening check then emails "counters may not open" about a
+  // perfectly healthy counter, every night, for the whole estate. The shipped Pi agent
+  // reports agent_version 1 and has no pmr_job branch at all, so it must be offered NOTHING
+  // until the build that implements the key reports PMR_JOB_AGENT_VERSION.
+  async function claimPmrJobForDevice(deviceId, claimedBy, minAgentVersion) {
+    if (!isUuid(deviceId)) return null;
+    // No floor supplied is not "no floor": an unknown requirement must not become an open
+    // door. The caller passes pmrVerbs.PMR_JOB_AGENT_VERSION; anything else refuses.
+    const floor = Number.isInteger(minAgentVersion) && minAgentVersion > 0 ? minAgentVersion : null;
+    if (floor === null) return null;
+    return one(
+      `UPDATE pmr_jobs j
+          SET status = 'claimed', claimed_at = now(), claimed_by = $2,
+              attempts = j.attempts + 1
+        WHERE j.id = (
+          SELECT q.id FROM pmr_jobs q
+           WHERE q.executor = 'counter-pi'
+             AND q.pi_device_id = $1
+             AND q.expires_at > now()
+             AND q.attempts < q.max_attempts
+             AND NOT (q.override_hours AND q.attempts > 0)
+             AND (q.status = 'pending'
+                  OR (q.status = 'claimed' AND q.retry_ok
+                      AND q.claimed_at < now() - make_interval(secs => q.claim_ttl_s)))
+             AND pmr_job_wait_reason(q, now()) IS NULL
+             -- The executor's own reported version, out of the telemetry body this device
+             -- already posts. The cast is inside a CASE, never guarded by an AND: SQL does
+             -- not promise left-to-right evaluation, so a regex test AND-ed with a cast
+             -- can still run the cast first and error the whole claim on one malformed
+             -- payload. A device that has never reported yields NULL, and NULL >= n is not
+             -- true — which is the safe answer.
+             AND (SELECT CASE WHEN (ds.raw ->> 'agent_version') ~ '^[0-9]{1,9}$'
+                              THEN (ds.raw ->> 'agent_version')::int END
+                    FROM device_state ds WHERE ds.device_id = q.pi_device_id) >= $3
+           ORDER BY q.created_at
+           FOR UPDATE SKIP LOCKED
+           LIMIT 1
+        )
+        RETURNING j.id AS job_id, j.verb, j.args`,
+      [deviceId, nz(claimedBy) || 'counter-pi', floor]
+    );
+  }
+
+  // The node variant. Hands out SEVERAL jobs, because this executor's poll is 15 minutes
+  // and its timer carries an explicit do-not-shorten warning — one job per tick would take
+  // an hour to set onboot on four VMs at one site. Bounded so a backlog cannot arrive as
+  // one enormous reply.
+  //
+  // ⚠️ AND THE SAME CAPABILITY FLOOR THE PI PATH HAS (D4). This path carried the hours gate
+  // and the attempts cap but no floor at all, which made it one PROXMOX_NODE_TOKENS entry
+  // away from the exact failure S10 describes: the SHIPPED collector posts
+  // {"vms","capacity"} and parses no `jobs` key, so the first per-node token issued to it
+  // would have made every job addressed to that node vanish — claimed on the reply, never
+  // executed, never reported, expired at its deadline. On this path the vanishing verbs
+  // include vm.shutdown and vm.reboot, so "claimed and silently lost" would be a live
+  // pharmacy desktop believed to have been shut down.
+  //
+  // Handing a job out IS the claim on this executor too: it rides the reply to a push the
+  // collector already makes, and there is no ack. So the floor is checked BEFORE anything is
+  // selected, and a collector below it sees no jobs — the correct direction, because a job
+  // never offered stays pending and shows as waiting.
+  //
+  // `collectorVersion` is the collector's own claim about itself, out of the body it also
+  // authored. That is the same trust as the Pi's agent_version (read from device_state.raw,
+  // which the agent wrote), and it is acceptable for the same reason: the failure direction
+  // is "a capable collector is offered no work", never "an incapable one is". A collector
+  // that lies UPWARD swallows its own jobs, which is a bug in that collector and visible as
+  // jobs that expire against one node.
+  async function claimPmrJobsForNode(node, limit, collectorVersion, minCollectorVersion) {
+    const name = typeof node === 'string' ? node.trim() : '';
+    if (!name) return [];
+    // No floor supplied is not "no floor" — the same refusal claimPmrJobForDevice makes. The
+    // caller passes pmrVerbs.PMR_JOB_COLLECTOR_VERSION; anything else hands out nothing.
+    const floor = Number.isInteger(minCollectorVersion) && minCollectorVersion > 0
+      ? minCollectorVersion : null;
+    if (floor === null) return [];
+    // A collector that reports NO version is pre-floor by definition. Checked as an integer
+    // and never parsed out of a string, for the same reason the settings whitelist refuses
+    // "24": a version arriving as text is a collector bug, and coercing it hides exactly the
+    // class of mistake this floor exists to catch.
+    const have = Number.isInteger(collectorVersion) ? collectorVersion : 0;
+    if (have < floor) return [];
+    const cap = Number.isInteger(limit) && limit > 0 && limit <= 20 ? limit : 4;
+    return rows(
+      `UPDATE pmr_jobs j
+          SET status = 'claimed', claimed_at = now(), claimed_by = $1,
+              attempts = j.attempts + 1
+        WHERE j.id IN (
+          SELECT q.id FROM pmr_jobs q
+           WHERE q.executor = 'proxmox-node'
+             AND q.node = $1
+             AND q.expires_at > now()
+             -- Same two loop-breakers as the Pi path (B3). The node's claim TTL is 1800s
+             -- rather than 120s, so the loop is slower — a slow loop that shuts a live
+             -- pharmacy desktop four times is still a loop.
+             AND q.attempts < q.max_attempts
+             AND NOT (q.override_hours AND q.attempts > 0)
+             AND (q.status = 'pending'
+                  OR (q.status = 'claimed' AND q.retry_ok
+                      AND q.claimed_at < now() - make_interval(secs => q.claim_ttl_s)))
+             AND pmr_job_wait_reason(q, now()) IS NULL
+           ORDER BY q.created_at
+           FOR UPDATE SKIP LOCKED
+           LIMIT $2
+        )
+        RETURNING j.id AS job_id, j.verb, j.args`,
+      [name, cap]
+    );
+  }
+
+  // ── the executor's report ─────────────────────────────────────────────────
+  // 'applied' means THE EXECUTOR SAYS IT RAN. It is not done. finished_at stays null and
+  // the confirm pass decides, from a reading nothing on the executor wrote.
+  //
+  // Ownership is re-checked here even though the caller authenticated, exactly as
+  // POST /config/result re-checks with getConfigJobForFetch and relayNext re-checks the
+  // session's device: a valid token for counter B must not be able to close counter A's
+  // job. Exactly one of the two scopes is supplied; the other is null and its arm cannot
+  // match.
+  async function recordPmrJobResult(jobId, f = {}, scope = {}) {
+    if (!isUuid(jobId)) return null;
+    const status = f.status === 'applied' ? 'applied' : 'failed';
+    return one(
+      `UPDATE pmr_jobs SET
+         status      = $2,
+         applied_at  = CASE WHEN $2 = 'applied' THEN now() ELSE applied_at END,
+         -- A failure is over. An 'applied' job is NOT: it is waiting to be proven, and
+         -- stamping finished_at here is precisely the "it exited 0, so it worked" mistake
+         -- this ladder exists to make impossible.
+         finished_at = CASE WHEN $2 = 'applied' THEN NULL ELSE now() END,
+         result_log  = $3
+       WHERE id = $1
+         AND status = 'claimed'
+         AND (($4::uuid IS NOT NULL AND pi_device_id = $4)
+           OR ($5::text IS NOT NULL AND node = $5))
+       RETURNING id, verb, status, confirm_kind, confirm_deadline_s, counter_id, pharmacy_id`,
+      [jobId, status, nz(f.result_log),
+        isUuid(scope.pi_device_id) ? scope.pi_device_id : null,
+        typeof scope.node === 'string' && scope.node.trim() ? scope.node.trim() : null]
+    );
+  }
+
+  // ── the independent observation, taken on the telemetry hot path ──────────
+  // Half the proof that a counter session really signed out: the moment a thin client
+  // reports its RDP client DOWN after a session-restart job was applied, stamp it.
+  //
+  // Computed from the state row the telemetry handler has ALREADY written this tick, so it
+  // needs nothing from the payload and no cooperation from the agent — the same trick
+  // getCounterBootDirective uses for its boot_applied_at stamp. Guarded on
+  // session_down_at IS NULL and on there being a job in flight, so the hot path writes once
+  // per restart rather than on every 30 s tick.
+  async function notePmrSessionDown(deviceId) {
+    if (!isUuid(deviceId)) return;
+    await q(
+      `UPDATE pmr_jobs j SET session_down_at = now()
+         FROM device_state ds
+        WHERE ds.device_id = j.pi_device_id
+          AND j.pi_device_id = $1
+          AND j.status = 'applied'
+          -- Both counter verbs that end in a session restart. The printer promote swaps the
+          -- staged table and restarts the session as ONE action (contract section 4), so the
+          -- same down-then-up transition is half of its proof too.
+          AND j.confirm_kind IN ('pi-session-restarted', 'pi-printers-promoted')
+          AND j.session_down_at IS NULL
+          AND (ds.raw -> 'rdp' ->> 'running') = 'false'`,
+      [deviceId]
+    );
+
+    // ── the OTHER half of the promote's proof (B2) ─────────────────────────
+    // pmrVerbs.js defends counter.printing-promote's self-attestation with "print_tab_pending
+    // must be observed TRUE-then-FALSE across the moment the job was applied". The FALSE half
+    // was tested; the TRUE half was never recorded anywhere, so the confirm pass could not
+    // tell "the staged table was promoted" from "this counter has never had one".
+    //
+    // Stamped here, on the same hot path and by the same trick as session_down_at: computed
+    // from the state row the telemetry handler has already written this tick, needing nothing
+    // from the payload and no cooperation from the agent.
+    //
+    // ⚠️ NOT RESTRICTED TO status='applied'. The staged table exists from the moment the tick
+    // sends it, which is BEFORE the job is claimed and long before it is applied — a promote
+    // waits for the site's overnight window. Waiting for 'applied' would look for TRUE in the
+    // one window where it is about to become FALSE, and would find it almost never. Every
+    // status that is still going somewhere is included; a job that already finished is not,
+    // so this writes once per job and not on every 30 s tick forever.
+    await q(
+      `UPDATE pmr_jobs j SET print_tab_staged_at = now()
+         FROM device_state ds
+        WHERE ds.device_id = j.pi_device_id
+          AND j.pi_device_id = $1
+          AND j.confirm_kind = 'pi-printers-promoted'
+          AND j.status IN ('pending', 'claimed', 'applied')
+          AND j.print_tab_staged_at IS NULL
+          AND (ds.raw -> 'peripherals' ->> 'print_tab_pending') = 'true'`,
+      [deviceId]
+    );
+  }
+
+  // ── DONE MEANS PROVEN: the confirm pass ───────────────────────────────────
+  // One set-based statement per confirming reading. Every one of them joins a table that
+  // some OTHER collector wrote — proxmox_vms from the node's 15-minute push, device_state
+  // from the Pi's own telemetry — and every one requires the reading to be NEWER than the
+  // moment the job was applied. A reading taken before the job ran proves nothing, and that
+  // freshness test is the whole difference between this and trusting an exit code.
+  //
+  // Nothing here can be reached by an executor. There is no route by which the thing that
+  // ran the job can also declare it confirmed.
+  async function confirmPmrJobs() {
+    let confirmed = 0;
+
+    // The counter session signed out and back in. TWO arms, either sufficient:
+    //   1. the Pi reports an RDP session that STARTED after the job was applied. This is
+    //      the deterministic proof and it needs one new agent-side field
+    //      (rdp.session_started_at); the arm is written now so it lights up the moment that
+    //      build lands, with no change here.
+    //   2. the session was independently OBSERVED down (notePmrSessionDown, above) and a
+    //      LATER reading shows it up again. This needs no new field and works today, but it
+    //      can miss a bounce that completes inside one 30 s tick — in which case the job
+    //      reaches its deadline and FAILS, which raises the counter in the pre-opening
+    //      check. Failing towards "somebody look at this before the pharmacy opens" is the
+    //      correct direction for the one job that must not be quietly assumed.
+    //
+    // The cast is inside a CASE, not guarded by an AND: SQL does not promise to evaluate
+    // AND left-to-right, so a `~ '^[0-9]+$' AND ...::bigint` pair can still evaluate the
+    // cast first and error the whole pass on one malformed payload.
+    const sess = await q(
+      `UPDATE pmr_jobs j
+          SET status = 'confirmed', confirmed_at = now(), finished_at = now(),
+              confirm_detail = CASE
+                WHEN r.started_ms IS NOT NULL THEN
+                  'the thin client reports an RDP session started after this job was applied'
+                ELSE
+                  'the RDP session was observed down at '
+                  || to_char(j.session_down_at, 'YYYY-MM-DD HH24:MI:SS')
+                  || ' and up again in a later reading' END
+         FROM device_state ds,
+              LATERAL (SELECT CASE
+                                WHEN (ds.raw -> 'rdp' ->> 'session_started_at') ~ '^[0-9]{1,19}$'
+                                THEN (ds.raw -> 'rdp' ->> 'session_started_at')::bigint
+                              END AS started_ms,
+                              (ds.raw -> 'rdp' ->> 'running') = 'true' AS rdp_up) r
+        WHERE ds.device_id = j.pi_device_id
+          AND j.status = 'applied'
+          AND j.confirm_kind = 'pi-session-restarted'
+          AND j.applied_at IS NOT NULL
+          AND ( r.started_ms > (EXTRACT(epoch FROM j.applied_at) * 1000)
+             OR (j.session_down_at IS NOT NULL AND r.rdp_up
+                 AND ds.last_seen_at > j.session_down_at) )`
+    );
+    confirmed += sess.rowCount || 0;
+
+    // The thin client actually rebooted: it is back, and its uptime is SHORTER than the
+    // time since the job was applied. Comparing uptime rather than "did it come back"
+    // matters — a Pi that never rebooted at all is also online and also reporting.
+    const piBoot = await q(
+      `UPDATE pmr_jobs j
+          SET status = 'confirmed', confirmed_at = now(), finished_at = now(),
+              confirm_detail = 'the thin client is back with an uptime of '
+                               || ds.uptime_s || 's, shorter than the age of this job'
+         FROM device_state ds
+        WHERE ds.device_id = j.pi_device_id
+          AND j.status = 'applied'
+          AND j.confirm_kind = 'pi-uptime-reset'
+          AND j.applied_at IS NOT NULL
+          AND ds.last_seen_at > j.applied_at
+          AND ds.uptime_s IS NOT NULL
+          AND ds.uptime_s < EXTRACT(epoch FROM (ds.last_seen_at - j.applied_at)) + 60`
+    );
+    confirmed += piBoot.rowCount || 0;
+
+    // THE STAGED PRINTER TABLE IS NO LONGER STAGED, and the session came back.
+    //
+    // print_tab_pending is the agent's own comparison of printers.tab.next against
+    // printers.tab, on significant lines only. The promote verb's whole job is to make that
+    // comparison equal and restart the session, so the pair (pending false, RDP up) in a
+    // reading taken AFTER the job was applied is the transition that proves both halves ran.
+    //
+    // ⚠️ The freshness test is what stops this confirming on a counter that never had a
+    // staged table at all: a reading OLDER than applied_at proves nothing, and a job is only
+    // ever raised for a counter whose effective table actually changed.
+    //
+    // ⚠️ SELF-ATTESTED — device_state.raw is the Pi's own writing. pmrVerbs.js says so on the
+    // verb, names the independent reading that would replace this (the guest agent's own
+    // printer list, read by the Proxmox collector), and states why shipping it this way is
+    // defensible for THIS verb.
+    const printersPromoted = await q(
+      `UPDATE pmr_jobs j
+          SET status = 'confirmed', confirmed_at = now(), finished_at = now(),
+              confirm_detail = CASE
+                WHEN j.session_down_at IS NOT NULL THEN
+                  'the thin client reports no staged printer table remaining, and its RDP '
+                  || 'session was observed down at '
+                  || to_char(j.session_down_at, 'YYYY-MM-DD HH24:MI:SS')
+                  || ' and up again in a later reading'
+                ELSE
+                  'the thin client reported a staged printer table at '
+                  || to_char(j.print_tab_staged_at, 'YYYY-MM-DD HH24:MI:SS')
+                  || ' and reports none remaining, with its RDP session up, in a reading '
+                  || 'taken after this job was applied' END
+         FROM device_state ds
+        WHERE ds.device_id = j.pi_device_id
+          AND j.status = 'applied'
+          AND j.confirm_kind = 'pi-printers-promoted'
+          AND j.applied_at IS NOT NULL
+          AND ds.last_seen_at > j.applied_at
+          -- ⛔ TRUE-THEN-FALSE, WHICH IS WHAT THE VERB'S DEFENCE ACTUALLY CLAIMS (B2). The
+          -- FALSE half is below; this is the half that was missing. Without it "no staged
+          -- table remaining" is satisfied by a counter that never had one — and since a
+          -- promote job is only ever raised for a counter whose effective table changed, the
+          -- freshness test alone left a real gap: a counter that lost the staged file some
+          -- other way (a hand-edit, a reimage, an agent that never wrote it) would confirm a
+          -- promotion that never happened, and 'confirmed' is the word this ladder exists to
+          -- make mean something.
+          AND j.print_tab_staged_at IS NOT NULL
+          AND (ds.raw -> 'peripherals' ->> 'print_tab_pending') = 'false'
+          AND (ds.raw -> 'rdp' ->> 'running') = 'true'`
+    );
+    confirmed += printersPromoted.rowCount || 0;
+
+    // Proxmox reports the flag as the job asked for it, in an inventory push taken AFTER
+    // the job was applied. This is the converging verb's reading, and it is what makes
+    // onboot safe to reconcile unattended: the loop can see for itself that it worked.
+    const onboot = await q(
+      `UPDATE pmr_jobs j
+          SET status = 'confirmed', confirmed_at = now(), finished_at = now(),
+              confirm_detail = 'proxmox reports onboot=' || (CASE WHEN v.onboot THEN '1' ELSE '0' END)
+                               || ' in the inventory push at '
+                               || to_char(v.seen_at, 'YYYY-MM-DD HH24:MI:SS')
+         FROM proxmox_vms v
+        WHERE v.vmid = j.vmid
+          AND j.status = 'applied'
+          AND j.confirm_kind = 'vm-onboot-matches'
+          AND j.applied_at IS NOT NULL
+          AND v.seen_at > j.applied_at
+          AND v.onboot IS NOT NULL
+          AND v.onboot = ((j.args ->> 'onboot') = '1')`
+    );
+    confirmed += onboot.rowCount || 0;
+
+    // Power reached the state that was asked for. Both directions in one statement, with
+    // the wanted status derived from the confirm kind rather than from the verb, so an old
+    // job whose verb was later re-specified still confirms against what it was created to
+    // prove.
+    const power = await q(
+      `UPDATE pmr_jobs j
+          SET status = 'confirmed', confirmed_at = now(), finished_at = now(),
+              confirm_detail = 'proxmox reports status=' || v.status
+                               || ' in the inventory push at '
+                               || to_char(v.seen_at, 'YYYY-MM-DD HH24:MI:SS')
+         FROM proxmox_vms v
+        WHERE v.vmid = j.vmid
+          AND j.status = 'applied'
+          AND j.confirm_kind IN ('vm-status-running', 'vm-status-stopped')
+          AND j.applied_at IS NOT NULL
+          AND v.seen_at > j.applied_at
+          AND v.status = CASE WHEN j.confirm_kind = 'vm-status-running'
+                              THEN 'running' ELSE 'stopped' END`
+    );
+    confirmed += power.rowCount || 0;
+
+    // The VM really restarted. Same uptime argument as the Pi: 'running' on its own is also
+    // true of a VM that ignored the reboot entirely. The slack is wider (120s) because this
+    // reading arrives on a 15-minute timer and seen_at is when the collector looked, not
+    // when the guest came up.
+    const vmBoot = await q(
+      `UPDATE pmr_jobs j
+          SET status = 'confirmed', confirmed_at = now(), finished_at = now(),
+              confirm_detail = 'proxmox reports the VM running with an uptime of '
+                               || v.uptime_s || 's, shorter than the age of this job'
+         FROM proxmox_vms v
+        WHERE v.vmid = j.vmid
+          AND j.status = 'applied'
+          AND j.confirm_kind = 'vm-uptime-reset'
+          AND j.applied_at IS NOT NULL
+          AND v.seen_at > j.applied_at
+          AND v.status = 'running'
+          AND v.uptime_s IS NOT NULL
+          AND v.uptime_s < EXTRACT(epoch FROM (v.seen_at - j.applied_at)) + 120`
+    );
+    confirmed += vmBoot.rowCount || 0;
+
+    // Write the confirmed reading back onto the intent it satisfied, so the UI's "wanted /
+    // observed" pair moves on the SAME reading that closed the job rather than waiting for
+    // the next reconcile pass.
+    await q(
+      `UPDATE pmr_intent i
+          SET observed = i.want, observed_at = j.confirmed_at, last_job_id = j.id
+         FROM pmr_jobs j
+        WHERE j.intent_id = i.id AND j.status = 'confirmed'
+          AND j.confirmed_at > now() - interval '5 minutes'
+          AND i.observed IS DISTINCT FROM i.want`
+    );
+    return { confirmed };
+  }
+
+  // The other half of "done means proven": a job that was never proven must END, and it
+  // must end as a FAILURE rather than drifting in 'applied' forever the way a config_job
+  // stuck in 'fetched' does.
+  async function expirePmrJobs() {
+    const gone = await q(
+      `UPDATE pmr_jobs
+          SET status = 'expired', finished_at = now(),
+              result_log = COALESCE(result_log || E'\\n', '')
+                || 'expired: the time limit passed before an executor collected it'
+        WHERE status IN ('pending', 'claimed') AND expires_at <= now()`
+    );
+    const unproven = await q(
+      `UPDATE pmr_jobs
+          SET status = 'failed', finished_at = now(),
+              result_log = COALESCE(result_log || E'\\n', '')
+                || 'failed: the executor reported it ran, but no independent reading '
+                || 'confirmed it within ' || confirm_deadline_s || 's'
+        WHERE status = 'applied'
+          AND applied_at IS NOT NULL
+          AND applied_at < now() - make_interval(secs => confirm_deadline_s)`
+    );
+    // A job that has used every attempt is finished whether or not its clock has run out.
+    // Left pending it would sit on the screen looking claimable until expires_at, and — the
+    // part that matters — it would NOT appear as a failure to the pre-opening check, which
+    // is the one thing that gets a person to the site before it opens.
+    const spent = await q(
+      `UPDATE pmr_jobs
+          SET status = 'failed', finished_at = now(),
+              result_log = COALESCE(result_log || E'\\n', '')
+                || 'failed: handed to an executor ' || attempts
+                || ' times without a result, which is the cap for this verb'
+        WHERE status IN ('pending', 'claimed')
+          AND attempts >= max_attempts
+          AND (status = 'pending'
+               OR claimed_at < now() - make_interval(secs => claim_ttl_s))`
+    );
+    return {
+      expired: gone.rowCount || 0,
+      unproven: unproven.rowCount || 0,
+      spent: spent.rowCount || 0,
+    };
+  }
+
+  // ── the reconciler ────────────────────────────────────────────────────────
+  // Refresh what has been OBSERVED about every intent from whatever collector already
+  // reports the fact, then close the gaps that are allowed to close on their own.
+  //
+  // THE CONVERGENCE RULE, implemented: only vm.onboot converges here. It is a CONFIGURATION
+  // property (it changes what the next node boot does and touches nothing running), it is
+  // fully reversible, it interrupts no session, and proxmox_vms.onboot is a fresh
+  // independent reading of it. A LIFECYCLE field — vm.running — is deliberately NOT
+  // reconciled: power is a one-shot job with a time limit that an operator raised, and a
+  // loop that powered VMs to match a stored wish would fight the engineer who just stopped
+  // one. counter.boot_vmid is not reconciled either, for a different reason: the telemetry
+  // reply already re-sends it on EVERY tick and is self-healing, so a second mechanism
+  // pushing the same field is how a counter starts flapping.
+  //
+  // `verbSpec` carries the verb's timings from the one allowlist in pmrVerbs.js, so this
+  // function invents none of them.
+  async function reconcilePmrIntent(verbSpec = {}) {
+    const observedVm = await q(
+      `UPDATE pmr_intent i
+          SET observed = to_jsonb(CASE WHEN v.onboot THEN 1 ELSE 0 END), observed_at = v.seen_at
+         FROM proxmox_vms v
+        WHERE i.field = 'vm.onboot' AND i.vmid = v.vmid AND v.onboot IS NOT NULL
+          AND i.observed IS DISTINCT FROM to_jsonb(CASE WHEN v.onboot THEN 1 ELSE 0 END)`
+    );
+    const observedRun = await q(
+      `UPDATE pmr_intent i
+          SET observed = to_jsonb(CASE WHEN v.status = 'running' THEN 1 ELSE 0 END),
+              observed_at = v.seen_at
+         FROM proxmox_vms v
+        WHERE i.field = 'vm.running' AND i.vmid = v.vmid AND v.status IS NOT NULL
+          AND i.observed IS DISTINCT FROM to_jsonb(CASE WHEN v.status = 'running' THEN 1 ELSE 0 END)`
+    );
+    // The boot target's observation comes from the stamp the telemetry path already
+    // computes out of device_state.raw — not from a second read of the payload.
+    const observedBoot = await q(
+      `UPDATE pmr_intent i
+          SET observed = to_jsonb(c.boot_vmid), observed_at = c.boot_applied_at
+         FROM counters c
+        WHERE i.field = 'counter.boot_vmid' AND i.counter_id = c.id
+          AND c.boot_applied_at IS NOT NULL
+          AND i.observed IS DISTINCT FROM to_jsonb(c.boot_vmid)`
+    );
+
+    const created = await rows(
+      `WITH gap AS (
+         SELECT i.id AS intent_id, i.pharmacy_id, i.vmid,
+                (i.want #>> '{}')::int AS want_onboot, v.node
+           FROM pmr_intent i
+           JOIN proxmox_vms v ON v.vmid = i.vmid AND v.node IS NOT NULL
+          WHERE i.field = 'vm.onboot'
+            AND i.observed IS DISTINCT FROM i.want
+            -- One job per gap. Without this the reconciler would raise another every pass
+            -- for the whole 40 minutes it takes two collector ticks to prove the first.
+            AND NOT EXISTS (SELECT 1 FROM pmr_jobs j
+                             WHERE j.intent_id = i.id
+                               AND j.status IN ('pending', 'claimed', 'applied'))
+       )
+       INSERT INTO pmr_jobs
+         (verb, executor, node, pharmacy_id, vmid, args, disruptive, retry_ok,
+          confirm_kind, confirm_deadline_s, expires_at, claim_ttl_s, intent_id, created_by)
+       SELECT 'vm.set-onboot', 'proxmox-node', g.node, g.pharmacy_id, g.vmid,
+              jsonb_build_object('vmid', g.vmid, 'onboot', g.want_onboot),
+              false, true, 'vm-onboot-matches', $1,
+              now() + make_interval(secs => $2), $3, g.intent_id, 'reconciler'
+         FROM gap g
+       RETURNING id, intent_id`,
+      [verbSpec.confirm_deadline_s || 2400, verbSpec.ttl_s || 86400, verbSpec.claim_ttl_s || 1800]
+    );
+    if (created.length) {
+      await q(
+        `UPDATE pmr_intent i SET last_job_id = j.id
+           FROM pmr_jobs j WHERE j.id = ANY($1::uuid[]) AND j.intent_id = i.id`,
+        [created.map((r) => r.id)]
+      );
+    }
+    return {
+      observed: (observedVm.rowCount || 0) + (observedRun.rowCount || 0) + (observedBoot.rowCount || 0),
+      created: created.length,
+    };
+  }
+
+  // ── operator actions on a job ─────────────────────────────────────────────
+  async function listPmrJobs(f = {}) {
+    return rows(
+      `SELECT id, verb, executor, status, state, waiting_reason, disruptive, override_hours,
+              override_by, override_at, pharmacy_id, site_code, site_name, counter_id, vmid,
+              node, args, confirm_kind, confirm_detail, attempts, not_before, expires_at,
+              created_by, created_at, claimed_at, applied_at, confirmed_at, finished_at,
+              result_log
+         FROM pmr_jobs_v
+        WHERE ($1::bigint IS NULL OR pharmacy_id = $1)
+          AND ($2::text IS NULL OR status = $2)
+        ORDER BY created_at DESC
+        LIMIT 200`,
+      [f.pharmacy_id == null ? null : f.pharmacy_id, nz(f.status)]
+    );
+  }
+
+  async function getPmrJob(id) {
+    if (!isUuid(id)) return null;
+    return one(`SELECT * FROM pmr_jobs_v WHERE id = $1`, [id]);
+  }
+
+  // Is there already a job of this verb in flight for this counter?
+  //
+  // Written for the printer path, where the SAME staged table can be saved four times in a
+  // minute while an operator sets up a printer. Each save would otherwise queue another
+  // sign-out for the same counter for the same night — and pmr_jobs has no uniqueness of its
+  // own, deliberately, because two DIFFERENT restarts of one counter are legitimate.
+  //
+  // 'pending' and 'claimed' only: an 'applied' job is waiting on its confirming reading and a
+  // finished one is history, and neither is a reason to refuse a NEW change made afterwards.
+  async function getPendingPmrCounterJob(counterId, verb) {
+    if (!Number.isInteger(Number(counterId)) || typeof verb !== 'string') return null;
+    return one(
+      `SELECT * FROM pmr_jobs_v
+        WHERE counter_id = $1 AND verb = $2 AND status IN ('pending','claimed')
+        ORDER BY created_at DESC LIMIT 1`,
+      [Number(counterId), verb]
+    );
+  }
+
+  // WHERE-guarded exactly as cancelConfigJob is: a job already claimed by an executor, or
+  // already finished, returns null and the caller reports that it was too late — rather
+  // than a silent no-op that reads as success.
+  async function cancelPmrJob(id, by) {
+    if (!isUuid(id)) return null;
+    return one(
+      `UPDATE pmr_jobs
+          SET status = 'cancelled', finished_at = now(),
+              result_log = COALESCE(result_log || E'\\n', '')
+                           || 'cancelled by ' || COALESCE($2, 'watchman')
+        WHERE id = $1 AND status IN ('pending', 'claimed')
+        RETURNING id, verb, status`,
+      [id, nz(by)]
+    );
+  }
+
+  // "Apply it now — I know it signs the member of staff out." The ONLY way past the hours
+  // gate, and it is a stored decision with a name and a time on it, because the rule this
+  // suspends is that Watchman never restarts a session during opening hours ON ITS OWN.
+  // Nothing here bypasses the time limit or the confirming reading.
+  async function overridePmrJobHours(id, by) {
+    if (!isUuid(id)) return null;
+    return one(
+      `UPDATE pmr_jobs
+          SET override_hours = true, override_by = $2, override_at = now(),
+              not_before = NULL,
+              -- The job was created with an expiry computed from the overnight window it
+              -- was waiting for (S1/S12). Releasing it now without touching that would be
+              -- fine in the ordinary case and useless in the one that matters — an override
+              -- typed minutes before the held window would expire. GREATEST only ever
+              -- lengthens, so a job with hours left keeps them.
+              expires_at = GREATEST(expires_at, now() + interval '15 minutes')
+        WHERE id = $1 AND status = 'pending' AND disruptive
+          -- Offered once, and only once. attempts is 0 for a job no executor has taken, and
+          -- an override on a job that has already been handed out is the loop B3 describes.
+          AND attempts = 0
+        RETURNING id, verb, status, counter_id, pharmacy_id, expires_at`,
+      [id, nz(by) || 'watchman']
+    );
+  }
+
+  // ── the nightly restart ───────────────────────────────────────────────────
+  // Claim tonight for every LIVE site whose own local clock has just passed midnight and
+  // that has not already had its night run.
+  //
+  // The primary key on (pharmacy_id, local_date) IS the mechanism: INSERT … ON CONFLICT DO
+  // NOTHING … RETURNING gives back exactly the sites this call won, so a 3-worker cluster
+  // runs a night once and a worker restarted at 00:40 does not run it a second time. No
+  // cron and no "when did I last run" state anywhere — the same reasoning pruneRelay uses
+  // for doing its housekeeping opportunistically instead of on a timer.
+  //
+  // ⚠️ THE TWO GUARDS ARE DECOUPLED (S14). They used to be AND-ed: claim the night only if
+  // the local clock is inside the window AND the site is closed. A 24-hour pharmacy is open
+  // for the whole window, so it never satisfied both — it therefore NEVER got a nightly row,
+  // which meant it never got a restart, never got a pre-opening check, and never raised an
+  // alert. Silently, forever, while the comment claimed the opposite.
+  //
+  // Now the night is CLAIMED for every live site once per its own local date, and whether a
+  // restart is possible is a SEPARATE question answered per site by siteDisruptiveWindow():
+  //   * closed and inside its overnight window  -> jobs are created and run now
+  //   * open until 01:00                        -> jobs are created HELD until 01:00, which
+  //                                                is what not_before now means (S1/S12)
+  //   * never closes                            -> NO jobs, and the row records why
+  // In all three the site still has a nightly row, and the pre-opening check no longer
+  // depends on one at all (S3).
+  //
+  // The window guard stays, and it still does its own job: it bounds how late a MISSED night
+  // may be picked up, so a worker that was down until 08:00 does not schedule the estate's
+  // restarts as the pharmacies open.
+  async function claimPmrNightlySites(windowHours) {
+    const hours = Number.isInteger(windowHours) && windowHours >= 1 && windowHours <= 6
+      ? windowHours : 1;
+    return rows(
+      `WITH due AS (
+         SELECT p.id,
+                (now() AT TIME ZONE site_tz(p.timezone))::date AS local_date
+           FROM pharmacies p
+          WHERE p.status = 'live'
+            AND (now() AT TIME ZONE site_tz(p.timezone))::time < make_time($1, 0, 0)
+       ), claimed AS (
+         INSERT INTO pmr_nightly_runs (pharmacy_id, local_date)
+         SELECT d.id, d.local_date FROM due d
+         ON CONFLICT (pharmacy_id, local_date) DO NOTHING
+         RETURNING pharmacy_id, local_date
+       )
+       SELECT c.pharmacy_id, c.local_date, p.code AS site_code, p.name AS site_name,
+              site_tz(p.timezone) AS site_timezone,
+              -- Answered here so the worker makes ONE decision per site from ONE reading,
+              -- rather than asking the database again per counter.
+              pmr_disruptive_allowed(p.id, now())      AS restart_allowed_now,
+              site_next_disruptive_window(p.id, now()) AS next_window_at
+         FROM claimed c JOIN pharmacies p ON p.id = c.pharmacy_id
+        ORDER BY p.code`,
+      [hours]
+    );
+  }
+
+  // The counters a night applies to: LIVE counters with a thin client enrolled. A counter
+  // with no Pi is not a failure to report, it is a counter that has not been built yet.
+  async function listSiteLiveCounters(pharmacyId) {
+    return rows(
+      `SELECT c.id, c.n, c.label, c.pi_device_id, d.serial AS pi_serial,
+              ds.status AS pi_status, ds.last_seen_at, ds.uptime_s,
+              (ds.raw -> 'rdp' ->> 'running') AS rdp_running,
+              (ds.raw -> 'rdp' ->> 'configured_target') AS rdp_configured_target
+         FROM counters c
+         LEFT JOIN devices d ON d.id = c.pi_device_id
+         LEFT JOIN device_state ds ON ds.device_id = c.pi_device_id
+        WHERE c.pharmacy_id = $1 AND c.status = 'live'
+        ORDER BY c.n`,
+      [pharmacyId]
+    );
+  }
+
+  async function recordPmrNightlyRun(pharmacyId, localDate, f = {}) {
+    return one(
+      `UPDATE pmr_nightly_runs
+          SET counters_total = $3, jobs_created = $4, intents_promoted = $5,
+              skipped_reason = $6
+        WHERE pharmacy_id = $1 AND local_date = $2::date
+        RETURNING pharmacy_id, local_date, counters_total, jobs_created, skipped_reason`,
+      [pharmacyId, localDate, f.counters_total || 0, f.jobs_created || 0,
+        f.intents_promoted || 0, nz(f.skipped_reason)]
+    );
+  }
+
+  // ── the pre-opening check ─────────────────────────────────────────────────
+  // Claim the verification for every LIVE site that is about to open and has not been
+  // checked for its own local date yet.
+  //
+  // ⚠️ IT IS DRIVEN OFF THE SITE, NOT OFF THE RESTART (S3). This used to select FROM
+  // pmr_nightly_runs, so it could only run for a site that HAD a nightly row — and a worker
+  // down from 23:50 to 01:30 creates none. On exactly the morning when nothing was applied,
+  // nothing was verified and nobody was told. The check now reads each site's own
+  // next_open_at and claims into its OWN table, so it happens whether or not the restart did.
+  //
+  // ⚠️ THE CLAIM IS A LEASE, NOT A STAMP (S4). checked_at used to be written at CLAIM time,
+  // before a verdict existed, so any failure between claiming and deciding permanently
+  // destroyed that site's only alert for the night. Now the claim takes a lease a later pass
+  // reclaims once it lapses, and checked_at is written by finishPmrOpeningCheck only after
+  // the verdict and any email have actually landed. The failure direction is a duplicate
+  // email, which is the right way round for the one message that gets somebody to a
+  // pharmacy before it opens.
+  //
+  // The lead time is the whole point: this has to run EARLY ENOUGH TO FIX IT, not at the
+  // moment the shutters go up. Everything else waits for the morning queue.
+  //
+  // ⚠️ AND A SITE THAT NEVER CLOSES IS STILL CHECKED (D6). The guard used to be
+  // `is_open IS NOT TRUE AND next_open_at IS NOT NULL`, which a 24-hour pharmacy satisfies on
+  // neither count: it is always open and it never next-opens. So it was never claimed and
+  // never checked — the second half of the harm S14 named, still open after S14 fixed the
+  // first half. A 24-hour site is precisely the one where nobody arrives in the morning to
+  // notice a dead counter, because there is no morning.
+  //
+  // THE CHECK TIME CHOSEN FOR IT IS 06:00 LOCAL — pmr_night_end_s(), reused rather than
+  // invented. That constant is already this schema's definition of the moment the quiet
+  // hours end and the day's work starts, so a 24-hour site is verified at the instant the
+  // estate already treats as the start of trading, and there is one definition of "morning"
+  // in the platform instead of two. The lead window works the same way it does for everyone
+  // else: the check runs in the `lead` minutes BEFORE that instant, early enough to fix it.
+  const PMR_CHECK_LEASE_MIN = 10;
+  async function claimPmrOpeningChecks(leadMinutes) {
+    const lead = Number.isInteger(leadMinutes) && leadMinutes >= 5 && leadMinutes <= 240
+      ? leadMinutes : 60;
+    return rows(
+      `WITH due AS (
+         SELECT p.id AS pharmacy_id,
+                (now() AT TIME ZONE site_tz(p.timezone))::date AS local_date,
+                s.next_open_at
+           FROM pharmacies p
+           CROSS JOIN LATERAL site_hours_state(p.id, now()) s
+          WHERE p.status = 'live'
+            -- IS NOT TRUE, not = false: a site whose hours do not resolve must still be
+            -- checked. "We do not know when it opens" is not a reason to stop looking at
+            -- whether its counters came back.
+            AND s.is_open IS NOT TRUE
+            AND s.next_open_at IS NOT NULL
+            AND s.next_open_at <= now() + make_interval(mins => $1)
+         UNION ALL
+         -- THE SITE THAT NEVER CLOSES. Identified by exactly the test
+         -- site_next_disruptive_window() short-circuits on — open now, and no close anywhere
+         -- in the fifteen days site_hours_state() looks ahead — so the two functions cannot
+         -- disagree about which sites these are.
+         --
+         -- next_open_at is reported as today's local 06:00 because that is what this row
+         -- MEANS to everything downstream: it is the instant the check is verifying the
+         -- counters for, and it is what the alert email prints as the opening time. Sending
+         -- the real answer (NULL — it never opens, it is already open) would print "unknown"
+         -- on the one email whose job is to get somebody to a pharmacy in time.
+         SELECT p.id,
+                (now() AT TIME ZONE site_tz(p.timezone))::date,
+                ((now() AT TIME ZONE site_tz(p.timezone))::date
+                   + make_interval(secs => pmr_night_end_s())) AT TIME ZONE site_tz(p.timezone)
+           FROM pharmacies p
+           CROSS JOIN LATERAL site_hours_state(p.id, now()) s
+          WHERE p.status = 'live'
+            AND s.is_open IS TRUE
+            AND s.next_close_at IS NULL
+            -- The lead window before 06:00 local, expressed as a time-of-day band rather
+            -- than as "<= now() + lead". For a site with no next_open_at there is no future
+            -- instant to count back from, and comparing against today's 06:00 unbounded
+            -- would make the row due for the whole rest of the day. GREATEST keeps the band
+            -- inside the day even if the lead is configured longer than six hours.
+            AND EXTRACT(epoch FROM (now() AT TIME ZONE site_tz(p.timezone))::time)::int
+                  BETWEEN GREATEST(pmr_night_end_s() - $1::int * 60, 0) AND pmr_night_end_s()
+       ), claimed AS (
+         INSERT INTO pmr_opening_checks
+           (pharmacy_id, local_date, next_open_at, claimed_at, lease_until, attempts)
+         SELECT d.pharmacy_id, d.local_date, d.next_open_at, now(),
+                now() + make_interval(mins => $2), 1
+           FROM due d
+         -- DO UPDATE with a WHERE, which is what makes the lease reclaimable: a row that is
+         -- already finished (checked_at set) or still held by another worker (lease in the
+         -- future) matches nothing and returns nothing.
+         ON CONFLICT (pharmacy_id, local_date) DO UPDATE
+            SET claimed_at   = now(),
+                lease_until  = now() + make_interval(mins => $2),
+                attempts     = pmr_opening_checks.attempts + 1,
+                next_open_at = EXCLUDED.next_open_at
+          WHERE pmr_opening_checks.checked_at IS NULL
+            AND pmr_opening_checks.lease_until <= now()
+         RETURNING pharmacy_id, local_date, next_open_at
+       )
+       SELECT c.pharmacy_id, c.local_date, c.next_open_at,
+              p.code AS site_code, p.name AS site_name
+         FROM claimed c JOIN pharmacies p ON p.id = c.pharmacy_id
+        ORDER BY p.code`,
+      [lead, PMR_CHECK_LEASE_MIN]
+    );
+  }
+
+  // Record the verdict, and CLAIM THE ALERT in the same statement — alerted_at IS NULL is
+  // what makes it one email per site per morning rather than one per worker pass.
+  //
+  // Deliberately does NOT set checked_at. The verdict existing is not the same as the person
+  // having been told, and the whole point of S4 is that the two are separate moments.
+  async function recordPmrOpeningCheck(pharmacyId, localDate, f = {}) {
+    return one(
+      `UPDATE pmr_opening_checks
+          SET counters_ok = $3, counters_at_risk = $4,
+              alerted_at = CASE WHEN $4 > 0 AND alerted_at IS NULL THEN now() ELSE alerted_at END,
+              alert_detail = CASE WHEN $4 > 0 THEN $5 ELSE alert_detail END
+        WHERE pharmacy_id = $1 AND local_date = $2::date AND checked_at IS NULL
+        RETURNING pharmacy_id, local_date, counters_ok, counters_at_risk, alerted_at`,
+      [pharmacyId, localDate, f.counters_ok || 0, f.counters_at_risk || 0, nz(f.alert_detail)]
+    );
+  }
+
+  // THE ONLY WRITER OF checked_at, and it runs after the alert has landed.
+  //
+  // `done` false means the verdict was reached but the person was NOT told — an email send
+  // that failed. Then checked_at stays null AND the alert claim is released, so the lease
+  // lapses and a later pass re-runs the whole check. A site whose alert failed to send must
+  // not be recorded as checked; that is precisely the state where nobody knows.
+  async function finishPmrOpeningCheck(pharmacyId, localDate, f = {}) {
+    return one(
+      `UPDATE pmr_opening_checks
+          SET checked_at = CASE WHEN $3::boolean THEN now() ELSE checked_at END,
+              alerted_at = CASE WHEN $3::boolean THEN alerted_at ELSE NULL END
+        WHERE pharmacy_id = $1 AND local_date = $2::date
+        RETURNING pharmacy_id, local_date, checked_at, alerted_at, counters_at_risk`,
+      [pharmacyId, localDate, !!f.done]
+    );
+  }
+
+  // Jobs from tonight that did not reach 'confirmed' at this site — the second input to the
+  // opening check, next to what the counters themselves are reporting. A restart that
+  // failed or expired is exactly the case where a counter may not come back.
+  // ⚠️ THE NIGHT'S OWN JOBS (S13). This used to be an 18-hour sweep of EVERYTHING at the
+  // site, so any unrelated job an engineer raised yesterday afternoon — including one the
+  // hours gate correctly held and then expired — counted as "tonight's restart failed", and
+  // the pre-opening email said "counters may not open" about a healthy counter. That breaks
+  // the one rule this channel has: it is sent ONLY when a counter will not open.
+  //
+  // Scoped two ways, both needed. created_by = 'nightly' is what the nightly pass stamps and
+  // nothing else does, so an operator's job can never be read as the night's. The local-date
+  // bound then keeps it to THIS night rather than every night since.
+  async function listPmrUnfinishedNightJobs(pharmacyId, localDate) {
+    return rows(
+      `SELECT j.id, j.verb, j.status, j.counter_id, j.result_log, j.created_at, j.finished_at
+         FROM pmr_jobs j
+         JOIN pharmacies p ON p.id = j.pharmacy_id
+        WHERE j.pharmacy_id = $1
+          AND j.created_by = 'nightly'
+          AND j.created_at >= (($2::date)::timestamp AT TIME ZONE site_tz(p.timezone))
+          AND j.created_at <  ((($2::date) + 1)::timestamp AT TIME ZONE site_tz(p.timezone))
+          AND j.status <> 'confirmed'
+        ORDER BY j.created_at`,
+      [pharmacyId, localDate]
+    );
+  }
+
   async function end() {
     await pool.end();
   }
 
   return {
     reportProxmoxVms,
+    reportProxmoxCapacity,
+    reportProxmoxVmPrinters,
+    listDesktopPrinters,
     reconcileProxmox,
     listProxmoxVms,
     listPrinters,
     upsertPrinter,
     deletePrinter,
     reportPrinters,
+    // ── the printer model (docs/pmr-printer-contract.md §1) ──
+    reportCounterPrinters,
+    listPrinterDevices,
+    listPrinterQueues,
+    upsertPrinterQueue,
+    deletePrinterQueue,
+    setPrinterAssignment,
+    listPrinterAssignments,
+    getCounterPrinterTableForDevice,
+    getCounterPrintTabState,
+    // ── the site build lifecycle ──
+    getSiteCapture,
+    setSiteCapture,
+    setSiteCaptureRollUp,
+    getSiteImport,
+    setSiteImport,
+    // ── the capture kit's credentials (src/shared/captureToken.js) ──
+    createCaptureTicket,
+    listCaptureTickets,
+    revokeCaptureTicket,
+    redeemCaptureTicket,
+    getCaptureTokenByHash,
+    touchCaptureToken,
+    listCaptureSitesForToken,
+    listCaptureSlots,
+    listCaptureRuns,
+    upsertCaptureRun,
+    getCaptureRunForRole,
+    reportCaptureDropTargets,
+    getCaptureDropTarget,
+    listCaptureDropTargets,
+    // ── node headroom ──
+    listNodeCapacity,
+    reportNodeCapacity,
     listPharmacies,
     getPharmacy,
     createPharmacy,
@@ -2763,6 +5674,9 @@ function makePgStore(poolOrConfig) {
     detachPharmacyVm,
     setCounterBootTarget,
     clearCounterBootTarget,
+    stageCounterBootTarget,
+    cancelCounterBootTargetStage,
+    promoteCounterBootTargets,
     setCounterAction,
     takeCounterAction,
     getCounterBootDirective,
@@ -2788,6 +5702,7 @@ function makePgStore(poolOrConfig) {
     listTags,
     setDeviceTags,
     setDeviceIdentity,
+    setDevicePppoePassword,
     updateDeviceMeta,
     listTagRules,
     createTagRule,
@@ -2861,6 +5776,44 @@ function makePgStore(poolOrConfig) {
     pruneHistory,
     pruneNeighbors,
     pruneMacHosts,
+
+    // ── the PMR control plane ─────────────────────────────────────────────
+    // Every caller reaches these through the `typeof store.X === 'function'` guard the
+    // directive channel already uses, so a store that predates them (store.mem.js) still
+    // loads and simply carries no control plane.
+    getSiteHours,
+    siteDisruptiveWindow,
+    listSiteClosedDays,
+    finishPmrOpeningCheck,
+    listSiteHours,
+    listSiteHoursExceptions,
+    setSiteHours,
+    setSiteHoursException,
+    deleteSiteHoursException,
+    getEstateHours,
+    setPmrIntent,
+    listPmrIntent,
+    deletePmrIntent,
+    createPmrCounterJob,
+    createPmrVmJob,
+    claimPmrJobForDevice,
+    claimPmrJobsForNode,
+    recordPmrJobResult,
+    notePmrSessionDown,
+    confirmPmrJobs,
+    expirePmrJobs,
+    reconcilePmrIntent,
+    listPmrJobs,
+    getPmrJob,
+    getPendingPmrCounterJob,
+    cancelPmrJob,
+    overridePmrJobHours,
+    claimPmrNightlySites,
+    listSiteLiveCounters,
+    recordPmrNightlyRun,
+    claimPmrOpeningChecks,
+    recordPmrOpeningCheck,
+    listPmrUnfinishedNightJobs,
     end,
   };
 }

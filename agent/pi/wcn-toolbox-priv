@@ -25,6 +25,71 @@ LOCK=/var/lib/wcn/toolbox.lock
 AGENT=/usr/local/sbin/vigilant-pi-agent
 AGENT_ENV=/etc/vigilant/agent.env
 KIOSK_LOG=/var/log/wcn-kiosk.log
+WG_CONF=/etc/wireguard/wg0.conf
+WG_TRIAL=/var/lib/wcn/wg-trial
+# The printer set. LIVE is the only file wcn-kiosk reads; NEXT is the only file the agent writes.
+# These paths are literals here and are never taken from the network or from an argument.
+PRINTERS_TAB=/var/lib/wcn/printers.tab
+PRINTERS_NEXT=$PRINTERS_TAB.next
+PRINTERS_PREV=$PRINTERS_TAB.prev
+
+# ── THE printers.tab CONTRACT — ONE format, THREE owners ─────────────────────
+# Owners, and what each is allowed to touch:
+#   vigilant-pi-agent.py  writes printers.tab.NEXT only, never the live file.
+#   wcn-toolbox-priv      (this file, verb 'printing-promote')  validates .next, keeps .prev,
+#                         swaps live, restarts the session — as ONE action.
+#   wcn-kiosk             reads printers.tab only, and turns it into xfreerdp argv.
+#
+# ALL THREE MUST ACCEPT AND REJECT EXACTLY THE SAME FILES. Every rule below is repeated
+# verbatim in the other two files. Three owners each applying their own rules to one shared
+# format is not a theoretical problem: it is the bug class that produced R1-R6, where a value
+# was staged by one owner, promoted by a second and silently dropped by a third.
+#
+#   line            <queue_name>\t<windows_driver>\t<flags>   — exactly two TABs, LF only
+#   blank / '#'     ignored
+#   queue_name      ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$   i.e. 1..63 characters.
+#                   It is the CUPS queue name AND the Windows printer name AND what ProScript
+#                   stores in its report mapping — one string wearing three hats, which is why
+#                   this is a tight allowlist and not a sanitiser.
+#                   63 and not 64: this file hands the same name to test-print and queue-clear,
+#                   whose v_queue caps at 63. A 64-character name would promote and then be
+#                   untestable — and because validation is all-or-nothing, ONE over-long name
+#                   makes that site's WHOLE table permanently un-promotable, blocking every
+#                   later printer change there and diagnosable only from one stderr line.
+#   windows_driver  printable ASCII 0x20..0x7e, 1..128 characters, NO COMMA.
+#                   It cannot use the queue-name class: every real driver name has spaces
+#                   ("ZDesigner ZD420-203dpi ZPL", "Brother HL-L5100DN series"). Bounded
+#                   printable ASCII is safe for the reason v_ssid records — the value reaches
+#                   its consumer as ONE element of an argv array, never as a shell word, and
+#                   the TAB separator is what guarantees the split.
+#                   THE COMMA is excluded at all three owners because comma is FreeRDP's OWN
+#                   field separator inside /printer:<queue>,<driver>[,default]. Real driver
+#                   names contain one ("Kyocera FS-1030D, KPDL"), so this needs no attacker,
+#                   just an operator typing the true name. When only wcn-kiosk refused it, the
+#                   table staged here, validated here, promoted here and restarted the session
+#                   — and the counter came back with that printer GONE, while telemetry still
+#                   read converged. If it is the label printer, dispensing labels stop.
+#   flags           comma separated, a CLOSED SET, currently only `default`; empty is legal.
+#                   At most ONE `default` in the whole table.
+#   uniqueness      queue names unique across the table.
+#   table size      at most PRINTERS_MAX queues. ONE number in all three: the agent refuses
+#                   the push, this file refuses the promotion, and wcn-kiosk counts anything
+#                   past it as REJECTED rather than silently truncating the table.
+#   file size       at most 64 KiB.
+#   all or nothing  at both writing ends one bad line refuses the WHOLE table: which queue is
+#                   `default` and which queues exist at all only mean anything relative to each
+#                   other, so a partially applied table is internally consistent and wrong.
+#
+# THE ONE DELIBERATE ASYMMETRY, written down so nobody "fixes" it into a fourth disagreement:
+# on a duplicate queue name, a second `default`, or more than PRINTERS_MAX queues, the two
+# WRITING owners refuse the WHOLE table — so none of those can ever reach the live file through
+# promotion. wcn-kiosk, which reads a file it did not write, resolves the same three per LINE
+# (first queue wins, first `default` wins, the excess counted as rejected), because its
+# non-negotiable job is that a counter never ends up with zero printers. Every PER-VALUE rule
+# above is identical in all three; only these three whole-table conditions differ, and the
+# kiosk's leniency is unreachable by anything that came through promotion.
+PRINTERS_MAX=32
+PRINTERS_MAX_BYTES=65536
 
 [ "$(id -u)" = 0 ] || { echo "wcn-toolbox-priv: must run as root" >&2; exit 90; }
 
@@ -38,6 +103,38 @@ v_cidr()   { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || die "bad 
 v_ip()     { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "bad ip: $1"; }
 v_host()   { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || die "bad hostname: $1"; }
 v_queue()  { [[ "$1" =~ ^[A-Za-z0-9_.-]{1,63}$ ]] || die "bad queue: $1"; }
+# A queue name in printers.tab, to the shared contract at the top of this file: 1..63 characters.
+# That is v_queue's class INTERSECTED with the contract's leading-alphanumeric rule, and it keeps
+# v_queue's 63-char cap deliberately — anything this promotes will later be handed to test-print
+# and queue-clear as an argument, so a name that promotes must be a name those verbs accept.
+# vigilant-pi-agent.py's TAB_QUEUE_RE and wcn-kiosk's queue check are the same 63.
+v_tabqueue() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] || die "bad queue name: $1"; }
+# A WINDOWS DRIVER NAME. It cannot be a character allowlist — real ones contain spaces and
+# punctuation ("ZDesigner ZD420-203dpi ZPL", "Brother HL-L5100DN series") — so this is v_ssid's
+# shape: bounded length plus a printable-ASCII check. That is safe for the same reason v_ssid is
+# safe: the value only ever reaches xfreerdp3 as ONE ELEMENT of a fixed argv array, and the tab
+# file is split on TAB, which this check proves the value cannot contain.
+#
+# ...with ONE printable character carved out: the COMMA. Comma is FreeRDP's own field separator
+# inside /printer:<queue>,<driver>[,default], so wcn-kiosk refuses any line whose driver holds
+# one — correctly. Accepting it here promoted such a table, restarted the counter's session, and
+# brought it back with that printer GONE while telemetry read converged. See the contract block.
+v_driver() {
+    [ -n "$1" ] && [ "${#1}" -le 128 ] || die "bad driver: length must be 1..128"
+    [ -z "$(printf '%s' "$1" | LC_ALL=C tr -d '\40-\176')" ] || die "bad driver: not printable ASCII"
+    case "$1" in
+        *,*) die "bad driver: contains a comma, which FreeRDP reads as its own /printer: field separator - rename the driver in Windows: $1" ;;
+    esac
+}
+# The flags field. A CLOSED SET, not a pattern. Empty is legal; anything else is a bug or an
+# attack, and either way the answer is to refuse.
+v_flags() {
+    [ -z "$1" ] && return 0
+    local f; local IFS=,
+    for f in $1; do
+        case "$f" in default) ;; *) die "bad flag: ${f:-<empty>}" ;; esac
+    done
+}
 # SSIDs are genuinely arbitrary bytes, so this is a length + printable-ASCII check rather than
 # a character allowlist. It is safe because the value only ever reaches nmcli as fixed argv.
 v_ssid()   { [ -n "$1" ] && [ "${#1}" -le 32 ] && [[ "$1" != *[$'\x00'-$'\x1f\x7f']* ]] || die "bad ssid"; }
@@ -135,6 +232,64 @@ cmd_wg_status() {
     timeout 5 wg show wg0 transfer 2>/dev/null
     echo "--"
     timeout 5 wg show wg0 endpoints 2>/dev/null
+}
+
+# ── wireguard re-key (LIVE, guarded) ─────────────────────────────────────────
+# Replace /etc/wireguard/wg0.conf with a new one and restart the tunnel. This is how a Pi is
+# moved to a different pharmacy identity (e.g. an office bench unit -> 10.255.<N>.x) WITHOUT
+# a re-image, on a device where westerncomms has no shell and no general sudo.
+#
+# Built like the other dangerous verbs (cmdline-quiet, agent-update), because a wrong key or
+# peer here is a DEAD TUNNEL — no handshake, no telemetry, no remote way back, a site visit:
+#   * the new config arrives on STDIN, never argv (/proc is world-readable; argv would leak the
+#     private key). It is written to a file and never interpolated into a shell.
+#   * validated before use: it must be a plausible single wg config AND its PrivateKey must be a
+#     real key (`wg pubkey` accepts it). A value that does not pass is refused, not sanitised.
+#   * the current wg0.conf is backed up to wg0.conf.prev before the swap.
+#   * a DEAD-MAN REVERT is armed BEFORE the swap: 3 min later wg-revert-check restores the backup
+#     unless the tunnel has actually handshaked. So the failure mode of a re-key self-recovers to
+#     the previous working identity, with nobody on site.
+cmd_wg_apply() {
+    local new tmp pk
+    new=$(cat)
+    printf '%s\n' "$new" | grep -q '^\[Interface\]' || die "wg-apply: no [Interface] section"
+    printf '%s\n' "$new" | grep -q '^\[Peer\]'       || die "wg-apply: no [Peer] section"
+    printf '%s\n' "$new" | grep -q '^Endpoint'       || die "wg-apply: no Endpoint"
+    printf '%s\n' "$new" | grep -q '^AllowedIPs'     || die "wg-apply: no AllowedIPs"
+    pk=$(printf '%s\n' "$new" | sed -n 's/^PrivateKey *= *//p' | head -1)
+    printf '%s' "$pk" | wg pubkey >/dev/null 2>&1    || die "wg-apply: PrivateKey is not a valid key"
+    install -d -m 0755 /var/lib/wcn
+    tmp=$(mktemp); chmod 600 "$tmp"; printf '%s\n' "$new" > "$tmp"
+    [ -f "$WG_CONF" ] && cp -p "$WG_CONF" "$WG_CONF.prev"
+    # Arm the dead-man FIRST — a crash between here and the restart still self-recovers.
+    printf 'armed\n' > "$WG_TRIAL"
+    systemd-run --on-active=180 /usr/local/sbin/wcn-toolbox-priv wg-revert-check >/dev/null 2>&1 || true
+    install -m 600 "$tmp" "$WG_CONF"; rm -f "$tmp"
+    systemctl restart wg-quick@wg0
+    echo "wg-apply: applied; auto-reverts in ~3 min unless the tunnel handshakes"
+}
+
+# Run once, 3 min after a re-key, by the transient systemd-run timer above. Healthy = at least
+# one peer handshaked within the last 3 min; otherwise the previous wg0.conf is restored.
+cmd_wg_revert_check() {
+    [ -f "$WG_TRIAL" ] || return 0
+    local now ok=0 ts _pk
+    now=$(date +%s)
+    while IFS=$'\t' read -r _pk ts; do
+        case "$ts" in ''|*[!0-9]*) continue ;; esac
+        [ "$ts" -gt 0 ] && [ $(( now - ts )) -le 180 ] && ok=1
+    done <<WGHS
+$(wg show wg0 latest-handshakes 2>/dev/null)
+WGHS
+    if [ "$ok" = 1 ]; then
+        rm -f "$WG_TRIAL" "$WG_CONF.prev"
+        echo "wg-apply: confirmed — tunnel is handshaking"
+    else
+        [ -f "$WG_CONF.prev" ] && install -m 600 "$WG_CONF.prev" "$WG_CONF" && rm -f "$WG_CONF.prev"
+        rm -f "$WG_TRIAL"
+        systemctl restart wg-quick@wg0
+        echo "wg-apply: NO handshake in 3 min — reverted to previous wg0.conf"
+    fi
 }
 
 # Only the URL. The token on the next line of that file stays here.
@@ -444,23 +599,124 @@ cmd_pcscd_reset() {
     echo "card service reset"
 }
 
+# ── printing ─────────────────────────────────────────────────────────────────
 # A real page, not an empty job. A raw queue (the Zebra label printer) silently produces
 # nothing from a text file, so branch on the queue's own device URI rather than its name.
+#
+# WHAT THE PAGE IS FOR: an engineer standing at the counter presses this and then reads, OFF THE
+# PAPER, which queue came out of which tray. So the QUEUE NAME is the largest element on the
+# page, and the tray, the counter and the time are printed under it. Anything less and the
+# button does not answer the question it exists to answer.
+#
+# Everything interpolated into a payload is escaped first. The queue name has already passed
+# v_queue, so escaping it is belt-and-braces — but the TRAY LABEL and the DEVICE URI come out of
+# cupsd's configuration and have never been through a validator in their lives.
+
+# Printable ASCII only, bounded length. Every value that reaches a print payload goes through it.
+_p_clean() { printf '%s' "${1-}" | LC_ALL=C tr -cd '\40-\176' | cut -c1-"${2:-64}"; }
+
+# ZPL escaping. `^` starts a format command and `~` starts a control command, so an unescaped one
+# inside a field is EXECUTED rather than printed — a queue name could otherwise close the field
+# and issue ZPL of its own. ^FH turns on hex escapes for the ^FD that follows it, using `_` as
+# the escape character, so `_` has to be rewritten FIRST, before it acquires that meaning.
+# Every ^FD in the label below is preceded by ^FH.
+_zpl_esc() {
+    local s; s=$(_p_clean "${1-}" "${2:-64}")
+    s="${s//_/_5F}"; s="${s//^/_5E}"; s="${s//\~/_7E}"
+    printf '%s' "$s"
+}
+
+# The tray label, when the queue's own device URI names one — iPharm's ETP queue is
+# pjltray://BRN....local?tray=TRAY2&pcl=5. Empty when there is none.
+_uri_tray() {
+    local u="${1-}" t=""
+    case "$u" in
+        *\?tray=*|*\&tray=*) t="${u#*tray=}"; t="${t%%&*}" ;;
+    esac
+    _p_clean "$t" 24
+}
+
+# Follow ONE hop for a client queue, to decide the print LANGUAGE only.
+#
+# counter 1's Label-ZD421 is ipp://192.168.55.18:631/printers/Label-ZD421 — a client queue
+# pointing at counter 2's shared raw Zebra. That URI carries no device identity at all: the only
+# Zebra evidence in the string is the QUEUE NAME, which this function refuses to read, because a
+# name is not evidence (the same reason the card-reader probe prefers the interface class over
+# the product string). So ask the far server for ITS device URI — the same class of evidence, one
+# hop out. Without this, a test print to the ZD421 from counter 1 takes the plain-text branch and
+# reproduces exactly the "silently produces nothing" symptom this function was written to kill,
+# while the identical queue on counter 2 works — i.e. it presents as intermittent.
+#
+# Bounded by timeout and failure-tolerant: if the far counter is off we keep the local URI and
+# classify on that. This is evidence gathering, not an argument check, so it falls back rather
+# than dying — a far counter being asleep must not break a test print that would otherwise work.
+_resolve_uri() {
+    local u="${1-}" hp rq far
+    case "$u" in ipp://*/printers/*|ipps://*/printers/*) ;; *) printf '%s' "$u"; return 0 ;; esac
+    hp="${u#*://}"; hp="${hp%%/*}"
+    rq="${u##*/}";  rq="${rq%%\?*}"
+    case "$hp" in ''|*[!A-Za-z0-9.:_-]*) printf '%s' "$u"; return 0 ;; esac
+    case "$rq" in ''|*[!A-Za-z0-9._-]*)  printf '%s' "$u"; return 0 ;; esac
+    far=$(timeout 5 lpstat -h "$hp" -v "$rq" 2>/dev/null | sed -n 's/.*device for [^:]*: //p')
+    if [ -n "$far" ]; then printf '%s' "$far"; else printf '%s' "$u"; fi
+}
+
 cmd_test_print() {
     local q="$1"; v_queue "$q"
-    local uri; uri=$(lpstat -v "$q" 2>/dev/null | sed -n 's/.*device for [^:]*: //p')
-    local tmp; tmp=$(mktemp)
-    if printf '%s' "$uri" | grep -qi 'zebra\|zpl\|socket://'; then
-        printf '^XA^FO40,40^A0N,30,30^FDWCN test print^FS^FO40,90^A0N,24,24^FD%s^FS^XZ\n' \
-            "$(hostname)" > "$tmp"
-        timeout 20 lp -d "$q" -o raw "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "lp failed"; }
+    local uri lang tray tmp mode
+    uri=$(timeout 10 lpstat -v "$q" 2>/dev/null | sed -n 's/.*device for [^:]*: //p')
+    [ -n "$uri" ] || die "no device URI for $q - unknown queue, or cupsd is not answering"
+    tray=$(_uri_tray "$uri")        # the tray belongs to THIS queue's URI...
+    lang=$(_resolve_uri "$uri")     # ...but the print language is the far device's
+    tmp=$(mktemp) || die "mktemp failed"
+    # Expanded now, on purpose: at EXIT the local $tmp is long gone and `set -u` would make an
+    # unexpanded trap noisy. This also covers the die paths and a SIGTERM landing mid-job.
+    trap "rm -f '$tmp'" EXIT INT TERM
+    # `socket://` is a TRANSPORT, not a language, and it stays in this test deliberately: it is
+    # the bias that fails the safe way round. A non-Zebra misread as ZPL prints a visibly wrong
+    # page that an engineer can read and report; a Zebra misread as text prints NOTHING AT ALL,
+    # which is the original defect and is indistinguishable from a broken printer.
+    if printf '%s' "$lang" | grep -qi 'zebra\|zpl\|socket://'; then
+        mode=zpl
+        # Sized for a dispensing label: everything sits inside ~400 x 215 dots (about 2" x 1.05"
+        # at 203dpi). ^FB wraps a long queue name to two lines instead of running it off the
+        # edge. No ^PW/^LL — the stock the queue is configured for is not ours to override.
+        {
+            printf '^XA^CI28\n'
+            printf '^FO16,12^A0N,22,22^FDWCN test print^FS\n'
+            printf '^FO16,42^A0N,50,50^FB380,2,0,L,0^FH^FD%s^FS\n' "$(_zpl_esc "$q")"
+            [ -n "$tray" ] && \
+                printf '^FO16,158^A0N,26,26^FH^FDtray %s^FS\n' "$(_zpl_esc "$tray" 24)"
+            printf '^FO16,190^A0N,22,22^FH^FD%s  %s^FS\n' \
+                "$(_zpl_esc "$(hostname)" 32)" "$(date '+%Y-%m-%d %H:%M')"
+            printf '^XZ\n'
+        } > "$tmp"
+        timeout 20 lp -d "$q" -o raw -t wcn-test "$tmp" >/dev/null 2>&1 || die "lp failed on $q"
     else
-        printf 'WCN counter test print\nhost: %s\ndate: %s\nqueue: %s\n' \
-            "$(hostname)" "$(date -Is)" "$q" > "$tmp"
-        timeout 20 lp -d "$q" "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "lp failed"; }
+        mode=text
+        # PLAIN ASCII ONLY. Every queue in the estate is raw, so cupsd passes these bytes through
+        # untouched — a PCL escape sequence sent to a queue that turns out not to speak PCL would
+        # print as literal garbage, and this branch is the one we reach when we DON'T know the
+        # language. Size comes from letter-spacing the queue name, which needs no language at all.
+        # The trailing form feed is what ejects the page on a laser.
+        {
+            printf 'WCN TEST PRINT\n'
+            printf '==================================================\n'
+            printf '  QUEUE:  %s\n' "$(_p_clean "$q" 63 | sed 's/./& /g')"
+            printf '==================================================\n'
+            printf '  queue   : %s\n' "$(_p_clean "$q" 63)"
+            [ -n "$tray" ] && printf '  tray    : %s\n' "$tray"
+            printf '  counter : %s\n' "$(_p_clean "$(hostname)" 63)"
+            printf '  time    : %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+            printf '  device  : %s\n' "$(_p_clean "$uri" 90)"
+            printf '\nWrite the tray this page came out of against the queue name above.\n'
+            printf '\f'
+        } > "$tmp"
+        timeout 20 lp -d "$q" -t wcn-test "$tmp" >/dev/null 2>&1 || die "lp failed on $q"
     fi
-    rm -f "$tmp"
-    echo "test page sent to $q"
+    # lp exiting 0 means cupsd ACCEPTED the job, never that a page came out. Report which branch
+    # was taken as well, so a blank page is diagnosable without a second visit to the site.
+    echo "test page sent to $q ($mode${tray:+, tray $tray})"
 }
 
 cmd_queue_enable() { local q="$1"; v_queue "$q"; cupsenable "$q" && echo "enabled $q"; }
@@ -469,9 +725,171 @@ cmd_queue_clear()  { local q="$1"; v_queue "$q"; cancel -a "$q" && echo "cleared
 # xfreerdp3 ignores SIGTERM, and `pkill -f` would match this very helper's own argv. -x on the
 # exact process name is the only correct form here; the kiosk loop reconnects by itself, which
 # also re-runs pick_transport and so recovers a session wedged on the Cloudflare fallback.
+# The kill is a helper because printing-promote needs the identical action as its last step.
+_kiosk_kick() { pkill -9 -x xfreerdp3 2>/dev/null; return 0; }
+
 cmd_kiosk_restart() {
-    pkill -9 -x xfreerdp3 2>/dev/null
+    _kiosk_kick
     echo "session restarting"
+}
+
+# ── printer set promotion ────────────────────────────────────────────────────
+# Watchman stages a printer set through the agent as printers.tab.NEXT. wcn-kiosk reads ONLY
+# printers.tab, and it re-reads it on EVERY RECONNECT — a network blip is enough — so writing the
+# live file IS the commit, and a half-written live file would apply itself mid-shift. Hence two
+# files and this verb: validate the pending set, keep a rollback copy, swap it in atomically and
+# restart the session, as ONE action with ONE decision point.
+#
+# It takes NO ARGUMENT on purpose. The server sends a NAME from the allowlist, never a command
+# line and never a path — the three paths are literals at the top of this file, exactly as
+# cmd_toolbox_sync fixes its own install paths ("never taken from the network"). The server
+# chooses the bytes; it never chooses where they land.
+#
+# This verb INTERRUPTS A LIVE COUNTER, so every failure path leaves the session alone.
+
+# Dies on the FIRST violation, naming the line. Called two ways: bare, as the pre-flight check,
+# where dying IS the refusal; and inside a subshell for the post-swap re-check, where the
+# subshell's exit turns the same refusal into a status the caller can act on. One implementation,
+# so the file that is checked before the swap and the file that is checked after it are held to
+# the exact same rules. Echoes a one-line summary on success.
+_printers_validate() {
+    local f="$1" n=0 lineno=0 line rest q d fl tabs defq="" names=" " sz
+    [ -L "$f" ] && die "$f: refusing, it is a symlink"
+    [ -f "$f" ] || die "$f: not a regular file"
+    # `| tr -d ' \t'` because some wc implementations pad the count; an unparseable answer is
+    # treated as over the ceiling, which is the same direction of failure as too big.
+    sz=$(wc -c < "$f" 2>/dev/null | tr -d ' \t')
+    case "$sz" in '' | *[!0-9]*) die "$f: refusing, could not establish its size" ;; esac
+    [ "$sz" -le "$PRINTERS_MAX_BYTES" ] || die "$f: refusing, larger than 64 KiB"
+    # `|| [ -n "$line" ]` so a final line with no trailing newline is still checked, not skipped.
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$(( lineno + 1 ))
+        case "$line" in
+            ''|'#'*) continue ;;
+            *$'\r'*) die "$f line $lineno: carriage return - the file must be LF only" ;;
+        esac
+        tabs="${line//[!$'\t']/}"
+        [ "${#tabs}" -eq 2 ] \
+            || die "$f line $lineno: expected 3 TAB separated fields, found $(( ${#tabs} + 1 ))"
+        q="${line%%$'\t'*}"; rest="${line#*$'\t'}"
+        d="${rest%%$'\t'*}"; fl="${rest#*$'\t'}"
+        v_tabqueue "$q"
+        v_driver "$d"
+        v_flags "$fl"
+        case "$names" in *" $q "*) die "$f line $lineno: duplicate queue $q" ;; esac
+        names="$names$q "
+        # Two default queues would emit two ,default flags to xfreerdp3 and leave the VM's
+        # default printer down to ordering. Ambiguity is a refusal, like any other bad value.
+        case ",$fl," in
+            *,default,*)
+                [ -z "$defq" ] || die "$f line $lineno: $q is a second default; $defq already is"
+                defq="$q" ;;
+        esac
+        n=$(( n + 1 ))
+        # ONE cap, shared with wcn-kiosk's PRINTERS_MAX and the agent's. This side used to allow
+        # 64 while the kiosk redirected 32, so a 40-queue table promoted cleanly, cost the
+        # counter its session, and came back missing queues 33-40 and its default printer.
+        # Refusing here means promotion never applies a table the kiosk would truncate.
+        [ "$n" -le "$PRINTERS_MAX" ] \
+            || die "$f: refusing, more than $PRINTERS_MAX queues - wcn-kiosk redirects at most that many"
+    done < "$f"
+    # THE FALLBACK RULE, enforced from this side. wcn-kiosk falls back to its hardcoded block when
+    # printers.tab is ABSENT or has no valid lines — but a counter must never get there by way of
+    # a promotion. An empty pending set is a refusal, not a fallback.
+    [ "$n" -ge 1 ] || die "$f: no valid queue lines - refusing, a counter must never end up with none"
+    echo "$n queues, default: ${defq:--}"
+}
+
+# Put back what was live before. If nothing was live, remove the file entirely rather than leave
+# a bad one in place: absent is a state wcn-kiosk handles by design, bad is not.
+#
+# ATOMIC, through the SAME install-to-sibling-then-mv path the promotion uses, and for the same
+# reason: wcn-kiosk re-reads the live file on EVERY RECONNECT, and a network blip is a reconnect.
+# `cp` truncates and rewrites the destination IN PLACE, so a blip inside that window read a
+# truncated table and fell back — and a cp that failed halfway left the live file permanently
+# truncated, with the error sent to /dev/null and "restored the previous set" printed anyway.
+#
+# Returns 0 only when the live file genuinely holds the previous set (or is genuinely gone).
+# Every caller must branch on that: a failed restore is the one outcome that must never be
+# reported as a successful one.
+_printers_restore() {
+    local rtmp
+    if [ -f "$PRINTERS_PREV" ]; then
+        rtmp="$PRINTERS_TAB.restore.$$"
+        install -m 0644 "$PRINTERS_PREV" "$rtmp" || {
+            rm -f "$rtmp"
+            echo "wcn-toolbox-priv: RESTORE FAILED: could not stage $PRINTERS_PREV" >&2
+            return 1
+        }
+        mv -f "$rtmp" "$PRINTERS_TAB" || {
+            rm -f "$rtmp"
+            echo "wcn-toolbox-priv: RESTORE FAILED: could not swap $PRINTERS_PREV into place" >&2
+            return 1
+        }
+        sync
+        return 0
+    fi
+    rm -f "$PRINTERS_TAB" || {
+        echo "wcn-toolbox-priv: RESTORE FAILED: could not remove $PRINTERS_TAB" >&2
+        return 1
+    }
+    sync
+    return 0
+}
+
+cmd_printing_promote() {
+    local summary tmp
+    [ -e "$PRINTERS_NEXT" ] || die "nothing to promote: $PRINTERS_NEXT does not exist"
+    # `|| die` is LOAD-BEARING. The command substitution is a subshell, so _printers_validate's
+    # own `exit 91` ends only that subshell — without this the pre-flight refusal would not stop
+    # the promotion, the bad set would go live, and only the post-swap re-check would pull it
+    # back. That window is a reconnect wide, which is exactly what the two-file design exists to
+    # close. The reason has already been printed to stderr by the inner die.
+    summary=$(_printers_validate "$PRINTERS_NEXT") || die "refusing to promote $PRINTERS_NEXT"
+    install -d -m 0755 /var/lib/wcn || die "could not create /var/lib/wcn"
+
+    # The G2 rule from cmd_toolbox_sync: identical content is never rewritten. This verb costs a
+    # counter its session, so it must be safe to call on every tick without spending one.
+    if cmp -s "$PRINTERS_NEXT" "$PRINTERS_TAB" 2>/dev/null; then
+        rm -f "$PRINTERS_NEXT"
+        echo "printers already current ($summary) - session left alone"
+        return 0
+    fi
+
+    # Rollback copy of what is live RIGHT NOW, taken before anything is touched.
+    if [ -f "$PRINTERS_TAB" ]; then
+        cp -p "$PRINTERS_TAB" "$PRINTERS_PREV" || die "could not keep a rollback copy - refusing"
+    else
+        rm -f "$PRINTERS_PREV"
+    fi
+
+    # Sibling temp in the SAME directory, so the rename is a same-filesystem atomic swap and the
+    # kiosk can never read a half-written file on a reconnect. 0644 because wcn-kiosk reads it as
+    # the unprivileged westerncomms, not as root.
+    tmp="$PRINTERS_TAB.promote.$$"
+    install -m 0644 "$PRINTERS_NEXT" "$tmp" || { rm -f "$tmp"; die "could not stage the new set"; }
+    # NO RESTORE ON THIS ARM. If the rename itself failed the live file was NEVER TOUCHED — it
+    # still holds exactly what the counter is printing to. Rewriting it here would be pure added
+    # risk on a path that has just proved the filesystem is unhappy.
+    mv -f "$tmp" "$PRINTERS_TAB" \
+        || { rm -f "$tmp"; die "atomic swap failed - the live set was not touched, session left alone"; }
+    sync
+
+    # Re-check what actually landed, under the same rules. A truncated or short write here would
+    # otherwise reach the kiosk on its very next reconnect.
+    if ! ( _printers_validate "$PRINTERS_TAB" >/dev/null ); then
+        if _printers_restore; then
+            die "promoted file failed its re-check - restored the previous set, session left alone"
+        fi
+        # The one state worth shouting about: the live file is bad AND the rollback did not go
+        # back. The kiosk will fall back rather than lose every printer, but this counter needs
+        # a human. Never printed as if the restore had worked.
+        die "promoted file failed its re-check AND THE RESTORE FAILED - $PRINTERS_TAB is not trustworthy; wcn-kiosk will fall back. Fix this counter by hand."
+    fi
+
+    rm -f "$PRINTERS_NEXT"                              # the pending change is no longer pending
+    _kiosk_kick                                         # ...and the swap + this are the one action
+    echo "printers promoted: $summary; session restarting"
 }
 
 cmd_log_tail() {
@@ -607,6 +1025,8 @@ verb="${1:-}"; shift 2>/dev/null || true
 case "$verb" in
     auth)               cmd_auth ;;
     wg-status)          cmd_wg_status ;;
+    wg-apply)           cmd_wg_apply ;;
+    wg-revert-check)    cmd_wg_revert_check ;;
     agent-url)          cmd_agent_url ;;
     agent-installed)    cmd_agent_installed_sha ;;
     agent-autoupdate)   cmd_agent_autoupdate ;;
@@ -626,6 +1046,7 @@ case "$verb" in
     test-print)         cmd_test_print "${1:?queue}" ;;
     queue-enable)       cmd_queue_enable "${1:?queue}" ;;
     queue-clear)        cmd_queue_clear "${1:?queue}" ;;
+    printing-promote)   cmd_printing_promote ;;
     kiosk-restart)      cmd_kiosk_restart ;;
     to-rdp)             cmd_to_rdp ;;
     log-tail)           cmd_log_tail ;;

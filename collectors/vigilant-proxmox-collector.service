@@ -1,0 +1,40 @@
+[Unit]
+Description=Vigilant Proxmox collector — push the cluster's VM inventory and capacity to Vigilant
+# Nothing to report before the network is up, and the whole pass is one outbound POST.
+After=network-online.target pve-cluster.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/vigilant/proxmox-collector.env
+# ⚠️ NO .py SUFFIX. The deployed file on wcn-dreadnaught is /usr/local/sbin/vigilant-proxmox-collector
+# (verified 2026-08-25). A path with .py does not exist and the unit fails to start.
+ExecStart=/usr/local/sbin/vigilant-proxmox-collector
+# MUST bound the WHOLE pass, not just the part PASS_DEADLINE_S covers. The deadline clock starts
+# AFTER the /cluster/resources reads and is only checked at the top of each VM, so the worst case is:
+#   50s cluster-resource timeouts + 240s deadline + 48s of in-flight VM work + 30s POST ≈ 368s.
+# 300s killed the pass mid-POST. 420s leaves real margin and still sits well inside the 15m timer.
+#
+# ⚠️ AND IT NOW ALSO BOUNDS THE JOB PHASE, which runs on the reply to that POST. The collector's
+# own HARD_PASS_BUDGET_S is 380s, measured from the top of main(), and it will not START a job
+# whose per-verb timeout would not finish inside what is left — so the process brings itself in
+# under this number rather than relying on it. If systemd does kill the pass mid-job anyway, the
+# write-ahead journal makes the next pass settle that job as FAILED rather than run it again.
+TimeoutStartSec=420
+# Root, because pvesh's authentication IS being root on a node — there is no API token in this
+# design, which is the point (see the module docstring).
+#
+# Reads: /cluster/resources, per-VM config, rrddata, and two read-only guest-agent GETs.
+#
+# ⚠️ NO LONGER READ-ONLY. Vigilant can hand this node work on the reply to its report — the
+# closed set vm.set-onboot / vm.start / vm.shutdown / vm.reboot — and two of those take a live
+# pharmacy desktop down. The server sends a NAME; the collector's own JOB_VERBS table decides
+# what that name means locally and re-validates every argument before it becomes argv. Nothing
+# listens: the channel is the reply to an outbound POST, so there is still no inbound hole.
+#
+# It writes its flock in /run and its write-ahead job journal in /var/lib/vigilant.
+Nice=10
+IOSchedulingClass=idle
+
+# ⛔ No [Install] section, deliberately. Enable the .timer, never the .service — enabling the
+# service as well fires an extra pass at every boot on top of the timer's OnBootSec.

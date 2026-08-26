@@ -39,6 +39,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 CONF = "/etc/vigilant/agent.env"
@@ -367,9 +368,22 @@ def power():
 
 def failed_units():
     """Anything systemd has given up on. A kiosk can look alive while the thing that matters
-    — the launcher, cups, the tunnel — sits in `failed` and nobody notices."""
+    — the launcher, cups, the tunnel — sits in `failed` and nobody notices.
+
+    EXCEPT the support screen-sharing unit when no session is wanted. That unit is on-demand:
+    it is started for a support session and stopped when the session ends, and x11vnc exits
+    non-zero on SIGTERM, so systemd leaves it `failed` after every NORMAL use. Reporting that
+    put a permanent "1 unit failed" on counters where nothing was wrong — which is exactly how
+    a fault list stops being read.
+
+    It is only suppressed when nothing is asking for a session. If Watchman HAS asked for one
+    (support_vnc_min > 0) and the unit is failed, then it genuinely did not come up, and that is
+    a real fault: an engineer is sitting waiting for a screen that will never arrive.
+    """
     out = run(["systemctl", "--failed", "--no-legend", "--plain", "--no-pager"])
     names = [l.split()[0] for l in out.splitlines() if l.strip() and not l.startswith("0 loaded")]
+    if not RUNTIME.get("support_vnc_min"):
+        names = [n for n in names if n.split(".")[0] != SUPPORT_VNC_UNIT]
     return {"count": len(names), "units": names[:8]}
 
 
@@ -545,6 +559,269 @@ def sysfs_card_reader():
     return (True if readers else False), readers, undriven
 
 
+# ── USB printers, independently of CUPS ─────────────────────────────────────
+# Every other printer check on this device starts from CUPS, so a printer with NO QUEUE is
+# invisible to all of them. That is not hypothetical: a Zebra ZD421 sat plugged into a live
+# counter and unusable from go-live, and nothing we reported could tell "this counter has no
+# label printer" from "it has one and nobody ever made a queue for it". Walking sysfs answers
+# the first half of that on its own, and cross-referencing CUPS answers the second.
+#
+# USB printer interfaces are bInterfaceClass 07. The protocol byte then says how the host may
+# talk to it — reported because a unidirectional interface can never report "out of paper",
+# which explains a printer that looks permanently healthy and is not.
+PRINTER_IFACE_CLASS = "07"
+PRINTER_IFACE_PROTOCOL = {
+    "01": "unidirectional",
+    "02": "bidirectional",
+    "03": "ieee-1284.4",
+}
+
+# ⚠ manufacturer, product and serial are USB DESCRIPTOR strings. They are chosen by whoever
+# built the device, not by us, and a hostile or simply faulty one can put ANYTHING in them —
+# including a newline, which in a line-oriented report forges an extra record, or an escape
+# sequence, which rewrites a support engineer's terminal. So every one of them is validated
+# before it is reported: printable ASCII (0x20..0x7e — no newline, no tab, no control byte, no
+# non-ASCII) and a hard 64-character cap. A field that fails is reported as null and the
+# refusal is logged, rather than being sanitised into something that looks trustworthy.
+# NOTHING here is ever passed to a shell; these values only ever become JSON.
+USB_STR_MAX = 64
+# The cap is written into the pattern rather than interpolated, so the pattern reads as what
+# it is. Keep the two in step.
+USB_STR_RE = re.compile(r"^[\x20-\x7e]{1,64}$")
+# The kernel formats these itself as "%04x", so this can be exact rather than forgiving.
+USB_ID_RE = re.compile(r"^[0-9a-f]{4}$")
+
+
+def _usb_attr(dev, name):
+    """Raw text of one sysfs attribute of a USB device. None when absent or empty.
+
+    Read as BYTES and decoded with errors="replace" on purpose. A descriptor holding
+    non-ASCII is a value that really is there and really is unreportable, and decoding it
+    strictly would raise and make it indistinguishable from a missing file. The replacement
+    character does not match USB_STR_RE, so such a device is refused-and-logged by the one
+    place that does the logging instead of vanishing silently.
+
+    The read is capped: a sysfs attribute is at most one page, and this is the one file in
+    this function that a device has any influence over.
+    """
+    try:
+        with open(os.path.join(dev, name), "rb") as fh:
+            raw = fh.read(4096)
+    except Exception:
+        return None
+    return raw.decode("ascii", "replace").strip() or None
+
+
+def _usb_str(dev, name):
+    """A descriptor string, or None if it is not safe to report. Logs every refusal.
+
+    The refusal is logged with repr(), which escapes exactly the bytes that made the value
+    unsafe — so a device that tries to forge a log line has its attempt printed as \\n rather
+    than performed. Truncated to 80 characters for the same reason the value is refused.
+    """
+    value = _usb_attr(dev, name)
+    if value is None:
+        return None                     # genuinely absent; most devices carry no serial
+    if USB_STR_RE.match(value):
+        return value
+    print(f"vigilant-pi-agent: refusing USB {name} of {os.path.basename(dev)}: {value[:80]!r} "
+          f"(not printable ASCII within {USB_STR_MAX} chars)", flush=True)
+    return None
+
+
+def _usb_id(dev, name):
+    """idVendor/idProduct as exactly four lowercase hex characters, or None."""
+    value = (_usb_attr(dev, name) or "").lower()
+    return value if USB_ID_RE.match(value) else None
+
+
+def cups_scheduler_up():
+    """True when cupsd answered, False when it is down, None when lpstat is not installed.
+
+    Needed because "lpstat -v printed nothing" is AMBIGUOUS, and the two meanings pull in
+    opposite directions: it is either a counter with no queues at all — the finding this whole
+    section exists to report — or a counter whose cupsd is not running, where claiming every
+    attached printer has no queue would raise a false alarm on every printer at the site at
+    once. `lpstat -r` separates them, and it is only worth a shell-out in that ambiguous case.
+    """
+    if not have("lpstat"):
+        return None
+    out = run(["lpstat", "-r"], timeout=8)
+    if not out.strip():
+        return False
+    return "not running" not in out.lower()
+
+
+def _usb_uri_fields(uri):
+    """(manufacturer, product, serial) from a CUPS usb:// device URI, or None if it is not one.
+
+    All three come back percent-decoded and lower-cased, because CUPS writes
+    "Zebra%20Technologies" where the sysfs descriptor says "Zebra Technologies".
+
+    RESTRICTED TO usb:// ON PURPOSE. A counter's queue list also holds ipp:// client queues
+    pointing at another counter's shared printer; those URIs describe a REMOTE device and must
+    never be able to absorb a printer plugged into THIS Pi.
+    """
+    try:
+        parts = urllib.parse.urlsplit(uri)
+    except Exception:
+        return None
+    if parts.scheme.lower() != "usb":
+        return None
+    maker = urllib.parse.unquote(parts.netloc).strip().lower()
+    product = urllib.parse.unquote(parts.path).strip("/").strip().lower()
+    try:
+        query = urllib.parse.parse_qs(parts.query)          # parse_qs percent-decodes for us
+    except Exception:
+        query = {}
+    values = query.get("serial") or []
+    serial = values[0].strip().lower() if values else ""
+    return maker, product, serial
+
+
+def _queue_for_usb_device(rec, uris):
+    """Which CUPS queue, if any, belongs to this physical device.
+
+    Returns (queue_name, matched_on). matched_on is None when nothing matched.
+
+    A CUPS USB device URI is usb://<manufacturer>/<product>?serial=<serial>, percent-encoded,
+    so the serial is the identifying field and is matched FIRST — it is the only one that
+    separates two printers of the same model. Manufacturer+product is used ONLY when the
+    device reports no usable serial at all, never as a second chance for a device whose serial
+    simply is not in any queue: that case is the whole point of this check, and quietly
+    matching it by model would turn the alarm off exactly when it should be sounding.
+
+    EVERY COMPARISON IS EXACT, against a PARSED field — never a substring of the whole URI.
+    Substring matching was verified against iPharm counter 1's real queues and matched serial
+    "1" to Label-ZD420, serial "8" to a URI carrying port 631, and serial "ipp" to
+    Pharmacy-Printer. Cheap and counterfeit USB hardware ships serials exactly like "0" and
+    "1", so such a device was reported `queued` against a queue it has nothing to do with and
+    dropped straight out of printers_unqueued — switching off the single alarm this whole
+    function exists to raise.
+    """
+    parsed = []
+    for queue, uri in uris:
+        fields = _usb_uri_fields(uri)
+        if fields is not None:
+            parsed.append((queue, fields))
+
+    serial = (rec.get("serial") or "").strip().lower()
+    if serial:
+        for queue, (_maker, _product, uri_serial) in parsed:
+            if uri_serial and uri_serial == serial:
+                return queue, "serial"
+        return None, None
+    maker = (rec.get("manufacturer") or "").strip().lower()
+    product = (rec.get("product") or "").strip().lower()
+    if maker and product:
+        for queue, (uri_maker, uri_product, _serial) in parsed:
+            if uri_maker == maker and uri_product == product:
+                return queue, "name"
+    return None, None
+
+
+def sysfs_usb_printers():
+    """USB printers attached to this Pi, whether or not CUPS has a queue for them.
+
+    Returns (present, printers).
+      present  — None when sysfs cannot be read at all, so the caller reports nothing rather
+                 than a confident "no printers attached". False means sysfs was readable and
+                 there is genuinely no class-07 device.
+      printers — one record per device, capped, never None when present is not None.
+
+    Built to the same rules as sysfs_card_reader(), for the same reason: this runs inside the
+    telemetry path on a live pharmacy counter, so it returns a list in every case and raises
+    in none. Grouped by DEVICE rather than by interface (a multifunction unit exposes printer
+    and scanner interfaces separately and must be reported once), every read individually
+    guarded so one unreadable node cannot abort the scan, and nothing executed — there is no
+    subprocess call in this path.
+
+    _usb_dev_info() is deliberately NOT reused: it collapses manufacturer and product into one
+    display string, and it does no validation, both of which are wrong here.
+    """
+    try:
+        ifaces = glob.glob("/sys/bus/usb/devices/*/bInterfaceClass")
+    except Exception:
+        return None, None
+    if not ifaces:
+        return None, None
+
+    devs = {}
+    for path in sorted(ifaces):
+        try:
+            with open(path) as fh:
+                cls = fh.read().strip().lower()
+        except Exception:
+            continue
+        if cls != PRINTER_IFACE_CLASS:
+            continue
+        # …:1.0 is an interface; its parent directory is the device holding the descriptor
+        # strings. Same string surgery as sysfs_card_reader(): dirname, then split off the
+        # LAST colon-suffix.
+        iface_dir = os.path.dirname(path)
+        dev = iface_dir.rsplit(":", 1)[0]
+        devs.setdefault(dev, []).append(iface_dir)
+
+    # The CUPS side is read ONCE, outside the loop — a per-device lpstat would be one shell-out
+    # per printer on a 1 GB device every 30 seconds. The URIs are handed over RAW: decoding is
+    # _usb_uri_fields()'s job, because it has to decode per FIELD. Flattening the URI to one
+    # lower-cased string first is precisely what made the old substring match possible.
+    try:
+        uris = list(cups_queue_uris().items())
+    except Exception:
+        uris = None
+    # An EMPTY queue list is not the same evidence as a populated one — see cups_scheduler_up().
+    # Only a scheduler that is confirmed up turns "no queue matched" into a real finding.
+    if uris is not None and not uris and not cups_scheduler_up():
+        uris = None
+
+    printers = []
+    for dev, iface_dirs in sorted(devs.items()):
+        rec = {
+            # The Pi's own id for this device: its USB bus path, e.g. "1-1.3". This is what
+            # names it in dmesg and in /sys, so it is the id an engineer can act on.
+            "usb_path": os.path.basename(dev),
+            "iface": os.path.basename(iface_dirs[0]),
+            "vendor_id": _usb_id(dev, "idVendor"),
+            "product_id": _usb_id(dev, "idProduct"),
+            "manufacturer": _usb_str(dev, "manufacturer"),
+            "product": _usb_str(dev, "product"),
+            "serial": _usb_str(dev, "serial"),
+        }
+        # bInterfaceProtocol lives on the INTERFACE, not the device, so it is read relative to
+        # the interface directory rather than to dev.
+        proto = (_usb_attr(iface_dirs[0], "bInterfaceProtocol") or "").lower()
+        rec["protocol"] = PRINTER_IFACE_PROTOCOL.get(proto, proto or None)
+
+        if uris is None:
+            # CUPS could not be read. "No queue" would be a lie in that state, and it is the
+            # lie that raises a false alarm on a counter that is printing perfectly.
+            rec["status"] = "unknown"
+            rec["queue"] = None
+        else:
+            queue, how = _queue_for_usb_device(rec, uris)
+            if queue:
+                rec["status"] = "queued"
+                rec["queue"] = queue
+                rec["matched_on"] = how
+            elif rec["serial"] or (rec["manufacturer"] and rec["product"]):
+                # THE FINDING THIS FUNCTION EXISTS FOR: plugged in, powered, enumerated by the
+                # kernel — and no CUPS queue points at it, so nothing on this counter can print
+                # to it and no other check we have would ever say so.
+                rec["status"] = "attached, no queue"
+                rec["queue"] = None
+            else:
+                # Nothing usable to match on, so neither answer is honest.
+                rec["status"] = "unknown"
+                rec["queue"] = None
+        printers.append(rec)
+        # Bounded like every other list in this payload. A counter has two or three printers;
+        # anything past eight is a fault or a hub full of something else.
+        if len(printers) >= 8:
+            break
+    return (True if printers else False), printers
+
+
 def peripherals(rdp_argv=""):
     """What is actually plugged into this counter.
 
@@ -604,7 +881,35 @@ def peripherals(rdp_argv=""):
     queues = cups_devices()
     out["printer_queues"] = len(queues)
     out["printer_names"] = sorted(queues.keys())[:6]
+    # WHERE each queue points, so Watchman can draw the host dependency instead of saying
+    # "not recorded" about a relationship that is plainly visible in lpstat. Same cap and the
+    # same sort as printer_names, so the two lists line up and truncate together.
+    roles = cups_queue_roles()
+    out["printer_queue_roles"] = [
+        {"queue": q, "kind": roles[q]["kind"], "host": roles[q]["host"]}
+        for q in sorted(queues.keys())[:6] if q in roles
+    ]
     out["printer_redirected"] = "/printer" in rdp_argv
+
+    # …and CUPS is NOT the source of truth for what is plugged in, which is the gap this
+    # closes. A device here with status "attached, no queue" is a printer nobody can print to
+    # and that no other field on this device would ever mention.
+    #
+    # Nested inside `peripherals` rather than sent as a top-level payload key ON PURPOSE: this
+    # object already lands in device_state.raw, so it needs no ingest change and cannot collide
+    # with a contract name. A top-level key the ingest does not know fails schema validation
+    # and takes the WHOLE telemetry POST down with it — see the wifi_link and relay_session
+    # comments in build_payload — which on a counter means it stops being monitored entirely.
+    attached, usb_printers = sysfs_usb_printers()
+    if attached is not None:
+        out["printers_attached"] = usb_printers
+        out["printers_attached_count"] = len(usb_printers)
+        orphans = [p["usb_path"] for p in usb_printers if p["status"] == "attached, no queue"]
+        if orphans:
+            out["printers_unqueued"] = orphans
+
+    # Whether a printer table has been staged and is waiting to be promoted at this counter.
+    out.update(printers_tab_state())
 
     # Scanners: SANE if installed, otherwise fall back to the USB class.
     if have("scanimage"):
@@ -1130,6 +1435,296 @@ def write_kiosk_conf(session):
     return True
 
 
+# ── the printer redirection table ───────────────────────────────────────────
+# Which CUPS queues wcn-kiosk redirects into the RDP session, and under which WINDOWS DRIVER
+# each one is presented. It replaces a hardcoded /printer: flag in the launcher, which is how
+# the repo copy and the two live iPharm Pis silently diverged: one site's printer was compiled
+# into a script and the next site's five were hand-edited on the device.
+#
+# TWO FILES, and the split is the whole point:
+#
+#   printers.tab       LIVE. wcn-kiosk reads ONLY this, and it re-reads on EVERY RECONNECT,
+#                      not only at startup. A network blip is a reconnect. So writing this
+#                      file IS the commit, and a half-finished change would be picked up
+#                      mid-shift by a counter that happened to wobble.
+#   printers.tab.next  PENDING. This agent writes ONLY this, and never the live file. A
+#                      separate privileged verb promotes .next -> printers.tab and restarts
+#                      the session as ONE deliberate action, at a moment somebody chose.
+#
+# NOTHING HERE RESTARTS ANYTHING — same rule as the branding block. Writing .next changes what
+# the counter will do after the next promotion, never what it is doing now, so there is no
+# reason for it to cost a live counter its session.
+PRINTERS_TAB = "/var/lib/wcn/printers.tab"
+PRINTERS_TAB_NEXT = PRINTERS_TAB + ".next"
+PRINTERS_TAB_HEADER = "# Managed by vigilant-pi-agent from Watchman — local edits are overwritten."
+
+# ── THE printers.tab CONTRACT — ONE format, THREE owners ────────────────────
+# Owners, and what each is allowed to touch:
+#   vigilant-pi-agent.py  (this file)  writes printers.tab.NEXT only, never the live file.
+#   wcn-toolbox-priv      ('printing-promote')  validates .next, keeps .prev, swaps live,
+#                                     restarts the session — as ONE action.
+#   wcn-kiosk             reads printers.tab only, and turns it into xfreerdp argv.
+#
+# ALL THREE MUST ACCEPT AND REJECT EXACTLY THE SAME FILES. Every rule below is repeated
+# verbatim in the other two files. Three owners each applying their own rules to one shared
+# format is not a theoretical problem: it is the bug class that produced R1–R6, where a value
+# was staged by one owner, promoted by a second and silently dropped by a third.
+#
+#   line            <queue_name>\t<windows_driver>\t<flags>   — exactly two TABs, LF only
+#   blank / '#'     ignored
+#   queue_name      ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$   i.e. 1..63 characters.
+#                   It is the CUPS queue name AND the Windows printer name AND what ProScript
+#                   stores in its report mapping — one string wearing three hats, which is why
+#                   this is a tight allowlist and not a sanitiser.
+#                   63 and not 64: wcn-toolbox-priv hands this same name to test-print and
+#                   queue-clear, whose v_queue caps at 63. A 64-character name would promote
+#                   and then be untestable — and because validation is all-or-nothing, ONE
+#                   over-long name makes that site's WHOLE table permanently un-promotable.
+#   windows_driver  printable ASCII 0x20..0x7e, 1..128 characters, NO COMMA.
+#                   It cannot use the queue-name class: every real driver name has spaces
+#                   ("ZDesigner ZD420-203dpi ZPL", "Brother HL-L5100DN series"). Bounded
+#                   printable ASCII is safe for the reason v_ssid records — the value reaches
+#                   its consumer as ONE element of an argv array, never as a shell word, and
+#                   the TAB separator is what guarantees the split.
+#                   THE COMMA is excluded at all three owners because comma is FreeRDP's OWN
+#                   field separator inside /printer:<queue>,<driver>[,default]. Real driver
+#                   names contain one ("Kyocera FS-1030D, KPDL"), so this needs no attacker,
+#                   just an operator typing the true name. When only wcn-kiosk refused it, the
+#                   table staged, validated, promoted and restarted the session — and the
+#                   counter came back with that printer GONE while telemetry read converged.
+#                   Refusing it HERE is what keeps the operator's mistake visible in Watchman.
+#   flags           comma separated, a CLOSED SET, currently only `default`; empty is legal.
+#                   At most ONE `default` in the whole table.
+#   uniqueness      queue names unique across the table.
+#   table size      at most PRINTERS_MAX queues. ONE number in all three: this agent refuses
+#                   the push, the toolbox refuses the promotion, and wcn-kiosk counts anything
+#                   past it as REJECTED rather than silently truncating the table.
+#   file size       at most 64 KiB.
+#   all or nothing  at both writing ends one bad line refuses the WHOLE table: which queue is
+#                   `default` and which queues exist at all only mean anything relative to each
+#                   other, so a partially applied table is internally consistent and wrong.
+#
+# THE ONE DELIBERATE ASYMMETRY, written down so nobody "fixes" it into a fourth disagreement:
+# on a duplicate queue name, a second `default`, or more than PRINTERS_MAX queues, the two
+# WRITING owners refuse the WHOLE table — so none of those can ever reach the live file through
+# promotion. wcn-kiosk, which reads a file it did not write, resolves the same three per LINE
+# (first queue wins, first `default` wins, the excess counted as rejected), because its
+# non-negotiable job is that a counter never ends up with zero printers. Every PER-VALUE rule
+# above is identical in all three; only these three whole-table conditions differ, and the
+# kiosk's leniency is unreachable by anything that came through promotion.
+TAB_QUEUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+# 0x2c is the comma, and it is the one printable character carved out of the range — see the
+# contract above. Excluding it from the pattern keeps ONE source of truth for the rule.
+TAB_DRIVER_RE = re.compile(r"^[\x20-\x2b\x2d-\x7e]{1,128}$")
+TAB_FLAGS = frozenset(("default",))
+# Hard cap on redirected queues, shared with wcn-kiosk's PRINTERS_MAX and wcn-toolbox-priv's
+# _printers_validate. A site has a handful; anything beyond this is a corrupt or runaway table,
+# and every queue is an argv element and a printer installed inside the session.
+PRINTERS_MAX = 32
+# Same 64 KiB ceiling wcn-toolbox-priv and wcn-kiosk apply to the file itself.
+PRINTERS_TAB_MAX_BYTES = 65536
+
+
+def read_text_file(path):
+    """A printers.tab-family file, or None. Bounded by the contract's 64 KiB ceiling.
+
+    Read at every telemetry tick, so the bound is what keeps a corrupt or runaway file on a
+    1 GB counter from being pulled into memory 120 times an hour. One byte over the ceiling is
+    read too, so an oversized file is distinguishable from one that exactly fills it — and it
+    then fails the same size rule wcn-toolbox-priv and wcn-kiosk apply.
+    """
+    try:
+        with open(path) as fh:
+            return fh.read(PRINTERS_TAB_MAX_BYTES + 1)
+    except Exception:
+        return None
+
+
+def _tab_records(text):
+    """The significant lines of a printers.tab body — comments and blanks dropped."""
+    if text is None:
+        return None
+    return [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+
+
+def _tab_queue_names(text):
+    """Queue names from a printers.tab body, in file order. None when the file is absent."""
+    rows = _tab_records(text)
+    if rows is None:
+        return None
+    return [r.split("\t", 1)[0] for r in rows][:16]
+
+
+def _tab_flags(value, where):
+    """Normalise one entry's flags to a sorted tuple, or None if any flag is not in the set.
+
+    A list of strings is the wire shape; a comma-separated string is accepted because it is
+    the shape the file itself uses and a server that echoes a line back should not be a fault.
+    """
+    if value is None or value == "":
+        return ()
+    if isinstance(value, str):
+        value = value.split(",")
+    if not isinstance(value, list):
+        print(f"vigilant-pi-agent: printer table {where}: flags must be a list, "
+              f"got {type(value).__name__}", flush=True)
+        return None
+    flags = set()
+    for flag in value:
+        if not isinstance(flag, str) or flag.strip() not in TAB_FLAGS:
+            print(f"vigilant-pi-agent: printer table {where}: refusing flag {flag!r} "
+                  f"(allowed: {', '.join(sorted(TAB_FLAGS))})", flush=True)
+            return None
+        flags.add(flag.strip())
+    return tuple(sorted(flags))
+
+
+def render_printers_tab(entries):
+    """The exact bytes printers.tab.next should hold — or None if ANY entry is invalid.
+
+    ALL OR NOTHING, deliberately. A printer table is a SET, not a bag of independent lines:
+    which queue is `default` and which queues exist at all only mean anything relative to each
+    other. Writing the good lines and dropping the bad one would hand a counter a table that
+    is internally consistent and quietly WRONG — a label printer missing, or no default at
+    all — and nothing downstream could tell that from an operator who meant it. Refusing the
+    whole push leaves the previous .next exactly as it was and says which line was at fault.
+
+    Deterministic, for the same reason render_kiosk_conf() is: the caller decides whether to
+    write by comparing these bytes with the file, so no timestamp, no hostname, and the
+    server's own ordering is preserved rather than re-sorted (the order sets the /printer:
+    flag order the launcher emits).
+    """
+    # The cap is enforced HERE, at push time, so the operator is refused in Watchman with a
+    # reason. wcn-kiosk caps at the same number, and before these three agreed it simply
+    # stopped reading at 32 — a 40-queue table promoted cleanly, cost the counter its session,
+    # and came back missing queues 33-40 and its default printer, logging a clean parse.
+    if len(entries) > PRINTERS_MAX:
+        print(f"vigilant-pi-agent: printer table has {len(entries)} queues, more than the "
+              f"{PRINTERS_MAX} wcn-kiosk will redirect — refusing the whole table", flush=True)
+        return None
+    lines = [PRINTERS_TAB_HEADER]
+    seen = set()
+    defaults = []
+    for i, entry in enumerate(entries):
+        where = f"entry {i + 1}"
+        if not isinstance(entry, dict):
+            print(f"vigilant-pi-agent: printer table {where}: expected an object, "
+                  f"got {type(entry).__name__} — refusing the whole table", flush=True)
+            return None
+        queue = entry.get("queue")
+        driver = entry.get("driver")
+        # repr() on every refusal: these strings came off the wire, and a value containing a
+        # newline must be PRINTED as \n rather than allowed to forge a second log line.
+        if not isinstance(queue, str) or not TAB_QUEUE_RE.match(queue):
+            print(f"vigilant-pi-agent: printer table {where}: refusing queue name "
+                  f"{queue!r} — refusing the whole table", flush=True)
+            return None
+        if not isinstance(driver, str) or not TAB_DRIVER_RE.match(driver):
+            # The comma is named explicitly. It is the one refusal an operator hits by typing
+            # the TRUE driver name off the Windows print server ("Kyocera FS-1030D, KPDL"), and
+            # "not printable ASCII" would send them looking for the wrong thing entirely.
+            if isinstance(driver, str) and "," in driver:
+                why = ("it contains a COMMA, which is FreeRDP's own field separator inside "
+                       "/printer: — rename the driver in Windows or omit the part after the "
+                       "comma")
+            else:
+                why = "it must be printable ASCII, 1..128 characters"
+            print(f"vigilant-pi-agent: printer table {where} ({queue}): refusing driver "
+                  f"{str(driver)[:80]!r} — {why} — refusing the whole table", flush=True)
+            return None
+        if queue in seen:
+            # Two lines for one queue would emit two /printer: flags naming the same Windows
+            # printer, and which driver won would depend on FreeRDP's argv order.
+            print(f"vigilant-pi-agent: printer table {where}: duplicate queue {queue!r} "
+                  "— refusing the whole table", flush=True)
+            return None
+        flags = _tab_flags(entry.get("flags"), f"{where} ({queue})")
+        if flags is None:
+            print("vigilant-pi-agent: refusing the whole printer table", flush=True)
+            return None
+        if "default" in flags:
+            defaults.append(queue)
+        seen.add(queue)
+        lines.append(f"{queue}\t{driver}\t{','.join(flags)}")
+    if len(defaults) > 1:
+        # "default" names the session's default printer. Two of them is not a preference the
+        # file can express, and guessing which one the operator meant is worse than refusing.
+        print(f"vigilant-pi-agent: printer table: {len(defaults)} queues marked default "
+              f"({', '.join(defaults)}) — refusing the whole table", flush=True)
+        return None
+    return "\n".join(lines) + "\n"
+
+
+def write_printers_tab_next(printers):
+    """Render Watchman's queue list into printers.tab.NEXT. Returns True if the file changed.
+
+    ⛔ This function must never write PRINTERS_TAB. The launcher re-reads the live file on
+    every reconnect, so writing it here would apply a change at the next random network blip,
+    to a counter mid-dispense, with nobody watching. Promotion is a separate privileged verb.
+    """
+    if printers is None:
+        return False                    # the server has no opinion this tick
+    if not isinstance(printers, list):
+        print(f"vigilant-pi-agent: ignoring printer table of type "
+              f"{type(printers).__name__}", flush=True)
+        return False
+    if not printers:
+        # An empty table cannot MEAN "no printers here": the launcher's non-negotiable
+        # fallback is that a file with no valid lines reverts to its hardcoded block, so an
+        # empty file would silently restore some other site's printer. Leaving .next alone is
+        # the only honest response to an empty push.
+        print("vigilant-pi-agent: empty printer table in this push, "
+              f"leaving {PRINTERS_TAB_NEXT} as it is", flush=True)
+        return False
+
+    want = render_printers_tab(printers)
+    if want is None:
+        return False                    # render_printers_tab has already said which line failed
+    # Byte comparison before writing, exactly as write_kiosk_conf does: the server re-sends the
+    # whole table every tick, and an unconditional rewrite would make print_tab_pending flap
+    # and would rewrite a file the launcher may be reading.
+    if read_text_file(PRINTERS_TAB_NEXT) == want:
+        return False
+    try:
+        os.makedirs(os.path.dirname(PRINTERS_TAB_NEXT), exist_ok=True)
+        tmp = PRINTERS_TAB_NEXT + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(want)
+        # 0644 because the launcher runs as the kiosk user, and an atomic replace so neither
+        # the launcher nor the promotion verb can ever see half a table.
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, PRINTERS_TAB_NEXT)
+    except Exception as e:
+        print(f"vigilant-pi-agent: cannot write {PRINTERS_TAB_NEXT}: {e}", flush=True)
+        return False
+    queues = ", ".join(l.split("\t", 1)[0] for l in _tab_records(want) or [])
+    print(f"vigilant-pi-agent: printer table staged -> {PRINTERS_TAB_NEXT} [{queues}] "
+          "(pending promotion; nothing restarted)", flush=True)
+    return True
+
+
+def printers_tab_state():
+    """What the counter is printing to now, and what it WILL print to once promoted.
+
+    print_tab_pending is the operator-facing half: true means a table has been staged that the
+    live file does not yet match, so Watchman can show "needs a session restart at this
+    counter" rather than leaving somebody to wonder why a printer they added has not appeared.
+
+    Compared on significant lines only, so rewording the managed-by header never reads as a
+    pending change — the header is cosmetic and promoting for it would cost a session.
+    """
+    live = read_text_file(PRINTERS_TAB)
+    pending = read_text_file(PRINTERS_TAB_NEXT)
+    out = {
+        "print_tab_live": _tab_queue_names(live),
+        "print_tab_next": _tab_queue_names(pending),
+        "print_tab_pending": False,
+    }
+    if pending is not None:
+        out["print_tab_pending"] = (_tab_records(pending) or []) != (_tab_records(live) or [])
+    return out
+
+
 def apply_settings(settings):
     """Adopt the per-thin-client settings Watchman sent.
 
@@ -1272,6 +1867,89 @@ def snmp_walk(host, community, oid):
     return [l.strip().strip('"') for l in lines]
 
 
+def cups_queue_uris():
+    """queue -> its FULL DeviceURI: scheme, port and query string all intact.
+
+    cups_devices() below reduces the same output to a bare host, which is everything the SNMP
+    poller needs and lossy for everything else — usb://Zebra%20Technologies/ZTC%20ZD420…
+    reduces to the vendor string, and the ?serial= that says WHICH Zebra is thrown away.
+    Anything matching a physical device to a queue has to see the whole URI, so the parse is
+    split in two here and cups_devices() keeps its exact previous behaviour on top.
+    """
+    if not have("lpstat"):
+        return {}
+    found = {}
+    for line in run(["lpstat", "-v"]).splitlines():
+        m = re.match(r"device for (\S+?):\s*(\S+)", line.strip())
+        if m:
+            found[m.group(1)] = m.group(2)
+    return found
+
+
+def cups_queue_roles():
+    """queue -> {"kind", "host"} — WHERE a queue points, which is the fact that reveals sharing.
+
+    ⭐ WHY THIS EXISTS. Watchman could not say which counter hosts a printer, because nothing
+    told it. The payload carried a queue COUNT and up to six NAMES, and a name is identical
+    whether the queue drives a printer plugged into this Pi or reaches one plugged into the
+    counter next door. At iPharm two Zebras live on counter 1 and counter 2 reaches them over
+    IPP — a real dependency, invisible to the platform, so the site read "shared to: not
+    recorded" while the sharing was right there in lpstat.
+
+    ⛔ THE RAW URI IS NOT REPORTED. It is built from IEEE-1284 strings the DEVICE supplies, and
+    the whole platform treats those as untrusted. What is reported is a CLASSIFICATION —
+    a closed set of kinds, plus a host only when that host validates as an address or a
+    hostname. A device that lies about its make cannot put anything into this field.
+
+      usb      the printer is plugged into THIS Pi. This counter is the host.
+      remote   the queue is reached over the network at `host`.
+      local    the queue points at this Pi itself. Not a dependency on anything.
+      other    a scheme this does not classify, reported as itself rather than guessed at.
+
+    ⚠️ `remote` DOES NOT MEAN "another counter". This device cannot tell a sibling Pi from the
+    printer itself — ipp://192.168.55.17 is counter 1 and ipp://BRNB4220013EDFD.local is a
+    Brother on the shop network, and both look identical from here. The PLATFORM decides, by
+    matching `host` against the addresses of the site's own counters: a match is a sharing
+    dependency worth drawing, anything else is a network printer that depends on nobody.
+    Classifying that here would be guessing with the one piece of context this device lacks.
+    """
+    HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$")
+    out = {}
+    for queue, uri in cups_queue_uris().items():
+        m = re.match(r"^([a-z0-9+.-]{1,16})://([^/:@?#]{0,255})", uri or "")
+        if not m:
+            out[queue] = {"kind": "other", "host": None}
+            continue
+        scheme, authority = m.group(1).lower(), m.group(2)
+        if scheme == "usb":
+            # The authority is the vendor string, never an address — do not report it as one.
+            out[queue] = {"kind": "usb", "host": None}
+            continue
+        host = authority if HOST_RE.match(authority or "") else None
+        if host and host in _own_addresses():
+            # A counter does not depend on itself, whatever the scheme says.
+            out[queue] = {"kind": "local", "host": None}
+        elif host and scheme in ("ipp", "ipps", "socket", "http", "https", "lpd"):
+            out[queue] = {"kind": "remote", "host": host}
+        else:
+            # An unclassified scheme still reports its host — pjltray:// at iPharm is a real
+            # network printer reached through a custom backend, and hiding the host would lose
+            # that. The kind says plainly that this was not classified.
+            out[queue] = {"kind": "other", "host": host}
+    return out
+
+
+def _own_addresses():
+    """This Pi's own IPv4 addresses plus localhost, so a self-referencing queue is not read as
+    a dependency on another counter."""
+    addrs = {"localhost", "127.0.0.1", "::1"}
+    for line in run(["ip", "-4", "-o", "addr"]).splitlines():
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", line)
+        if m:
+            addrs.add(m.group(1))
+    return addrs
+
+
 def cups_devices():
     """Discover printers from CUPS rather than making someone list them.
 
@@ -1280,11 +1958,7 @@ def cups_devices():
     also what the operator sees in Watchman, so discovering here keeps the two in step.
     """
     found = {}
-    for line in run(["lpstat", "-v"]).splitlines():
-        m = re.match(r"device for (\S+?):\s*(\S+)", line.strip())
-        if not m:
-            continue
-        queue, uri = m.group(1), m.group(2)
+    for queue, uri in cups_queue_uris().items():
         host = re.match(r"^[a-z]+://([^/:@]+)", uri)
         if host:
             found[queue] = host.group(1)
@@ -1863,7 +2537,24 @@ def build_payload(conf):
         # Pi/counter specifics. Not device_state columns, so they land in `raw` and are
         # still queryable and visible on the device page.
         "agent_kind": "counter-pi",
-        "agent_version": 1,
+        # ⚠️ THE CAPABILITY FLOOR, AND THIS NUMBER IS THE SECOND HALF OF A FEATURE.
+        # The server reads this back out of device_state.raw->>'agent_version' and refuses to
+        # hand a counter job to anything below PMR_JOB_AGENT_VERSION (2), because handing a job
+        # out IS the claim: an agent that cannot parse `pmr_job` does not ignore it, it
+        # SWALLOWS it, and the job goes pending -> claimed -> expired with nothing having
+        # happened and the pre-opening check emailing about a healthy counter.
+        #
+        # ⭐ AND IT IS NOT A CONSTANT, because "this build implements the branch" is not the
+        # same claim as "this device can honour a job tonight". The branch is worth 2 only
+        # while the ledger that makes execution once-only can actually be written, and an SD
+        # card that has remounted read-only — the fault reported two lines below as
+        # `rootfs_readonly` — takes that away from a device whose code is perfectly correct.
+        # pmr_agent_version() re-proves it every tick BY WRITING THE LEDGER, and drops this
+        # claim to 1 when it cannot: the job channel closes and nothing is swallowed, while
+        # boot, settings and action (COUNTER_CHANNEL_AGENT_FLOOR, all floored at 1) carry on.
+        # Raising this claim past what has just been proved would defeat the only protection
+        # the floor provides.
+        "agent_version": pmr_agent_version(conf),
         "os_version": (read_first("/etc/os-release", "") or "").split("PRETTY_NAME=")[-1].split("\n")[0].strip('"') or None,
         "hw_model": pi_model(),
         "hw_serial": pi_serial(),
@@ -2116,10 +2807,20 @@ def apply_boot_target(boot):
             except Exception as e:
                 print(f"vigilant-pi-agent: cannot write {PASS_FILE}: {e}", flush=True)
 
-    if changed:
-        print("vigilant-pi-agent: restarting kiosk", flush=True)
-        run(["systemctl", "restart", "getty@tty1"], timeout=25)
-    return changed
+    if not changed:
+        return False
+    # ⛔ NOT `run()`. This return value becomes `restarted` in tick(), and `restarted` is what
+    # pmr_settle() settles a deferred counter.session-restart against — so it must mean "a
+    # session really went down", not "I wrote rdp-target". `run()` returns stdout and discards
+    # the return code entirely, so a systemd refusal read as success and the server was told a
+    # counter had been signed out when it had not.
+    # restart_kiosk_session() exists for exactly this reason (read its docstring). The fix
+    # originally landed only in the OTHER function that produces `restarted`; this is the
+    # sibling it missed.
+    # A refused restart is not lost work: wcn-kiosk re-reads the target file on every reconnect,
+    # so the new target still takes effect at the next natural one — just not on this tick, and
+    # we no longer claim otherwise.
+    return restart_kiosk_session("boot target changed")
 
 
 # ── fleet branding ──────────────────────────────────────────────────────────
@@ -2458,6 +3159,70 @@ def apply_branding(conf, branding):
     return bool(wrote)
 
 
+def clear_failed_units():
+    """Clear systemd's failed state, and restart only what is MEANT to be running.
+
+    THE UNIT NAMES COME FROM systemd ON THIS DEVICE, never from the server. That is the whole
+    reason this is one named action rather than a "restart <unit>" the server parameterises:
+    the server still sends a single word it cannot vary, so this cannot become a way to start
+    an arbitrary unit on a pharmacy counter. Same rule as ACTIONS itself.
+
+    RESET IS NOT RESTART, and the difference matters here. `wcn-support-vnc` is on-demand: it is
+    started for a support session and stopped when it ends, and x11vnc exiting non-zero on
+    SIGTERM leaves the unit sitting in `failed` afterwards. Restarting THAT would begin sharing a
+    live counter's screen because someone clicked "fix" — the opposite of what was asked for. So
+    every failed unit has its state cleared, and only units systemd says are `enabled` — the ones
+    meant to run continuously — are actually restarted.
+    """
+    out = run(["systemctl", "--failed", "--no-legend", "--plain", "--no-pager"])
+    names = [l.split()[0] for l in out.splitlines() if l.strip() and not l.startswith("0 loaded")]
+    if not names:
+        print("vigilant-pi-agent: clear-failed: nothing is in a failed state", flush=True)
+        return
+    # A HARD AGGREGATE BUDGET. Every other service action is one `run(cmd, timeout=25)`, so 25s
+    # was the ceiling on how long ANY action could occupy the agent. This one makes up to 16*3
+    # subprocess calls, and run() swallows a timeout rather than raising, so without a budget a
+    # Pi whose systemctl calls hang would sit here for minutes. That matters more than it looks:
+    # this runs inside the single-threaded tick, and support_vnc_tick() — the ONLY thing that
+    # ends a screen-sharing session whose time is up — does not run until the tick returns.
+    # Blocking here would turn a support session's duration into a suggestion. Idempotent, so a
+    # truncated pass simply finishes on the next click.
+    deadline = time.monotonic() + 25
+    cleared, restarted, skipped, ranout = [], [], [], False
+    for unit in names[:16]:
+        if time.monotonic() > deadline:
+            ranout = True
+            break
+        # Re-validated even though systemd produced it: this is the side that turns a string into
+        # argv, and a unit name is the one part of this that is not a literal in this file. The
+        # leading character is constrained separately because systemd permits names beginning
+        # with '-' (`-.mount`, `-.slice`), and `systemctl reset-failed -Hfoo.service` would have
+        # the name eaten as the --host option. Belt and braces: '--' is passed as well.
+        if not re.fullmatch(r"[A-Za-z0-9_@][A-Za-z0-9_.@-]*\.[a-z]+", unit or ""):
+            print(f"vigilant-pi-agent: clear-failed: skipping odd unit name {unit!r}", flush=True)
+            continue
+        run(["systemctl", "reset-failed", "--", unit], timeout=10)
+        cleared.append(unit)
+        # `is-enabled` answers whether the unit FILE is installed, NOT whether it is a service
+        # meant to stay running — every Type=oneshot unit with an [Install] section says
+        # "enabled" too, and `systemctl restart` on an inactive oneshot RE-RUNS its ExecStart.
+        # On a counter that could mean re-running a boot-time task mid-shift. Restart only a
+        # long-running service: enabled AND not oneshot.
+        enabled = run(["systemctl", "is-enabled", "--", unit], timeout=8).strip()
+        utype = run(["systemctl", "show", "-p", "Type", "--value", "--", unit], timeout=8).strip()
+        if enabled == "enabled" and utype != "oneshot":
+            run(["systemctl", "restart", "--", unit], timeout=20)
+            restarted.append(unit)
+        else:
+            skipped.append(unit)
+    print("vigilant-pi-agent: clear-failed: cleared %s%s%s%s" % (
+        ", ".join(cleared) or "nothing",
+        ("; restarted " + ", ".join(restarted)) if restarted else "",
+        ("; left stopped (on-demand or oneshot): " + ", ".join(skipped)) if skipped else "",
+        "; ran out of time, run it again to finish" if ranout else "",
+    ), flush=True)
+
+
 # The service actions this device will carry out, and the command for each. The server
 # sends only a NAME which is looked up here — it never sends a command line — so a
 # compromised or mistaken server cannot turn this into arbitrary execution on a counter.
@@ -2468,6 +3233,9 @@ ACTIONS = {
     # session and reconnects in about 8 seconds.
     "restart-kiosk": ["systemctl", "restart", "getty@tty1"],
     "restart-agent": ["systemctl", "restart", "vigilant-agent"],
+    # A CALLABLE rather than an argv list: what this does depends on what systemd reports on
+    # this device, which is exactly the point — the server never names the unit.
+    "clear-failed": clear_failed_units,
 }
 
 
@@ -2520,8 +3288,714 @@ def run_action(name):
     if not cmd:
         print(f"vigilant-pi-agent: ignoring unknown action {name!r}", flush=True)
         return
+    # An entry is either a fixed command line or a function on this file. Both are literals
+    # here; the server only ever chose which one by name.
+    if callable(cmd):
+        print(f"vigilant-pi-agent: service action '{name}'", flush=True)
+        cmd()
+        return
     print(f"vigilant-pi-agent: service action '{name}' -> {' '.join(cmd)}", flush=True)
     run(cmd, timeout=25)
+
+
+# ── the PMR control plane on this device: JOBS ───────────────────────────────
+# THE SAME RULE AS ACTIONS ABOVE, written out again rather than pointed at, because a reader
+# who arrives at this table has to be able to check it here: the server sends only a NAME
+# which is looked up in PMR_VERBS below — it never sends a command line, a path, a URL or a
+# filename — so a compromised or mistaken server cannot turn this into arbitrary execution on
+# a counter. A name that is not a key in that table is REFUSED and reported as refused. It is
+# never guessed at, never prefix-matched, and never falls through to anything.
+#
+# Arguments are DATA. Every one is checked HERE, against the same closed bool/enum/range specs
+# validate_setting() already uses, before it could become argv — exactly as test_print
+# re-checks its queue name and relay_target re-checks its session target. "The server already
+# validated it" is not a reason to skip that: it is precisely the assumption that would make a
+# compromised server dangerous. None of today's three verbs takes an argument at all, so the
+# check below is currently a refusal of everything — which is the correct shape for a table
+# whose whole point is that it is closed.
+#
+# ── WHY A JOB IS NOT AN `action` ────────────────────────────────────────────
+# An `action` is fire-and-forget: the server clears it as it hands it over, nobody
+# acknowledges it, and nothing ever checks that it happened. A JOB has a ladder —
+# pending, claimed, applied, CONFIRMED — and the top rung is the point of the whole thing: a
+# job is done only when a reading taken afterwards shows the world really changed. This
+# agent's part of that ladder is exactly two things, and neither of them is deciding a job
+# worked:
+#
+#   * carry the verb out, ONCE, and
+#   * say honestly what happened — applied, or failed and why.
+#
+# 'confirmed' is a word this device may never write, and there is no code path below that
+# posts it: PMR_REPORTABLE is {applied, failed}, mirroring the server's own closed set. An
+# executor can say it ran the thing; it can never say the thing is true.
+#
+# ── ⚠️ HANDING A JOB OUT IS THE CLAIM ───────────────────────────────────────
+# There is no ack on the telemetry reply, so a job an agent cannot parse is not ignored — it
+# is SWALLOWED: claimed, never run, never reported, expired at its deadline, and the
+# pre-opening check then emails "this counter may not open" about a perfectly healthy one.
+# That is why the server refuses to hand a counter job to an agent reporting agent_version
+# below 2, and why bumping build_payload's "agent_version" to 2 is the LAST line of this
+# feature rather than the first. The floor is only honest while the branch below actually
+# works.
+#
+# ⭐ AND "ACTUALLY WORKS" IS A PROPERTY OF TONIGHT, NOT OF THE BUILD. The code being right is
+# only half of it: this branch cannot honour anything without a writable ledger, and an SD
+# card that has remounted read-only takes that away from a device whose code is perfect. So
+# the claim is not a constant — pmr_agent_version() re-proves the ledger BY WRITING IT on
+# every tick and claims 2 only when that write succeeded, dropping to 1 (boot, settings and
+# action, none of which need a ledger) when it did not. Same idea, same shape and the same
+# comments as job_branch_ready() in the Proxmox collector.
+#
+# ── ⚠️ ONE INTERRUPTION PER TICK ────────────────────────────────────────────
+# Two of the three verbs cost a member of staff their session, and so do the boot target and
+# the session settings. apply_boot_target already reasons about this for its own pair — "a
+# settings change written earlier in the same tick can be folded into this one restart
+# instead of causing a second" — and the job branch joins the SAME arrangement rather than
+# opening a second one. Nothing below restarts anything on its own; the verbs that need the
+# session dropped record that they need it and return "deferred", tick() performs the ONE
+# restart, and pmr_settle() then turns "deferred" into applied or failed according to what
+# actually happened. A counter with a boot-target change and a session-restart job on the
+# same tick is interrupted once.
+#
+# ── ⚠️ IDEMPOTENCE, AND WHERE IT LIVES ──────────────────────────────────────
+# A job whose result POST is lost is RE-OFFERED once its claim lapses (counter.session-restart
+# is retry_ok with up to 3 attempts). Restarting the session a second time because an
+# acknowledgement went missing is a second sign-out that changes nothing, so the outcome is
+# written to a small on-disk LEDGER, keyed by the server's job id, BEFORE it is reported. A
+# job id already in the ledger with a settled outcome is never carried out again — its
+# recorded outcome is simply re-sent. The ledger is also what makes the result POST safe to
+# retry at all: it is retried on every later tick until the server acknowledges it, and the
+# retry re-sends a recorded fact rather than repeating an act.
+#
+# The one hole, named rather than papered over: if the ledger file itself is lost (a wiped
+# /var/lib, a reimage), a re-offered session restart WOULD run a second time. That is the
+# cheapest of the failure directions — one extra sign-out at 00:05 — and it cannot touch the
+# other two verbs, because the server never re-offers a reboot or a promote (retry_ok false,
+# max_attempts 1).
+# ⚠️ THE TWO LEVELS THIS AGENT MAY CLAIM, and which one goes into the payload is decided
+# every tick by pmr_agent_version() — never by this file being the build that implements the
+# branch. 2 says "hand me counter jobs"; 1 says "boot, settings and action only", which is
+# what an agent with an unwritable ledger honestly is. The floor is only a protection while
+# the number is earned, so the number is worked out from a proof and not from a constant.
+PMR_JOB_AGENT_VERSION = 2
+PMR_BASE_AGENT_VERSION = 1
+PMR_JOB_LEDGER = "/var/lib/wcn/pmr-jobs.json"
+# Under /var/lib for the same two reasons as TARGET_FILE and BRANDING_STATE: it is
+# server-related state rather than hand-edited configuration, and /etc is READ-ONLY inside
+# this unit's ProtectSystem=full namespace.
+PMR_LEDGER_MAX = 64          # bounded file on a device with an SD card
+PMR_LEDGER_KEEP_S = 7 * 86400
+# ⛔ ONE JOB PER TICK, BECAUSE THAT IS WHAT THIS CHANNEL SENDS. The counter channel's reply
+# carries `pmr_job`, one object, from a claim (claimPmrJobForDevice) that is singular by
+# construction. A ceiling of four was a bound on a shape that does not exist here, and on a
+# device where a job costs a member of staff their session it is a bound worth having be the
+# shape: see pmr_jobs_from_reply for why the `jobs` array is refused rather than accepted.
+PMR_JOBS_PER_TICK = 1
+PMR_RESULT_PATH = "/pmr/job-result"
+PMR_LOG_MAX = 480
+# The server's ids are UUIDs and it refuses anything else (isUuid in the store), so this side
+# refuses anything else too — the id is the only field of a job that this agent puts back on
+# the wire, and a bounded shape is what keeps it from carrying anything.
+PMR_JOB_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+# The closed set an EXECUTOR may report. Mirrors EXECUTOR_REPORTABLE_STATUSES on the server;
+# the important word is the one that is NOT in it.
+PMR_REPORTABLE = ("applied", "failed")
+# HTTP codes that mean "stop trying": the server has an opinion and re-sending will not change
+# it. 404 is the ordinary one — recordPmrJobResult only matches a job still in 'claimed', so a
+# result the server already recorded comes back 404, and re-sending it forever would be noise.
+PMR_TERMINAL_HTTP = frozenset((400, 404, 409, 410, 422, 501))
+
+
+def _pmr_ledger_read():
+    """What this device has already done about which job ids.
+
+    A missing or corrupt file reads as EMPTY, and the consequence of that is stated in the
+    block above rather than hidden here: the outcomes are lost and a re-offered session
+    restart would run again. Entries whose id is not a well-formed job id are dropped on the
+    way in, so nothing hand-edited into this file can reach the result POST."""
+    try:
+        with open(PMR_JOB_LEDGER) as fh:
+            data = json.load(fh)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [e for e in data
+            if isinstance(e, dict) and isinstance(e.get("id"), str)
+            and PMR_JOB_ID_RE.match(e["id"])]
+
+
+def _pmr_ledger_write(entries):
+    """Persist the ledger. Atomic, and FSYNCED — unlike the branding state file, this one is
+    written immediately before `systemctl reboot`, so "it was in the page cache" is not good
+    enough: the entry that survives the reboot is the only record that the reboot was ours."""
+    try:
+        os.makedirs(os.path.dirname(PMR_JOB_LEDGER), exist_ok=True)
+        tmp = PMR_JOB_LEDGER + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(entries[-PMR_LEDGER_MAX:], fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, PMR_JOB_LEDGER)
+        return True
+    except OSError as e:
+        # Loud, because the retry is silent and free where this is neither: without the ledger
+        # a lost acknowledgement becomes a second sign-out.
+        print(f"vigilant-pi-agent: cannot record pmr job state in {PMR_JOB_LEDGER}: {e}", flush=True)
+        return False
+
+
+def _pmr_ledger_get(entries, job_id):
+    for e in entries:
+        if e.get("id") == job_id:
+            return e
+    return None
+
+
+def _pmr_ledger_put(entries, entry):
+    for i, e in enumerate(entries):
+        if e.get("id") == entry["id"]:
+            entries[i] = entry
+            return entries
+    entries.append(entry)
+    return entries
+
+
+def _pmr_ledger_open():
+    """Read the ledger AND PROVE IT CAN BE WRITTEN, BY WRITING IT. Returns the entries, or
+    None if this device cannot record a job outcome right now.
+
+    ⭐ THE PROOF IS THE WRITE, and it is taken again on every tick. A permission bit is not
+    the fault this exists for: a counter Pi's SD card remounts read-only under I/O error —
+    the very fault this agent reports elsewhere as `rootfs_readonly` — and after it, /var/lib
+    is a directory that still looks fine and accepts nothing. The only thing that separates
+    "we can start a job" from "we can finish one" is a completed fsynced replace, so that is
+    what is done here.
+
+    The cost is one small fsynced replace per tick, which is the price of the claim in the
+    payload being earned rather than asserted."""
+    entries = _pmr_ledger_read()
+    if not _pmr_ledger_write(entries):
+        return None
+    return entries
+
+
+def pmr_job_branch_ready(conf, entries):
+    """Is this device genuinely able to take a counter job on this tick?
+
+    All three, every tick — it can be spoken to and can answer (enrolled), the tool every verb
+    in its own table ends in is here, and the ledger that makes execution once-only is open
+    and WRITABLE. Only then is PMR_JOB_AGENT_VERSION claimed.
+
+    Modelled on job_branch_ready() in the Proxmox collector, and for the same reason: handing
+    a job out IS the claim, there is no ack on the telemetry reply, so a job an agent cannot
+    honour is not ignored, it is SWALLOWED — claimed, never run, never reported, expired at
+    its deadline, and the pre-opening check then emails about a healthy counter. Not being
+    offered work is always better than being offered work that cannot be finished."""
+    if not (conf.get("VIGILANT_URL") and conf.get("VIGILANT_TOKEN")):
+        return False, "this device is not enrolled, so no job outcome could be reported"
+    if not shutil.which("systemctl"):
+        return False, ("`systemctl` is not on PATH, so no verb in this device's table can be "
+                       "carried out")
+    if entries is None:
+        return False, (f"{PMR_JOB_LEDGER} cannot be written, so an outcome could not be "
+                       "recorded and a re-offer could not be told apart from a first offer")
+    return True, None
+
+
+def pmr_agent_version(conf):
+    """The version this payload may honestly claim, and the ledger proof that earns it.
+
+    ⚠️ WHY THIS RETURNS 1 RATHER THAN OMITTING THE KEY, which is where it departs from the
+    collector it copies. There, collector_version gates ONE channel, so omitting it is exactly
+    right. Here the same integer gates FOUR: `pmr_job` is floored at PMR_JOB_AGENT_VERSION,
+    but boot, settings and action are floored at 1 (COUNTER_CHANNEL_AGENT_FLOOR) and need no
+    ledger, no once-only guarantee and no result POST — they are the capabilities this agent
+    had before the job branch existed and it still has all three. Omitting the key yields null
+    server-side, null meets no floor, and a counter with a read-only SD card would also stop
+    being told which VM to boot into. So the rule is the collector's rule applied to a number
+    that means more than one thing: claim the HIGHEST level actually proved, never a level
+    that is merely hoped for. The job channel closes; the three that were never in doubt stay
+    open.
+
+    The proved ledger is handed on through conf, so that the tick that CLAIMS the capability
+    and the tick that USES it are working from the same act. It is assigned on every path,
+    including the failing ones, so a proof from an earlier tick can never be found here."""
+    conf["_pmr_ledger"] = None
+    entries = None
+    if conf.get("VIGILANT_URL") and conf.get("VIGILANT_TOKEN") and shutil.which("systemctl"):
+        entries = _pmr_ledger_open()
+        conf["_pmr_ledger"] = entries
+    ready, why_not = pmr_job_branch_ready(conf, entries)
+    if ready:
+        return PMR_JOB_AGENT_VERSION
+    # Said out loud every tick it is true. "The nightly restart never lands on this counter"
+    # is otherwise diagnosed as a broken queue on the server, when the answer is here.
+    print(f"vigilant-pi-agent: NOT offering to take counter jobs this tick — {why_not}",
+          flush=True)
+    return PMR_BASE_AGENT_VERSION
+
+
+def _pmr_rebooted_since(ts):
+    """Can this device SEE that it restarted after `ts`? Uptime against wall time, which is
+    the same test the server's own 'pi-uptime-reset' confirmation makes — a Pi that ignored a
+    reboot is also online and also reporting, so "I am here" proves nothing.
+
+    A counter Pi has no RTC, so a clock that went backwards over the reboot yields a negative
+    age; that arm falls back to "the uptime is small enough that this is plainly a fresh
+    boot" rather than concluding anything from a timestamp it cannot trust."""
+    up = uptime_s()
+    if not isinstance(up, (int, float)):
+        return False
+    age = time.time() - (ts or 0)
+    if age < 0:
+        return up < 900
+    return up < age + 120
+
+
+# ── the verb implementations ────────────────────────────────────────────────
+# Each returns (status, log). 'deferred' is not a status the server has ever heard of and is
+# never reported — it means "everything except the interruption is done; tick() owns that".
+
+def _pmr_session_restart(job, plan):
+    """counter.session-restart — drop the RDP session so the member of staff signs out and
+    back in. The server's own note for this verb: "the Pi maps this name to its own local
+    unit restart, exactly as ACTIONS maps restart-kiosk".
+
+    IT DELIBERATELY RESTARTS NOTHING HERE. The restart is recorded as WANTED and performed
+    once by tick(), so that a boot-target change or a session-settings change arriving on the
+    same tick costs this counter one interruption rather than two or three."""
+    plan["want_session_restart"] = True
+    plan["deferred"].append(job["id"])
+    return "deferred", "session restart folded into this tick's single kiosk restart"
+
+
+def _pmr_reboot(job, plan):
+    """counter.reboot — restart the thin client. Deferred for a second reason as well as the
+    coalescing one: a reboot ends this process, so it must be the LAST thing that happens in a
+    tick or it would swallow a queued service action and this tick's own job reports."""
+    plan["want_reboot"] = job["id"]
+    plan["deferred"].append(job["id"])
+    return "deferred", "reboot deferred to the end of this tick"
+
+
+def _pmr_printing_promote(job, plan):
+    """counter.printing-promote — swap the staged printer table live and restart the session
+    as ONE action.
+
+    ⭐ IT SHELLS OUT TO THE VERB THE DEVICE ALREADY HAS. wcn-toolbox-priv implements
+    `printing-promote`: it re-validates printers.tab.next against the §2 rules, keeps
+    printers.tab.prev, swaps the live file atomically and kicks the session — with every
+    failure path leaving the live set and the session alone. None of that is reimplemented
+    here and none of it should be; this agent only chooses the NAME, and the argv below is a
+    fixed literal pair with no value from the network anywhere in it. The three paths it
+    touches are literals in that script, so the server chooses neither the bytes' destination
+    nor the moment they are validated.
+
+    The kick is INSIDE that verb, inseparable from the swap, which is why this one verb does
+    interrupt the counter from here instead of deferring. It is still ONE interruption, and
+    the flag below is how: plan["session_interrupted"] tells tick() the tick's single teardown
+    has already been spent, so the restart it would otherwise issue a moment later is folded
+    into this one instead of landing on a session that is already coming back up. A promote
+    that reports "left alone" spent nothing and sets nothing."""
+    if not os.path.exists(TOOLBOX_PRIV):
+        return "failed", f"{TOOLBOX_PRIV} is not installed on this counter"
+    try:
+        r = subprocess.run([TOOLBOX_PRIV, "printing-promote"],
+                           capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        return "failed", f"printing-promote did not complete: {type(e).__name__}: {e}"
+    out = " ".join(((r.stdout or "") + " " + (r.stderr or "")).split())
+    if r.returncode != 0:
+        # Its own refusals arrive here verbatim — "nothing to promote", "refusing to promote"
+        # after the pre-flight validation, "the live set was not touched". Reported as the
+        # failure they are, never smoothed into a success.
+        return "failed", f"wcn-toolbox-priv printing-promote exited {r.returncode}: {out or 'no output'}"
+    # "printers already current ... session left alone" is a success that cost nobody a
+    # session, and the difference is worth carrying so the log does not claim an outage.
+    if "left alone" not in out:
+        plan["session_interrupted"] = True
+    return "applied", out or "printers promoted"
+
+
+# THE DEVICE'S OWN TABLE. Keys are the verb names the server may send; nothing outside this
+# object can run. `args` is the closed per-verb argument spec in validate_setting's
+# (kind, default, allowed) shape — empty on all three of today's verbs, which means every one
+# of them refuses any argument at all.
+#
+# `acts_here` says whether the verb CHANGES THE DEVICE inside pmr_run_jobs' loop, as opposed
+# to recording what it needs and leaving the doing to tick(). It is what decides whether the
+# ledger has to be proved writable immediately before the call: a verb that only writes to the
+# plan can be settled later, but a verb that tears a session down cannot be un-done if the
+# record of it will not go to disk.
+PMR_VERBS = {
+    "counter.session-restart":  {"run": _pmr_session_restart,  "args": {}, "acts_here": False},
+    "counter.reboot":           {"run": _pmr_reboot,           "args": {}, "acts_here": False},
+    "counter.printing-promote": {"run": _pmr_printing_promote, "args": {}, "acts_here": True},
+}
+
+
+def pmr_new_plan():
+    """What this tick's jobs need from tick(). Never a shared module-level object: a plan
+    carries job ids, and one leaking into the next tick would settle a job twice."""
+    return {"want_session_restart": False, "want_reboot": None,
+            "session_interrupted": False, "deferred": [], "ran": 0}
+
+
+def pmr_validate_args(spec, args):
+    """The arguments of one job against one verb's closed spec. Returns None if they are
+    acceptable, or the sentence explaining the refusal.
+
+    Refuses rather than coerces, and refuses UNKNOWN keys rather than dropping them: an
+    argument this build does not understand means the two sides disagree about what the verb
+    does, and carrying it out on the half we recognise is how a partially-understood
+    instruction becomes a wrong one. Fail closed, report the refusal, let a person look."""
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return "args must be a JSON object"
+    allowed = ", ".join(sorted(spec)) or "no arguments"
+    for key in sorted(args):
+        if key not in spec:
+            return f"unexpected argument {key!r} — this verb takes {allowed}"
+        if validate_setting(spec[key], args[key]) is None:
+            return f"argument {key!r} is the wrong type or out of range"
+    for key in sorted(spec):
+        if key not in args:
+            return f"missing argument {key!r}"
+    return None
+
+
+def pmr_jobs_from_reply(parsed):
+    """The control-plane jobs carried by a telemetry reply, as a bounded list of
+    {id, verb, args}.
+
+    ABSENT-NOT-NULL, the convention the rest of this reply already uses: the server omits the
+    key on the ~2,879 ticks out of 2,880 that carry no job, so an absent key and an empty
+    array both mean "nothing to do" and neither is an error.
+
+    ⛔ ONE KEY, AND IT IS THE ONE THIS CHANNEL SENDS. `pmr_job` — a single object, from a
+    claim that is singular server-side — is the whole of the counter channel's job shape. The
+    `jobs` ARRAY belongs to the Proxmox node channel, on a reply to a POST this agent never
+    makes, and it was accepted here only because "this side should not care which shape it is
+    handed" sounded like tolerance. It is not tolerance on this device: every verb in
+    PMR_VERBS costs a member of staff at a counter their session, so accepting the array
+    widened what one reply can do to this pharmacy from ONE interruption to four, and bought
+    no capability that anything on the wire actually uses. Narrowed deliberately — the reach
+    of a channel should be what it sends, not what a parser could be made to swallow.
+
+    A `jobs` key arriving here at all is therefore a disagreement about what this channel is,
+    and it is said out loud rather than dropped in silence. If the counter channel is ever
+    given the array form, widening it back is a deliberate edit that also owes this file a way
+    to REPORT the jobs it will not run — the loud line below cannot do that, because a claimed
+    job with no result is exactly what the whole ladder exists to prevent.
+
+    NOTHING IS EXECUTED HERE and nothing is trusted. An entry with no usable id is dropped
+    with a log line, because there is nothing to report a refusal AGAINST; an entry that has
+    an id keeps it whatever else is wrong with it, so that the refusal can be reported."""
+    out, seen = [], set()
+    if not isinstance(parsed, dict):
+        return out
+    raw = []
+    one = parsed.get("pmr_job")
+    if one is not None:
+        raw.append(one)
+    if parsed.get("jobs") is not None:
+        print("vigilant-pi-agent: refusing a 'jobs' key on the counter channel — this device "
+              "takes one job per tick, on 'pmr_job'. Nothing from it has been run", flush=True)
+    for item in raw:
+        if len(out) >= PMR_JOBS_PER_TICK:
+            print(f"vigilant-pi-agent: refusing more than {PMR_JOBS_PER_TICK} jobs on one "
+                  "tick — the rest are left unclaimed", flush=True)
+            break
+        if not isinstance(item, dict):
+            print(f"vigilant-pi-agent: ignoring malformed job entry ({type(item).__name__})", flush=True)
+            continue
+        jid = item.get("id")
+        if not isinstance(jid, str) or not PMR_JOB_ID_RE.match(jid.strip()):
+            print(f"vigilant-pi-agent: ignoring a job with no usable id ({jid!r}) — "
+                  "there is nothing to report a refusal against", flush=True)
+            continue
+        jid = jid.strip()
+        if jid in seen:
+            # Handing a job out IS the claim, so it is handed out once; a repeat inside one
+            # reply is a server-side mistake and running it twice is the expensive reading.
+            print(f"vigilant-pi-agent: ignoring a repeat of job {jid} in the same reply", flush=True)
+            continue
+        verb = item.get("verb")
+        out.append({
+            "id": jid,
+            # Kept as whatever arrived when it is not a string, so the refusal below names it.
+            "verb": verb.strip() if isinstance(verb, str) else verb,
+            "args": item.get("args"),
+        })
+        seen.add(jid)
+    return out
+
+
+def pmr_run_jobs(conf, parsed):
+    """Carry out this tick's jobs — everything about them except the interruption — and
+    return what tick() has to do next.
+
+    Every outcome is written to the ledger BEFORE it is reported, which is the whole
+    idempotence story: a job id already settled here is never carried out a second time, and
+    a re-offer (which is what a lost acknowledgement produces) only re-sends what is recorded.
+    A ledger entry still sitting at 'deferred' is the one exception: nothing was done for it
+    yet, so it is re-attached to this tick's plan — safe precisely because the two deferring
+    verbs perform no work of their own."""
+    plan = pmr_new_plan()
+    # The ledger build_payload proved writable a moment ago, on the tick that made the claim
+    # this reply is answering. POPPED, never left behind: a ledger is per-tick state and one
+    # leaking into the next tick would be a proof taken about a card that has since changed.
+    entries = conf.pop("_pmr_ledger", None) if isinstance(conf, dict) else None
+    jobs = pmr_jobs_from_reply(parsed)
+    if not jobs:
+        return plan
+    if entries is None:
+        # No proof came through — the payload was built elsewhere, or the branch was not
+        # claimed at all. Take it now rather than assume it.
+        entries = _pmr_ledger_open()
+    if entries is None:
+        # ⛔ THE LEDGER IS UNWRITABLE AND JOBS ARRIVED ANYWAY. The floor should have stopped
+        # this: agent_version went out as 1 for exactly this reason. Reaching here means the
+        # card went read-only between the payload and the reply, or a server ignored the
+        # claim. NOTHING IS CARRIED OUT — without the ledger a re-offer cannot be told from a
+        # first offer, and counter.session-restart is re-offered up to three times, which is
+        # three sign-outs of a trading counter.
+        #
+        # And every job is still ANSWERED, straight from here, because a claimed job with no
+        # result is the one outcome this control plane must never produce. The answer needs no
+        # ledger: it reports that nothing was done, so re-sending it after a lost
+        # acknowledgement repeats a fact and never an act.
+        for job in jobs:
+            log = (f"refused: {PMR_JOB_LEDGER} cannot be written on this counter, so this "
+                   "job could not be recorded before it ran. NOTHING WAS DONE — check the "
+                   "SD card, which has most likely remounted read-only.")
+            print(f"vigilant-pi-agent: pmr job {job['id']} REFUSED, nothing run: {log}",
+                  flush=True)
+            code, detail = pmr_post_result(conf, job["id"], "failed", log)
+            if not (code is not None and (200 <= code < 300 or code in PMR_TERMINAL_HTTP)):
+                print(f"vigilant-pi-agent: pmr job {job['id']} refusal NOT acknowledged "
+                      f"({code if code is not None else detail}) — it cannot be re-sent, "
+                      "because the ledger it would be re-sent from is the thing that is "
+                      "broken. The job will expire server-side, which is also honest: "
+                      "nothing happened.", flush=True)
+        return plan
+    dirty = False
+    # The reboot goes last: it ends this process, and a promote or a restart sharing the tick
+    # with it must have been carried out and recorded first.
+    jobs.sort(key=lambda j: 1 if j.get("verb") == "counter.reboot" else 0)
+    for job in jobs:
+        known = _pmr_ledger_get(entries, job["id"])
+        if known and known.get("status") in PMR_REPORTABLE:
+            print(f"vigilant-pi-agent: pmr job {job['id']} was already {known['status']} here "
+                  "— NOT running it again, re-sending the recorded outcome", flush=True)
+            # Being re-offered means the server never recorded it, so it is due again.
+            known["reported"] = False
+            dirty = True
+            continue
+        spec = PMR_VERBS.get(job["verb"]) if isinstance(job["verb"], str) else None
+        if spec is None:
+            status, log = "failed", (
+                f"refused: unknown verb {job['verb']!r} — this device implements "
+                + ", ".join(sorted(PMR_VERBS)))
+        else:
+            bad = pmr_validate_args(spec["args"], job["args"])
+            if bad:
+                status, log = "failed", "refused: " + bad
+            elif spec.get("acts_here") and not _pmr_ledger_write(entries):
+                # Cannot make the attempt durable, so do not make it. This verb tears the
+                # session down inside the call, and the ledger was proved writable before the
+                # payload went out — so a failure HERE means the card changed under us
+                # mid-tick. Refused, not attempted, and reported as such.
+                status, log = "failed", (
+                    f"not attempted: {PMR_JOB_LEDGER} stopped being writable during this "
+                    "tick, so this counter could not record the act before making it. "
+                    "The live printer table and the session were left alone.")
+            else:
+                try:
+                    status, log = spec["run"](job, plan)
+                except Exception as e:
+                    # An exception is a failure and is reported as one. It is never allowed to
+                    # look like an applied job, and never allowed to end the tick.
+                    status, log = "failed", f"{type(e).__name__}: {e}"
+        entry = {"id": job["id"], "verb": job["verb"] if isinstance(job["verb"], str) else None,
+                 "status": status, "log": (log or "")[:PMR_LOG_MAX],
+                 "ts": int(time.time()), "reported": False}
+        entries = _pmr_ledger_put(entries, entry)
+        dirty = True
+        plan["ran"] += 1
+        print(f"vigilant-pi-agent: pmr job {entry['id']} {entry['verb']!r} -> "
+              f"{status}: {entry['log']}", flush=True)
+    if dirty:
+        _pmr_ledger_write(entries)
+    return plan
+
+
+def pmr_post_result(conf, job_id, status, log):
+    """POST /pmr/job-result — {job_id, status, result_log}. Returns (http status or None,
+    detail). The server answers with awaiting_confirmation rather than "done", which is the
+    point: this device has said what it did, and something else decides whether it worked."""
+    url, token = conf.get("VIGILANT_URL"), conf.get("VIGILANT_TOKEN")
+    if not (url and token):
+        return None, "not enrolled"
+    body = {"job_id": job_id, "status": status, "result_log": (log or "")[:PMR_LOG_MAX] or None}
+    try:
+        return post(url, token, PMR_RESULT_PATH, body, timeout=15)
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read(200).decode(errors="replace")
+        except Exception:
+            detail = ""
+        return e.code, detail
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def pmr_flush_results(conf, entries=None):
+    """Re-send every recorded outcome the server has not acknowledged, oldest first.
+
+    Called on EVERY tick, not only on ticks that carried a job: the result POST is the half of
+    this exchange that can be lost, and a result sitting unsent is a job on its way to
+    expiring. Retrying is safe because what is retried is a recorded fact and not an act."""
+    if entries is None:
+        entries = _pmr_ledger_read()
+    dirty = False
+    for e in entries:
+        if e.get("reported") or e.get("status") not in PMR_REPORTABLE:
+            continue        # 'deferred' has not happened yet; there is nothing to say about it
+        status, log = e.get("status"), e.get("log") or ""
+        if e.get("verify") == "uptime":
+            # ⛔ THE ONE PLACE THIS DEVICE COULD HAVE LIED. The reboot outcome is written
+            # before the command is issued, because the command ends this process — so before
+            # it is ever SENT, the device checks it can actually see the reboot it is about to
+            # claim. A `systemctl reboot` that returned 0 and did nothing is reported as the
+            # failure it is, and the pre-opening check gets a person to the counter.
+            if _pmr_rebooted_since(e.get("ts")):
+                log = e["log"] = f"the thin client rebooted and is back with an uptime of {uptime_s()}s"
+                e["verify"] = None
+            else:
+                status = e["status"] = "failed"
+                log = e["log"] = "the reboot was issued but this device did not restart"
+                e["verify"] = None
+            dirty = True
+        code, detail = pmr_post_result(conf, e["id"], status, log)
+        if code is not None and (200 <= code < 300 or code in PMR_TERMINAL_HTTP):
+            e["reported"] = True
+            dirty = True
+            print(f"vigilant-pi-agent: pmr job {e['id']} reported {status} (HTTP {code})", flush=True)
+        else:
+            print(f"vigilant-pi-agent: pmr job {e['id']} result NOT acknowledged "
+                  f"({code if code is not None else detail}) — it will be re-sent next tick",
+                  flush=True)
+    # Prune by AGE alone, and only long after every verb's own ttl (the longest is a day).
+    # By this point the server has either recorded the result or expired the job, so an entry
+    # this old can prove nothing — including one still marked 'deferred' by a tick that died
+    # between carrying a verb out and settling it, which is the only way one can be stranded.
+    cutoff = time.time() - PMR_LEDGER_KEEP_S
+    keep = [e for e in entries if (e.get("ts") or 0) >= cutoff]
+    if dirty or len(keep) != len(entries):
+        _pmr_ledger_write(keep)
+
+
+def pmr_settle(conf, plan, restarted):
+    """Turn this tick's deferred jobs into what actually happened, then report everything
+    outstanding — and, last of all, reboot if a job asked for it.
+
+    `restarted` is tick()'s answer to "was the counter's session interrupted on this tick",
+    whether that came from the boot target, from the session settings or from a job. It is
+    the ONE restart, and the deferred session restarts settle against it: applied if it
+    happened, failed if it did not. Nothing here reports a restart this device did not see."""
+    entries = _pmr_ledger_read()
+    dirty = False
+    for jid in plan.get("deferred") or []:
+        e = _pmr_ledger_get(entries, jid)
+        if not e or e.get("status") != "deferred" or jid == plan.get("want_reboot"):
+            continue
+        if restarted:
+            e["status"], e["log"] = "applied", "the kiosk session was restarted"
+        else:
+            e["status"], e["log"] = "failed", "the kiosk session restart did not run"
+        e["ts"], e["reported"] = int(time.time()), False
+        dirty = True
+
+    reboot_id = plan.get("want_reboot")
+    if reboot_id:
+        e = _pmr_ledger_get(entries, reboot_id)
+        if e is not None and e.get("status") == "deferred":
+            # WRITTEN AND FSYNCED FIRST, because `systemctl reboot` ends this process and an
+            # outcome only in memory would be lost with it — leaving a job that was carried
+            # out looking to the server exactly like one that was swallowed. The claim is not
+            # SENT here: it is sent on the first tick after the device comes back, once
+            # _pmr_rebooted_since() has proved there was a reboot to claim.
+            e["status"], e["log"] = "applied", "reboot issued"
+            e["ts"], e["reported"], e["verify"] = int(time.time()), False, "uptime"
+            # ⛔ AND THE REBOOT IS GATED ON THAT WRITE HAVING WORKED. The paragraph above is
+            # the whole reason this record exists; issuing the command anyway when the record
+            # did not reach the disk produces exactly the outcome it was written to prevent —
+            # a counter that went down, an on-disk ledger still reading 'deferred', and a job
+            # the server cannot tell from one that was swallowed. counter.reboot is
+            # max_attempts 1 and retry_ok false, so it is never re-offered and nobody would
+            # ever learn what happened to it.
+            #
+            # WHICH WAY IT FAILS, STATED: it does not reboot. Refusing leaves a pharmacy
+            # counter trading and produces an honest 'failed' that is posted on this very tick
+            # (from memory — pmr_flush_results does not need the disk to send), which ends the
+            # ladder and puts a person in front of it. The other direction takes the counter
+            # down and tells nobody. That is the same choice as never passing --forceStop: the
+            # failure direction is "the pharmacy keeps working and somebody is raised".
+            if not _pmr_ledger_write(entries):
+                e["status"], e["verify"] = "failed", None
+                e["log"] = ("the reboot was NOT issued: this counter could not record it "
+                            f"first ({PMR_JOB_LEDGER} is unwritable, most likely an SD card "
+                            "that has remounted read-only). The device is still up and "
+                            "still serving; a reboot it cannot record is a reboot it cannot "
+                            "report.")
+                print(f"vigilant-pi-agent: pmr job {reboot_id} counter.reboot NOT issued — "
+                      f"{e['log']}", flush=True)
+                dirty = True
+            else:
+                print(f"vigilant-pi-agent: pmr job {reboot_id} counter.reboot -> rebooting "
+                      "now; the result is sent once this device is back", flush=True)
+                try:
+                    p = subprocess.run(["systemctl", "reboot"],
+                                       capture_output=True, text=True, timeout=25)
+                    rc, why = p.returncode, f"systemctl reboot exited {p.returncode}"
+                except Exception as ex:
+                    rc, why = 1, f"systemctl reboot did not complete: {type(ex).__name__}: {ex}"
+                if rc == 0:
+                    # Still here only because a reboot takes a few seconds to land. Nothing
+                    # more is sent on this arm: the first tick after the device comes back
+                    # reports it, and the uptime check there is what decides applied from
+                    # failed.
+                    return
+                # It refused, so this device is not rebooting and must not say that it did.
+                e["status"], e["log"], e["verify"] = "failed", why, None
+                dirty = True
+
+    if dirty:
+        _pmr_ledger_write(entries)
+    pmr_flush_results(conf, entries)
+
+
+def restart_kiosk_session(reason):
+    """The tick's ONE interruption of the counter. Returns whether it really happened, which
+    is more than `run()` can say — a deferred job settles against this answer, and reporting
+    a session restart that systemd refused would be exactly the "it exited 0, so it worked"
+    claim the job ladder exists to make impossible."""
+    print(f"vigilant-pi-agent: restarting kiosk ({reason})", flush=True)
+    try:
+        p = subprocess.run(["systemctl", "restart", "getty@tty1"],
+                           capture_output=True, text=True, timeout=25)
+    except Exception as e:
+        print(f"vigilant-pi-agent: kiosk restart did not complete: {type(e).__name__}: {e}", flush=True)
+        return False
+    if p.returncode != 0:
+        print(f"vigilant-pi-agent: kiosk restart exited {p.returncode}: "
+              f"{(p.stderr or p.stdout or '').strip()[:200]}", flush=True)
+        return False
+    return True
 
 
 # ── support screen sharing ───────────────────────────────────────────────────
@@ -3366,18 +4840,29 @@ def tick(conf, do_printers):
     settings_interval = None
     try:
         parsed = json.loads(body)
+        # ⚠️ THE ORDER OF THIS BLOCK IS A SAFETY PROPERTY, NOT A STYLE. Five of the directives
+        # this reply can carry end in a pharmacy counter losing its session, and the counter
+        # must be interrupted ONCE per tick however many of them arrive together. So every
+        # directive that only WRITES runs first, the single interruption happens in the middle,
+        # and the one directive that ends this process runs last of all:
+        #
+        #   1. settings, branding, printers.tab.next   write only, restart nothing
+        #   2. the jobs                                everything about them but the restart
+        #   3. the boot target                         writes, and restarts if it changed
+        #   4. THE ONE RESTART                         if anything above still needs it
+        #   5. the queued service action               at-most-once, so never skipped
+        #   6. the relay                               a convenience
+        #   7. settle + report the jobs, then reboot   ends the process, so it is last
+        #
         # Settings first, because this only WRITES kiosk.conf; the restart it may need is
-        # issued below, after the boot target has been written, so that a settings change and
-        # a target change landing on the same tick cost the counter one restart, not two.
+        # issued at step 4, after the boot target has been written, so that a settings change
+        # and a target change landing on the same tick cost the counter one restart, not two.
         kiosk_changed, settings_interval = apply_settings(parsed.get("settings"))
-        restarted = apply_boot_target(parsed.get("boot"))
-        if kiosk_changed and not restarted:
-            print("vigilant-pi-agent: restarting kiosk to pick up new session settings", flush=True)
-            run(["systemctl", "restart", "getty@tty1"], timeout=25)
-        # Branding BEFORE the action, so a splash pushed and a reboot requested on the same tick
-        # bring the new splash up on that very reboot. It restarts nothing of its own: the kiosk
-        # re-reads its message file on the next reconnect, and motd/issue/splash are read at login
-        # and at boot, so a wording change never costs a counter its session.
+        # Branding BEFORE the action and before any job, so a splash pushed and a reboot
+        # requested on the same tick bring the new splash up on that very reboot. It restarts
+        # nothing of its own: the kiosk re-reads its message file on the next reconnect, and
+        # motd/issue/splash are read at login and at boot, so a wording change never costs a
+        # counter its session.
         #
         # Its own guard, as with the relay: branding is cosmetic, and a bad push must not cost
         # this tick its printer report or its interval negotiation. It can also do a 2 MB HTTP GET
@@ -3386,8 +4871,63 @@ def tick(conf, do_printers):
             apply_branding(conf, parsed.get("branding"))
         except Exception as e:
             print(f"vigilant-pi-agent: branding ignored ({type(e).__name__}: {e})", flush=True)
+        # Grouped with branding because it shares branding's property: it restarts NOTHING. It
+        # writes printers.tab.NEXT only, so the counter keeps printing exactly as it is until
+        # somebody promotes the table deliberately. Its own guard for the same reason as the
+        # others — a malformed printer push must not cost this tick its printer report or its
+        # interval negotiation.
+        #
+        # ⭐ AND IT RUNS BEFORE THE JOBS, which is what makes a table staged on this very tick
+        # the table a counter.printing-promote job on the same tick actually promotes. The
+        # other order would promote the PREVIOUS set and leave the new one staged, having
+        # spent the counter's session on it.
+        try:
+            write_printers_tab_next(parsed.get("printers"))
+        except Exception as e:
+            print(f"vigilant-pi-agent: printer table ignored ({type(e).__name__}: {e})", flush=True)
+        # The control-plane jobs. Carried out here, but INTERRUPTING NOTHING here: a verb that
+        # needs the session dropped records that in the plan and the single restart below
+        # performs it. Its own guard, like branding and the relay — a malformed job must not
+        # cost this tick its boot target, its queued action or its interval negotiation.
+        plan = pmr_new_plan()
+        try:
+            plan = pmr_run_jobs(conf, parsed)
+        except Exception as e:
+            print(f"vigilant-pi-agent: pmr jobs ignored ({type(e).__name__}: {e})", flush=True)
+        restarted = apply_boot_target(parsed.get("boot"))
+        # ⭐ THE ONE INTERRUPTION MAY ALREADY HAVE HAPPENED, AND THIS IS WHERE THAT IS READ.
+        # counter.printing-promote is the single verb that interrupts from inside the job
+        # branch — the kick is inside wcn-toolbox-priv, inseparable from the swap — and it
+        # records that as plan["session_interrupted"]. Folding it in here is what keeps the
+        # rule at the top of this block true: a promote arriving with new session settings, or
+        # with a session-restart job, costs this counter ONE teardown and not two. Without
+        # this line the flag was written and never read, and the second teardown landed on a
+        # session that was already coming back up.
+        #
+        # It sets `restarted` rather than merely suppressing the restart, because that is the
+        # answer pmr_settle() settles deferred session-restart jobs against: the session DID
+        # go down on this tick, so a job that asked for exactly that is applied, not failed.
+        #
+        # A boot-target change on the same tick is the one case that still costs two, and
+        # deliberately: the promote's kick lands before the new target is written, so the
+        # session it brings back is pointed at the old VM and genuinely needs the restart
+        # apply_boot_target has already made above.
+        if plan["session_interrupted"]:
+            if not restarted:
+                print("vigilant-pi-agent: the printing-promote job already dropped this "
+                      "session — folding this tick's restart into it", flush=True)
+            restarted = True
+        if (kiosk_changed or plan["want_session_restart"]) and not restarted:
+            why = "a session-restart job" if plan["want_session_restart"] else "new session settings"
+            if kiosk_changed and plan["want_session_restart"]:
+                why = "a session-restart job and new session settings, folded into one"
+            restarted = restart_kiosk_session(why)
         # Deliberately after the boot target: if both arrive on the same tick, the device
         # should already be pointed at the right VM before it is restarted or rebooted.
+        #
+        # And deliberately BEFORE the job settle below: takeCounterAction() clears
+        # pending_action as it hands it over, so this channel is at-most-once too, and a
+        # reboot job that ran first would swallow a queued action outright.
         run_action(parsed.get("action"))
         # Its own guard, inside this one: the relay is a convenience, and a malformed session
         # must not cost the tick the interval negotiation below — nor the printer report.
@@ -3395,6 +4935,13 @@ def tick(conf, do_printers):
             relay_directive(conf, parsed.get("relay"))
         except Exception as e:
             print(f"vigilant-pi-agent: relay directive ignored ({type(e).__name__}: {e})", flush=True)
+        # LAST. It records what the restart above really did, re-sends every job result the
+        # server has not acknowledged, and only then carries out a reboot job — which ends
+        # this process, and so must not be able to skip anything above it.
+        try:
+            pmr_settle(conf, plan, restarted)
+        except Exception as e:
+            print(f"vigilant-pi-agent: pmr settle ignored ({type(e).__name__}: {e})", flush=True)
     except Exception as e:
         print(f"vigilant-pi-agent: directive ignored ({type(e).__name__})", flush=True)
 

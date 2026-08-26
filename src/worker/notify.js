@@ -100,4 +100,80 @@ async function dispatchAlert(t, { config, logger } = {}) {
   return { sent: true, results };
 }
 
-module.exports = { sendEmail, sendTeams, dispatchAlert };
+// ── THE PMR PRE-OPENING ALERT ───────────────────────────────────────────────
+// ⚠️ THE SINGLE INTEGRATION POINT for the control plane's alerting. Everything the estate
+// owner decided about this is expressed here, so there is one place to change it:
+//
+//   * IT GOES TO A SHARED SUPPORT INBOX, not to a per-rule recipient. `alert_rules` is
+//     where recipients live for the fleet's threshold alerts, and its rows are per-RULE —
+//     there is no per-pharmacy or per-customer recipient anywhere in this schema, and
+//     `pharmacies` has no contact column at all. So this reads ONE address from config
+//     (PMR_SUPPORT_INBOX) and that is deliberate rather than a gap left open.
+//   * IT FIRES ONLY WHEN A COUNTER WILL NOT OPEN. Everything else waits for the morning
+//     queue. The claim that makes it at-most-once per site per night is in the store
+//     (recordPmrOpeningCheck stamps alerted_at in the same statement that records the
+//     verdict), NOT here — a formatter cannot deduplicate across three worker processes.
+//   * ONE EMAIL PER SITE, listing every counter at risk, because the person reading it goes
+//     to the site once.
+//
+// dispatchAlert is NOT reused: its subject and body are hard-coded to the alert vocabulary
+// ([Vigilant] SEVERITY OPENED/CLEARED — rule @ site) and it requires a `rule` object, which
+// this has no equivalent of. The SENDERS are reused as-is, which is the part worth sharing.
+//
+// Fire-and-forget and never throws, exactly like dispatchAlert: a failed email must not
+// break the worker pass that is still checking the rest of the estate.
+//
+// `site` = { site_code, site_name, next_open_at }
+// `counters` = [{ label, reason }] — one entry per counter that will not open.
+async function dispatchOpeningAlert(site, counters, { config, logger } = {}) {
+  const lg = logger || log;
+  const list = Array.isArray(counters) ? counters : [];
+  // Nothing at risk is not an alert. The whole rule is "only when a counter will not open".
+  if (!list.length) return { sent: false, skipped: 'nothing-at-risk' };
+
+  const cfg = config || {};
+  const to = cfg.pmrSupportInbox || '';
+  if (!to) {
+    // Said out loud, once per site, rather than silently dropped: an estate with no inbox
+    // configured must not look like an estate with no problems. This is the log line that
+    // tells an operator the integration point above has never been filled in.
+    lg.warn('notify: a counter will not open, but PMR_SUPPORT_INBOX is unset — nobody was told', {
+      site: site && site.site_code, counters: list.length,
+    });
+    return { sent: false, skipped: 'no-inbox' };
+  }
+
+  const where = (site && (site.site_name || site.site_code)) || 'site';
+  const opensAt = site && site.next_open_at ? new Date(site.next_open_at).toISOString() : 'unknown';
+  // The subject carries the site and the count, because it is read on a phone at 07:00 and
+  // the decision it drives is "do I have to go there before they open".
+  const subject = `[Vigilant] ${list.length} counter${list.length === 1 ? '' : 's'} may not open — ${where}`;
+  const lines = [
+    `${list.length} counter${list.length === 1 ? '' : 's'} at ${where} did not come back after the nightly restart.`,
+    '',
+    `Site:  ${site && site.site_code ? site.site_code : ''} ${where}`.trim(),
+    `Opens: ${opensAt}`,
+    '',
+    'Counters:',
+    ...list.map((c) => `  - ${c.label || 'counter'}: ${c.reason || 'did not report'}`),
+    '',
+    'This was raised before opening so it can be fixed in time. Nothing else about this',
+    'site is being reported — everything that is not "a counter will not open" waits for',
+    'the morning queue.',
+    `When:  ${new Date().toISOString()}`,
+  ];
+  const text = lines.join('\n');
+
+  const result = await sendEmail({
+    apiKey: cfg.resendApiKey, from: cfg.alertEmailFrom, to, subject, text,
+  });
+  if (!result.ok && !result.skipped) {
+    lg.warn('notify: pre-opening email send failed', { site: site && site.site_code, status: result.status });
+  }
+  // Teams is available (sendTeams above) and takes a flat payload, but no webhook is
+  // configured for this path and inventing a second channel nobody asked for is not free.
+  // If one is wanted later it goes HERE, next to the email, not in a new module.
+  return { sent: !!result.ok, result };
+}
+
+module.exports = { sendEmail, sendTeams, dispatchAlert, dispatchOpeningAlert };
