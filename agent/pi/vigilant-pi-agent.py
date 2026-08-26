@@ -966,6 +966,10 @@ AGENT_SETTINGS = {
     # timestamp already past (never opens) or hours ahead (never closes). Capped server-side at
     # 60; the range here is the second lock on the same door.
     "support_vnc_min":   ("int", 0, (0, 60)),
+    # A monotonic id for the CURRENT support request. See support_vnc_tick(): it is what lets an
+    # operator ask again for the SAME duration after a session expired. Without it that request
+    # is indistinguishable from "nothing changed" and is discarded for ever.
+    "support_vnc_seq":   ("int", 0, (0, 1000000)),
 }
 
 # The KEY= name each session setting takes in kiosk.conf. Held separately from the wire
@@ -2558,9 +2562,10 @@ def _support_state():
         return {"password": d.get("password"),
                 "until": float(d.get("until") or 0),
                 "minutes": int(d.get("minutes") or 0),
+                "seq": int(d.get("seq") or 0),
                 "expired": bool(d.get("expired"))}
     except Exception:
-        return {"password": None, "until": 0.0, "minutes": 0, "expired": False}
+        return {"password": None, "until": 0.0, "minutes": 0, "seq": 0, "expired": False}
 
 
 def _support_write(**kw):
@@ -2679,7 +2684,7 @@ def _support_start(minutes, wg_ip):
     # Recorded only once the unit is CONFIRMED up, so a failed start never leaves a state file
     # claiming a live session with a password nothing is serving.
     _support_write(password=password, until=time.time() + minutes * 60,
-                   minutes=minutes, expired=False)
+                   minutes=minutes, seq=int(RUNTIME.get("support_vnc_seq") or 0), expired=False)
     print("vigilant-pi-agent: support screen sharing started on %s:%d for %d min"
           % (wg_ip, SUPPORT_VNC_PORT, minutes), flush=True)
     return True
@@ -2692,6 +2697,7 @@ def support_vnc_tick():
     because the Pi decided the time was up — not because a server remembered to say so, and not
     because someone closed a browser tab. Same reasoning as the relay's own local TTL."""
     want = RUNTIME.get("support_vnc_min") or 0
+    want_seq = int(RUNTIME.get("support_vnc_seq") or 0)
     st = _support_state()
 
     if want <= 0:
@@ -2710,9 +2716,16 @@ def support_vnc_tick():
               "(same password, not restarted)" % want, flush=True)
         return
 
-    # Already served this exact request. Waiting for Watchman to send 0 or a different value is
-    # what stops a counter re-sharing its screen every N minutes indefinitely.
-    if st["expired"] and want == st["minutes"]:
+    # Already served this exact request. Without this a counter re-shares its screen every N
+    # minutes for ever, because an unchanged setting keeps arriving on every tick.
+    #
+    # The id is what makes "the operator asked AGAIN" distinguishable from "nothing changed".
+    # Testing the duration alone meant a repeat request of the same length after an expiry was
+    # discarded permanently — the operator pressed the button, nothing happened, and the only
+    # escape was to ask for a different duration. That locked engineers out of a live pharmacy
+    # repeatedly on 2026-08-24. An older server sends no id at all; both sides then read 0 and
+    # the behaviour is exactly as it was before, so this is safe to roll out in either order.
+    if st["expired"] and want == st["minutes"] and want_seq == st["seq"]:
         return
 
     if st["until"] and time.time() >= st["until"]:
@@ -3404,30 +3417,37 @@ def tick(conf, do_printers):
             s, b = post(url, token, "/printers/report", {"printers": printers})
             print(f"printers {s} ({len(printers)} polled) {b}", flush=True)
 
-    # A per-thin-client report_interval_s from Watchman is a deliberate choice for THIS
-    # device, so it beats the fleet-wide poll_interval_s below. Already range-checked to
-    # 10..900 by the time it gets here.
-    if settings_interval:
-        return settings_interval
-
     # The server dictates cadence via poll_interval_s, and we MUST honour it: staleness is
     # judged centrally (STALE_AFTER_S), so an agent reporting slower than the server expects
     # flaps between online and stale forever while being perfectly healthy. Letting the
     # server drive also means the interval can be retuned fleet-wide without touching a Pi.
     try:
         want = json.loads(body).get("poll_interval_s")
-        # Floor exists so a server-side misconfiguration cannot turn the fleet into a
-        # thundering herd — precisely how the router fleet saturated the ingest.
-        #
-        # It was 10, which silently broke the server's own fast-poll feature: config.fastPollS
-        # is 3, so every fast-poll directive was discarded and `poll_until` did nothing at all.
-        # 3 matches that constant, and the window is bounded server-side and opt-in per device,
-        # so the herd protection that mattered is still there.
-        if isinstance(want, (int, float)) and want >= MIN_POLL_S:
-            return int(want)
     except Exception:
-        pass
-    return None
+        want = None
+    # Floor exists so a server-side misconfiguration cannot turn the fleet into a
+    # thundering herd — precisely how the router fleet saturated the ingest.
+    #
+    # It was 10, which silently broke the server's own fast-poll feature: config.fastPollS
+    # is 3, so every fast-poll directive was discarded and `poll_until` did nothing at all.
+    # 3 matches that constant, and the window is bounded server-side and opt-in per device,
+    # so the herd protection that mattered is still there.
+    server_interval = int(want) if isinstance(want, (int, float)) and want >= MIN_POLL_S else None
+
+    # A per-thin-client report_interval_s from Watchman is a deliberate choice for THIS device,
+    # so it beats the fleet-wide poll_interval_s — EXCEPT when the server is asking us to go
+    # FASTER. A poll_interval_s BELOW the per-device value means the server has opened a
+    # fast-poll window (poll_until), and that window exists precisely so an operator's click
+    # lands in seconds instead of on the next ordinary tick.
+    #
+    # Taking the per-device value unconditionally is what made fast-poll dead on arrival for
+    # every thin client in the estate: report_interval_s ALWAYS has a value (its default is 30),
+    # so the server's directive below was never once reached during a window.
+    if settings_interval and server_interval:
+        return min(settings_interval, server_interval)
+    if settings_interval:
+        return settings_interval
+    return server_interval
 
 
 def explain_failure(e):

@@ -345,6 +345,16 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 CREATE INDEX IF NOT EXISTS devices_kind_idx ON devices (kind);
 
+-- ⚠️ The PPPoE password — a SECRET. The agent historically stopped sending it; it is now
+-- collected again (on request) so support can read it without a second system. It lives HERE,
+-- on devices, DELIBERATELY and not on device_state, because device_state is in the
+-- supabase_realtime publication (see below) and devices is not — so the secret never rides a
+-- Realtime broadcast. The ingest also strips it from device_state.raw for the same reason.
+-- There is no GRANT on devices to the `authenticated` role, so the dashboard cannot read this
+-- column directly; it is served only through the ingest API's device-detail endpoint (the same
+-- path, and the same masked-by-default treatment, as the WiFi PSK).
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS pppoe_password text;
+
 -- ── pharmacies ───────────────────────────────────────────────────────────────
 -- ADDRESSING IS DERIVED-BY-DEFAULT, and OVERRIDABLE. From systems/pmr-vpn/network-design.md,
 -- a pharmacy index N gives: vlan 100+N, subnet 10.200.N.0/<prefix>, gateway 10.200.N.1,
@@ -933,6 +943,63 @@ ALTER TABLE proxmox_vms ADD COLUMN IF NOT EXISTS guest_ips        jsonb NOT NULL
 -- node reboot leaves that site with a gateway and no desktops. Nothing has ever surfaced it.
 ALTER TABLE proxmox_vms ADD COLUMN IF NOT EXISTS onboot           boolean;
 
+-- ── PMR VM capacity ─────────────────────────────────────────────────────────
+-- "Is this pharmacy's server running out of room?" — the one question the VM layer could not
+-- answer. One row per VM, overwritten in place by the collector; this is a CURRENT-STATE table,
+-- not a history, which is why it is keyed on vmid alone.
+--
+-- CPU and RAM averages come FREE from Proxmox RRD (the node already keeps them), so they are
+-- stored as computed numbers and nothing here has to accumulate them.
+--
+-- DISK HAS NO RRD SOURCE. rrddata's `disk` is ALWAYS 0 for a qemu VM — Proxmox cannot see
+-- inside the guest filesystem — and proxmox_vms.maxdisk is only the nominal virtual disk size
+-- (238GiB for VM 305, which is really 88% full). The only true reading is the guest agent's
+-- get-fsinfo, so disk_used_bytes/disk_total_bytes may be written from THAT AND NOTHING ELSE,
+-- and the 1d/7d/30d disk averages are computed by us from pmr_vm_disk_samples below.
+--
+-- disk_source is the tri-state. 'unknown' means the agent was absent, dead or unreadable on the
+-- pass that wrote this row (VMs 302/303/304 have no agent at all) and the disk numbers are NULL.
+-- It must never degrade to 0: "0 bytes used" and "we could not ask" are different facts, and
+-- one of them puts a false all-clear on a live dispensing server.
+CREATE TABLE IF NOT EXISTS pmr_vm_capacity (
+    vmid              int         PRIMARY KEY,
+    node              text,
+    name              text,
+    sampled_at        timestamptz NOT NULL DEFAULT now(),
+    cores             int,
+    mem_max_bytes     bigint,
+    cpu_pct_1d        numeric(5,2),               -- RRD `cpu` is a FRACTION 0..1, stored x100
+    cpu_pct_7d        numeric(5,2),
+    cpu_pct_30d       numeric(5,2),
+    mem_bytes_1d      bigint,
+    mem_bytes_7d      bigint,
+    mem_bytes_30d     bigint,
+    mem_pressure_1d   numeric(6,3),               -- RRD pressurememorysome, day timeframe
+    disk_mount        text,                       -- the largest real filesystem, e.g. 'C:\'
+    disk_used_bytes   bigint,
+    disk_total_bytes  bigint,
+    disk_used_1d      bigint,
+    disk_used_7d      bigint,
+    disk_used_30d     bigint,
+    disk_source       text        CHECK (disk_source IN ('agent','unknown')),
+    updated_at        timestamptz NOT NULL DEFAULT now()
+);
+
+-- Our own disk history, because Proxmox keeps none (see above). One row per VM per mountpoint
+-- per collection tick; the 1d/7d/30d columns on pmr_vm_capacity are AVGs over this table.
+-- Pruned to 35 days on every collection — 30 days of window plus a few days of slack, so the
+-- 30-day average is never computed from a window that was silently trimmed underneath it.
+CREATE TABLE IF NOT EXISTS pmr_vm_disk_samples (
+    vmid        int         NOT NULL,
+    mountpoint  text        NOT NULL,
+    sampled_at  timestamptz NOT NULL DEFAULT now(),
+    used_bytes  bigint,
+    total_bytes bigint,
+    PRIMARY KEY (vmid, mountpoint, sampled_at)
+);
+-- The retention DELETE and all three window AVGs filter on sampled_at alone.
+CREATE INDEX IF NOT EXISTS pmr_vm_disk_samples_age_idx ON pmr_vm_disk_samples (sampled_at);
+
 -- Discovered VMs joined to whatever they were matched to, plus the disagreements. A VM
 -- whose vmid differs from the one recorded on the counter is surfaced rather than
 -- corrected: it usually means the VM was rebuilt, and a human should decide.
@@ -941,10 +1008,6 @@ ALTER TABLE proxmox_vms ADD COLUMN IF NOT EXISTS onboot           boolean;
 -- ("cannot change name of view column"). Nothing else depends on it — the only reader is
 -- listProxmoxVms in store.pg.js — so dropping and recreating is safe and idempotent.
 DROP VIEW IF EXISTS proxmox_vms_v;
-
--- Discovered VMs joined to whatever they were matched to, plus the disagreements. A VM
--- whose vmid differs from the one recorded on the counter is surfaced rather than
--- corrected: it usually means the VM was rebuilt, and a human should decide.
 CREATE VIEW proxmox_vms_v AS
 SELECT v.*,
        p.code AS pharmacy_code,

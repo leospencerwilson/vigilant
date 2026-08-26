@@ -21,7 +21,7 @@ const telemetry = require('../shared/telemetry');
 const pmrGateway = require('../shared/pmrGateway');
 // The one validator + the one copy of the per-thin-client defaults. Both the save path and
 // the telemetry push go through this module so the UI, the server and the Pi cannot drift.
-const { validateCounterSettings, effectiveCounterSettings } = require('../shared/counterSettings');
+const { validateCounterSettings, effectiveCounterSettings, COUNTER_SETTINGS_DEFAULTS } = require('../shared/counterSettings');
 // The capability the browser presents to the noVNC bridge on the hub. Mirrors
 // /etc/wcn/wcn_vnc_token.py there — change one, change both.
 const { mintSupportToken } = require('../shared/supportToken');
@@ -2096,7 +2096,10 @@ async function piToolboxScript(ctx, which) {
 // The actions a thin client will carry out. An allowlist, not a command channel: the server
 // sends a NAME and the agent maps it to a command locally, so nothing here can ever become
 // arbitrary execution on a pharmacy counter.
-const PI_ACTIONS = ['reboot', 'restart-kiosk', 'restart-agent'];
+// 'clear-failed' takes no argument on purpose: the DEVICE decides which units it means, from
+// its own `systemctl --failed`. Keeping it a bare name is what stops this becoming a way for
+// the server to start an arbitrary unit on a pharmacy counter.
+const PI_ACTIONS = ['reboot', 'restart-kiosk', 'restart-agent', 'clear-failed'];
 // 'test-print:<queue>' is generated server-side (never accepted from a caller), so the
 // operator-facing allowlist above stays exact-match only.
 
@@ -2122,13 +2125,22 @@ async function counterAction(ctx) {
 }
 
 // ── support screen sharing ───────────────────────────────────────────────────
+// Cadence a counter reports at while a support session is open. 10 is the validator's floor for
+// report_interval_s. The agent's own floor is 3 (MIN_POLL_S) and applies to poll_interval_s, so
+// once an agent that prefers the FASTER of the two is rolled out, the poll_until window opened
+// below takes this the rest of the way down to config.fastPollS.
+const SUPPORT_FAST_REPORT_S = 10;
+
 // POST /counters/:id/support  { minutes }   — 0 ends it early
 //
 // Writes the setting and returns. Deliberately does NOT return a viewer URL: the Pi has not
-// started x11vnc yet and will not until its next telemetry tick (<=30 s), so there is no
-// server to connect to and no session password to hand out. The UI polls GET and opens the
-// viewer when the DEVICE says it is up. Returning a URL that fails for half a minute is how a
-// working feature gets reported as broken.
+// started x11vnc yet and will not until its next telemetry tick, so there is no server to
+// connect to and no session password to hand out. The UI polls GET and opens the viewer when
+// the DEVICE says it is up. Returning a URL that fails for half a minute is how a working
+// feature gets reported as broken.
+//
+// That tick used to be up to 30s, which is how this got reported as broken anyway. It is now
+// seconds - see the cadence block inside the handler.
 async function counterSupportStart(ctx) {
   const { res, store, log, body, params } = ctx;
   const p = parseJsonBody(body);
@@ -2148,6 +2160,32 @@ async function counterSupportStart(ctx) {
 
   const updated = await store.setCounterSettings(params.id, checked.value);
   if (!updated) return json(res, 404, { ok: false, error: 'not found' });
+
+  // ── make the click land in SECONDS, not on the Pi's next ordinary tick ──────────────────
+  // support_vnc_tick() runs on EVERY agent tick, so the entire delay an operator feels is the
+  // telemetry cadence - 30s by default, which reads as "the button did nothing" and is exactly
+  // how this feature got reported as broken. TWO things are needed; either alone does nothing:
+  //   1. open the server's fast-poll window (poll_until), so telemetry answers with fastPollS;
+  //   2. lower THIS counter's report_interval_s, because the agent treats a per-device
+  //      report_interval_s as a deliberate choice for that device and returns it BEFORE it ever
+  //      looks at poll_interval_s. That key's DEFAULT (30) is always present in the merged
+  //      settings, so it silently defeated fast-poll for every thin client in the estate.
+  // Both are wound back when the session is turned off, so no counter stays chatty forever.
+  const starting = checked.value.support_vnc_min > 0;
+  // Bump the request id on every START, so the agent can tell "the operator asked again" from
+  // "this setting has not changed". Without it a repeat request of the same duration after an
+  // expiry is discarded by the agent's re-arm guard and the counter never shares again.
+  const prevSeq = Number((counter.settings && counter.settings.support_vnc_seq) || 0);
+  const cadence = validateCounterSettings(Object.assign({
+    report_interval_s: starting ? SUPPORT_FAST_REPORT_S : COUNTER_SETTINGS_DEFAULTS.report_interval_s,
+  }, starting ? { support_vnc_seq: (prevSeq + 1) % 1000000 } : {}));
+  if (cadence.ok) await store.setCounterSettings(params.id, cadence.value);
+  if (typeof store.setPollWindow === 'function') {
+    // Bounded by the session itself, plus slack so a STOP is picked up quickly too. It closes on
+    // its own even if nothing ever calls stop - the same reasoning as the Pi's local expiry.
+    const secs = starting ? checked.value.support_vnc_min * 60 + 60 : 60;
+    await store.setPollWindow(counter.pi_device_id, new Date(Date.now() + secs * 1000).toISOString(), null);
+  }
 
   const by = typeof p.by === 'string' && p.by.trim() ? p.by.trim() : 'watchman';
   // Audited BEFORE the session can possibly be live, so a crash between here and the viewer

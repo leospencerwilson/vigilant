@@ -2103,8 +2103,14 @@ function makePgStore(poolOrConfig) {
 
   async function listPharmacyVms(pharmacyId) {
     return rows(
+      // The hypervisor columns come through here because this is what the site hub reads —
+      // without them the VM layer is the only one in the section with nothing observed about
+      // it, and `ip` above is DERIVED from the site index rather than seen. guest_ips is the
+      // only reading that reflects what Windows actually did with its address.
       `SELECT v.vmid, v.ip, v.role, v.source, v.counter_id, v.address_overridden,
-              pv.name, pv.status, pv.node, pv.template
+              pv.name, pv.status, pv.node, pv.template,
+              pv.agent_enabled, pv.agent_ok, pv.agent_error, pv.agent_checked_at,
+              pv.guest_os, pv.guest_ips, pv.onboot, pv.seen_at
          FROM pharmacy_vms_v v
          LEFT JOIN proxmox_vms pv ON pv.vmid = v.vmid
         WHERE v.pharmacy_id = $1
@@ -2669,13 +2675,35 @@ function makePgStore(poolOrConfig) {
     await tx(async (client) => {
       await bulkInsert(
         client,
-        `INSERT INTO proxmox_vms (vmid, node, name, status, vlan_tag, macs, cores, maxmem, maxdisk, uptime_s, template, seen_at)`,
+        `INSERT INTO proxmox_vms (vmid, node, name, status, vlan_tag, macs, cores, maxmem, maxdisk, uptime_s, template,
+                                  agent_enabled, agent_ok, agent_error, agent_checked_at, guest_os, guest_ips, onboot, seen_at)`,
+        // COALESCE on everything the collector can fail to read. It reports a VM from
+        // /cluster/resources even when the per-VM config call failed, and it OMITS the keys it
+        // could not establish rather than sending blanks — so without COALESCE one transient
+        // node hiccup overwrote a VM's stored vlan_tag with NULL and silently unlinked it from
+        // its pharmacy, because the reconciler joins on vlan_tag. The identity columns that
+        // always arrive (node/name/status/template) are still overwritten unconditionally.
+        //
+        // agent_checked_at is NOT coalesced onto now(): it is only ever set by a pass that
+        // actually probed, so an un-probed tick leaves the previous timestamp in place and the
+        // reading correctly ages.
         `ON CONFLICT (vmid) DO UPDATE SET
            node = EXCLUDED.node, name = EXCLUDED.name, status = EXCLUDED.status,
-           vlan_tag = EXCLUDED.vlan_tag, macs = EXCLUDED.macs, cores = EXCLUDED.cores,
-           maxmem = EXCLUDED.maxmem, maxdisk = EXCLUDED.maxdisk,
-           uptime_s = EXCLUDED.uptime_s, template = EXCLUDED.template, seen_at = now()`,
-        11,
+           vlan_tag = COALESCE(EXCLUDED.vlan_tag, proxmox_vms.vlan_tag),
+           macs = CASE WHEN jsonb_array_length(EXCLUDED.macs) > 0 THEN EXCLUDED.macs ELSE proxmox_vms.macs END,
+           cores = COALESCE(EXCLUDED.cores, proxmox_vms.cores),
+           maxmem = COALESCE(EXCLUDED.maxmem, proxmox_vms.maxmem),
+           maxdisk = COALESCE(EXCLUDED.maxdisk, proxmox_vms.maxdisk),
+           uptime_s = EXCLUDED.uptime_s, template = EXCLUDED.template,
+           agent_enabled = COALESCE(EXCLUDED.agent_enabled, proxmox_vms.agent_enabled),
+           agent_ok = COALESCE(EXCLUDED.agent_ok, proxmox_vms.agent_ok),
+           agent_error = COALESCE(EXCLUDED.agent_error, proxmox_vms.agent_error),
+           agent_checked_at = COALESCE(EXCLUDED.agent_checked_at, proxmox_vms.agent_checked_at),
+           guest_os = COALESCE(EXCLUDED.guest_os, proxmox_vms.guest_os),
+           guest_ips = CASE WHEN jsonb_array_length(EXCLUDED.guest_ips) > 0 THEN EXCLUDED.guest_ips ELSE proxmox_vms.guest_ips END,
+           onboot = COALESCE(EXCLUDED.onboot, proxmox_vms.onboot),
+           seen_at = now()`,
+        18,
         uniq.map((v) => [
           Number(v.vmid), nz(v.node), nz(v.name), nz(v.status),
           v.vlan_tag == null ? null : Number(v.vlan_tag),
@@ -2685,8 +2713,17 @@ function makePgStore(poolOrConfig) {
           v.maxdisk == null ? null : Number(v.maxdisk),
           v.uptime_s == null ? null : Number(v.uptime_s),
           v.template === true,
+          // Tri-state all the way down: undefined (the collector could not ask) and a real
+          // false are different answers, and only the second may ever render as "no".
+          v.agent_enabled == null ? null : Boolean(v.agent_enabled),
+          v.agent_ok == null ? null : Boolean(v.agent_ok),
+          nz(v.agent_error),
+          v.agent_checked_at == null ? null : new Date(Number(v.agent_checked_at) * 1000),
+          nz(v.guest_os),
+          JSON.stringify(Array.isArray(v.guest_ips) ? v.guest_ips : []),
+          v.onboot == null ? null : Boolean(v.onboot),
         ]),
-        placeholders(11, 'now()')
+        placeholders(18, 'now()')
       );
     });
     return { vms: uniq.length };
@@ -2728,14 +2765,27 @@ function makePgStore(poolOrConfig) {
       const m = /-cl0*(\d+)$/i.exec(v.name || '');
       if (!m) continue;
       const n = Number(m[1]);
-      const counter = await one(`SELECT id, vmid FROM counters WHERE pharmacy_id = $1 AND n = $2`, [v.pharmacy_id, n]);
+      const counter = await one(`SELECT id, vmid, boot_vmid FROM counters WHERE pharmacy_id = $1 AND n = $2`, [v.pharmacy_id, n]);
       if (!counter) {
         // A desktop VM exists for a counter nobody has recorded — worth knowing, since it
         // means the registry is behind reality rather than ahead of it.
         out.conflicts.push({ kind: 'counter_missing', pharmacy_id: v.pharmacy_id, counter_n: n, discovered: v.vmid, name: v.name });
         continue;
       }
-      if (counter.vmid == null) {
+      // NEVER guess against an explicit choice. This match is made on the `pmr-<code>-cl<n>`
+      // NAME convention, which assumes every position owns a VM named for its own index — and
+      // that is wrong wherever a position opens the site's PMR server instead. At iPharm the
+      // single client VM is called cl01 but belongs to position 2, so this linked vm 306 to
+      // position 1, which boots 305. The result was a phantom registration at an address
+      // (.11) that no VM holds — now provable, because the guest agent reports 306 on .12.
+      //
+      // `boot_vmid` is the directive the platform actually pushes to the Pi. If a position has
+      // one and it names a different VM, the name convention is simply wrong about this site:
+      // report it and leave the record alone.
+      if (counter.boot_vmid != null && counter.boot_vmid !== v.vmid) {
+        out.conflicts.push({ kind: 'counter_boots_other', counter_id: counter.id, counter_n: n,
+          boots: counter.boot_vmid, discovered: v.vmid, name: v.name });
+      } else if (counter.vmid == null) {
         await q(`UPDATE counters SET vmid = $2, vm_hostname = COALESCE(vm_hostname, $3) WHERE id = $1`,
           [counter.id, v.vmid, v.name]);
         out.counters_linked += 1;

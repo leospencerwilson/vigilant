@@ -59,6 +59,20 @@ const SPECS = {
   // closes). Capped at 60: a ceiling is what makes "we turned that off" true, and a longer job
   // means clicking again, which is one more audit row, which is the point.
   support_vnc_min:   { type: 'int',  default: 0,  min: 0,  max: 60 },
+
+  // A monotonic id for the CURRENT support request. Not a duration and not a deadline — just a
+  // number that changes every time an operator asks for a session.
+  //
+  // WHY IT EXISTS. The agent refuses to re-arm an EXPIRED session whose requested duration equals
+  // the one it already served, so that an unchanged setting cannot make a counter re-share its
+  // screen every N minutes for ever. Correct intent, but it also meant the obvious recovery —
+  // click "Start sharing" again, same 15 minutes — was silently discarded, permanently. That
+  // locked engineers out of a pharmacy repeatedly on 2026-08-24.
+  //
+  // A bounded int keeps this table's "bools and bounded ints only" invariant, so nothing here
+  // becomes the first free-text value in a channel whose safety rests on there being none. It
+  // wraps rather than grows, because only INEQUALITY is ever tested.
+  support_vnc_seq:   { type: 'int',  default: 0,  min: 0,  max: 1000000 },
 };
 
 const COUNTER_SETTING_KEYS = Object.keys(SPECS);
