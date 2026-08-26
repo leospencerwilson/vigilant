@@ -1229,6 +1229,14 @@ function createServer({ store, config: cfg }) {
         ctx.body = await readBody(req);
         return await handlers.deviceMetaSet(ctx);
       }
+      // DELETE /devices/:serial — full removal (cascade). Admin token ONLY — the scoped
+      // field key can enrol, only ops can destroy. Semantics in handlers.deviceDelete.
+      if (mDevMeta && method === 'DELETE') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.params = { serial: decodeURIComponent(mDevMeta[1]) };
+        ctx.body = await readBody(req);
+        return await handlers.deviceDelete(ctx);
+      }
 
       if (method === 'GET' && pathname === '/alert-rules') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });

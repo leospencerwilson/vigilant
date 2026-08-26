@@ -1189,6 +1189,10 @@ CREATE TABLE IF NOT EXISTS pmr_vm_printers (
 -- ("cannot change name of view column"). Nothing else depends on it — the only reader is
 -- listProxmoxVms in store.pg.js — so dropping and recreating is safe and idempotent.
 DROP VIEW IF EXISTS proxmox_vms_v;
+
+-- Discovered VMs joined to whatever they were matched to, plus the disagreements. A VM
+-- whose vmid differs from the one recorded on the counter is surfaced rather than
+-- corrected: it usually means the VM was rebuilt, and a human should decide.
 CREATE VIEW proxmox_vms_v AS
 SELECT v.*,
        p.code AS pharmacy_code,

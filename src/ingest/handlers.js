@@ -23,6 +23,7 @@ const pmrGateway = require('../shared/pmrGateway');
 // the telemetry push go through this module so the UI, the server and the Pi cannot drift.
 const {
   validateCounterSettings, effectiveCounterSettings, interruptingSettingChanges,
+  COUNTER_SETTINGS_DEFAULTS,
 } = require('../shared/counterSettings');
 // The capability the browser presents to the noVNC bridge on the hub. Mirrors
 // /etc/wcn/wcn_vnc_token.py there — change one, change both.
@@ -2868,13 +2869,22 @@ async function counterAction(ctx) {
 }
 
 // ── support screen sharing ───────────────────────────────────────────────────
+// Cadence a counter reports at while a support session is open. 10 is the validator's floor for
+// report_interval_s. The agent's own floor is 3 (MIN_POLL_S) and applies to poll_interval_s, so
+// once an agent that prefers the FASTER of the two is rolled out, the poll_until window opened
+// below takes this the rest of the way down to config.fastPollS.
+const SUPPORT_FAST_REPORT_S = 10;
+
 // POST /counters/:id/support  { minutes }   — 0 ends it early
 //
 // Writes the setting and returns. Deliberately does NOT return a viewer URL: the Pi has not
-// started x11vnc yet and will not until its next telemetry tick (<=30 s), so there is no
-// server to connect to and no session password to hand out. The UI polls GET and opens the
-// viewer when the DEVICE says it is up. Returning a URL that fails for half a minute is how a
-// working feature gets reported as broken.
+// started x11vnc yet and will not until its next telemetry tick, so there is no server to
+// connect to and no session password to hand out. The UI polls GET and opens the viewer when
+// the DEVICE says it is up. Returning a URL that fails for half a minute is how a working
+// feature gets reported as broken.
+//
+// That tick used to be up to 30s, which is how this got reported as broken anyway. It is now
+// seconds - see the cadence block inside the handler.
 async function counterSupportStart(ctx) {
   const { res, store, log, body, params } = ctx;
   const p = parseJsonBody(body);
@@ -2894,6 +2904,32 @@ async function counterSupportStart(ctx) {
 
   const updated = await store.setCounterSettings(params.id, checked.value);
   if (!updated) return json(res, 404, { ok: false, error: 'not found' });
+
+  // ── make the click land in SECONDS, not on the Pi's next ordinary tick ──────────────────
+  // support_vnc_tick() runs on EVERY agent tick, so the entire delay an operator feels is the
+  // telemetry cadence - 30s by default, which reads as "the button did nothing" and is exactly
+  // how this feature got reported as broken. TWO things are needed; either alone does nothing:
+  //   1. open the server's fast-poll window (poll_until), so telemetry answers with fastPollS;
+  //   2. lower THIS counter's report_interval_s, because the agent treats a per-device
+  //      report_interval_s as a deliberate choice for that device and returns it BEFORE it ever
+  //      looks at poll_interval_s. That key's DEFAULT (30) is always present in the merged
+  //      settings, so it silently defeated fast-poll for every thin client in the estate.
+  // Both are wound back when the session is turned off, so no counter stays chatty forever.
+  const starting = checked.value.support_vnc_min > 0;
+  // Bump the request id on every START, so the agent can tell "the operator asked again" from
+  // "this setting has not changed". Without it a repeat request of the same duration after an
+  // expiry is discarded by the agent's re-arm guard and the counter never shares again.
+  const prevSeq = Number((counter.settings && counter.settings.support_vnc_seq) || 0);
+  const cadence = validateCounterSettings(Object.assign({
+    report_interval_s: starting ? SUPPORT_FAST_REPORT_S : COUNTER_SETTINGS_DEFAULTS.report_interval_s,
+  }, starting ? { support_vnc_seq: (prevSeq + 1) % 1000000 } : {}));
+  if (cadence.ok) await store.setCounterSettings(params.id, cadence.value);
+  if (typeof store.setPollWindow === 'function') {
+    // Bounded by the session itself, plus slack so a STOP is picked up quickly too. It closes on
+    // its own even if nothing ever calls stop - the same reasoning as the Pi's local expiry.
+    const secs = starting ? checked.value.support_vnc_min * 60 + 60 : 60;
+    await store.setPollWindow(counter.pi_device_id, new Date(Date.now() + secs * 1000).toISOString(), null);
+  }
 
   const by = typeof p.by === 'string' && p.by.trim() ? p.by.trim() : 'watchman';
   // Audited BEFORE the session can possibly be live, so a crash between here and the viewer
@@ -6003,6 +6039,33 @@ async function deviceMetaSet(ctx) {
   return json(res, 200, { ok: true, device: updated });
 }
 
+// DELETE /devices/:serial  { by?, force? }
+// Full removal from the register — the cascade takes live state, history, the enrollment
+// token (revoked-by-deletion; the plaintext is unrecoverable, so a returning router needs
+// a full re-enrol), config jobs/snapshots and alerts. An ONLINE device is refused without
+// {"force":true}. The audit row records who asked; 'watchman' is the honest fallback when
+// the UI does not say (same convention as brandingActor — the admin token identifies the
+// estate, not a person).
+async function deviceDelete(ctx) {
+  const { res, store, body, params } = ctx;
+  if (typeof store.deleteDevice !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
+  const parsed = parseJsonBody(body) || {};
+  const by = typeof parsed.by === 'string' && parsed.by.trim() ? parsed.by.trim() : 'watchman';
+  const force = parsed.force === true;
+  const r = await store.deleteDevice(params.serial, { force });
+  if (!r) return json(res, 404, { ok: false, error: 'device not found' });
+  if (r.blocked === 'online') {
+    return json(res, 409, {
+      ok: false,
+      error: 'device is online — it is still reporting; pass {"force":true} to remove it anyway',
+      device: r.device,
+    });
+  }
+  await store.appendAudit(by, 'device.delete', params.serial,
+    `identity=${r.device.identity || '?'} site=${r.device.site_name || '?'} last_status=${r.device.status || 'unknown'} forced=${force}`);
+  return json(res, 200, { ok: true, deleted: true, device: r.device });
+}
+
 function validateTagRule(r, { partial } = {}) {
   if (!partial || r.tag !== undefined) {
     const tag = String(r.tag == null ? '' : r.tag).trim();
@@ -6638,6 +6701,7 @@ module.exports = {
   tagsList,
   deviceTagsSet,
   deviceMetaSet,
+  deviceDelete,
   pharmaciesList,
   pharmacyGet,
   pharmacyCreate,

@@ -1701,6 +1701,27 @@ function makePgStore(poolOrConfig) {
     );
   }
 
+  // Full removal of a device from the register. Every device-scoped table cascades from
+  // the devices row (schema FKs), so one DELETE takes live state, history, the enrollment
+  // token, config jobs/snapshots and alerts with it. audit_log is keyed by the serial
+  // STRING, not a FK — the trail, including the delete row itself, survives. An ONLINE
+  // device is refused unless force: deleting a router that is still reporting is almost
+  // always a mistake, and its agent would keep POSTing into 401s afterwards.
+  async function deleteDevice(serial, opts) {
+    const force = !!(opts && opts.force);
+    const dev = await one(
+      `SELECT d.id, d.serial, d.identity, d.site_name, d.customer, d.enrolled_at,
+              s.status, s.last_seen_at
+         FROM devices d LEFT JOIN device_state s ON s.device_id = d.id
+        WHERE d.serial = $1`,
+      [serial]
+    );
+    if (!dev) return null;
+    if (dev.status === 'online' && !force) return { blocked: 'online', device: dev };
+    await q(`DELETE FROM devices WHERE id = $1`, [dev.id]);
+    return { deleted: true, device: dev };
+  }
+
   async function listTagRules() {
     return rows(
       `SELECT id, name, tag, conditions, enabled, created_at, updated_at
@@ -5704,6 +5725,7 @@ function makePgStore(poolOrConfig) {
     setDeviceIdentity,
     setDevicePppoePassword,
     updateDeviceMeta,
+    deleteDevice,
     listTagRules,
     createTagRule,
     updateTagRule,
