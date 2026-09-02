@@ -609,6 +609,18 @@ function createServer({ store, config: cfg }) {
         ctx.body = await readBody(req);
         return await handlers.printerAssign(ctx);
       }
+      // POST /printers/adopt · /printers/identify (admin) — adopt a discovered printer, or send a
+      // Pi to read what is at its address. Bodies carry the ids; see handlers.
+      if (method === 'POST' && pathname === '/printers/adopt') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return await handlers.printerAdopt(ctx);
+      }
+      if (method === 'POST' && pathname === '/printers/identify') {
+        if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.body = await readBody(req);
+        return await handlers.printerIdentify(ctx);
+      }
       const mPrinterTest = /^\/printers\/([^/]+)\/test-print$/.exec(pathname);
       if (mPrinterTest && method === 'POST') {
         if (!authAdmin(req, cfg)) return json(res, 401, { ok: false, error: 'unauthorized' });
@@ -734,11 +746,15 @@ function createServer({ store, config: cfg }) {
       }
       // The on-console toolbox scripts, same device-token contract as pi-script above. Two fixed
       // paths map to a route-chosen allowlist key; the caller never names a file.
-      if (method === 'GET' && (pathname === '/agent/pi-toolbox' || pathname === '/agent/pi-toolbox-priv')) {
+      if (method === 'GET' && (pathname === '/agent/pi-toolbox' || pathname === '/agent/pi-toolbox-priv'
+          || pathname === '/agent/pi-kiosk')) {
         const dev = await authDevice(req, store);
         if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
         ctx.device = dev;
-        const which = pathname === '/agent/pi-toolbox-priv' ? 'wcn-toolbox-priv' : 'wcn-toolbox';
+        // Route-chosen, never caller-named: the path selects the allowlist key.
+        const which = pathname === '/agent/pi-toolbox-priv' ? 'wcn-toolbox-priv'
+          : pathname === '/agent/pi-kiosk' ? 'wcn-kiosk'
+            : 'wcn-toolbox';
         return await handlers.piToolboxScript(ctx, which);
       }
       // POST /screen — thin client uploads its screen thumbnail (device token, not admin).

@@ -2129,6 +2129,67 @@ function makePgStore(poolOrConfig) {
     return one(`SELECT * FROM printers WHERE id = $1`, [id]);
   }
 
+  // Adopt a discovered/candidate row. 'new' makes it a printer of its own; 'merge' records it as
+  // another address-form of one already listed WITHOUT destroying it — the row and its address
+  // stay as discovery evidence (merged_into), it is only stopped from standing as its own device.
+  async function adoptPrinter(pharmacyId, f = {}) {
+    const printerId = f.printer_id;
+    if (!printerId) return { error: 'printer_id required' };
+    const row = await one(`SELECT * FROM printers WHERE id = $1 AND pharmacy_id = $2`, [printerId, pharmacyId]);
+    if (!row) return { error: 'printer not found at this site' };
+    if (f.as === 'merge') {
+      let target = f.into_printer_id
+        ? await one(`SELECT id FROM printers WHERE id = $1 AND pharmacy_id = $2`, [f.into_printer_id, pharmacyId])
+        : null;
+      if (!target && f.into_device_serial) {
+        target = await one(
+          `SELECT id FROM printers WHERE pharmacy_id = $1 AND serial IS NOT NULL
+             AND lower(serial) = lower($2) AND id <> $3
+           ORDER BY last_seen_at DESC NULLS LAST LIMIT 1`,
+          [pharmacyId, f.into_device_serial, printerId]);
+      }
+      if (!target) return { error: 'could not resolve the printer to merge into' };
+      if (String(target.id) === String(printerId)) return { error: 'a printer cannot merge into itself' };
+      await q(`UPDATE printers SET merged_into = $1 WHERE id = $2`, [target.id, printerId]);
+      return { ok: true, merged_into: target.id };
+    }
+    await q(`UPDATE printers SET merged_into = NULL, hidden_at = NULL, hidden_reason = NULL WHERE id = $1`, [printerId]);
+    return { ok: true, adopted: printerId };
+  }
+
+  // Ask a thin client here to read what is at a printer's address NOW (resolve mDNS, ask IPP/SNMP
+  // for make/model/serial). The datacentre has no route to a pharmacy LAN, so this queues a job on
+  // a Pi (same channel as a test print) and reports back on its next tick; nothing here is sync.
+  async function identifyPrinter(pharmacyId, f = {}) {
+    const printerId = f.printer_id;
+    if (!printerId) return { error: 'printer_id required' };
+    const row = await one(`SELECT * FROM printers WHERE id = $1 AND pharmacy_id = $2`, [printerId, pharmacyId]);
+    if (!row) return { error: 'printer not found at this site' };
+    const address = String(row.address || '').trim();
+    if (!address || !/[.:]/.test(address)) {
+      return { error: 'this printer has no network address to identify (a USB queue has none)' };
+    }
+    let deviceId = null;
+    if (f.counter_id) {
+      const c = await one(`SELECT pi_device_id AS d FROM counters WHERE id = $1 AND pharmacy_id = $2`, [f.counter_id, pharmacyId]);
+      deviceId = c && c.d;
+    }
+    if (!deviceId && row.reported_by) {
+      const rep = await one(`SELECT pi_device_id AS d FROM counters WHERE pi_device_id = $1 AND pharmacy_id = $2`, [row.reported_by, pharmacyId]);
+      deviceId = rep && rep.d;
+    }
+    if (!deviceId) {
+      const any = await one(
+        `SELECT pi_device_id AS d FROM counters WHERE pharmacy_id = $1 AND pi_device_id IS NOT NULL
+         ORDER BY n NULLS LAST LIMIT 1`, [pharmacyId]);
+      deviceId = any && any.d;
+    }
+    if (!deviceId) return { error: 'no thin client here is enrolled, so nothing can go and look' };
+    const queued = await setCounterActionForDevice(deviceId, { action: `identify:${address}`, by: f.by || 'watchman' });
+    if (!queued) return { error: 'the chosen thin client is no longer linked to a counter' };
+    return { ok: true, queued: true, counter_id: queued.id, expected_within_seconds: 30 };
+  }
+
   // Queue an action against whichever counter owns this Pi. Printers are dispatched by
   // DEVICE rather than by counter because printers.reported_by names the Pi that can reach
   // the printer, and that is the only machine on the pharmacy LAN that can print to it.
@@ -2203,12 +2264,18 @@ function makePgStore(poolOrConfig) {
       disk_mount, disk_used_bytes, disk_total_bytes,
       disk_used_1d, disk_used_7d, disk_used_30d, disk_source,
       capacity_rrd_error, capacity_sampled_at,
+      proscript, vm_sql, vm_scardsvr, health_error, last_backup_at, backup_error,
       ...vm
     } = row;
     const n = (x) => (x == null || !Number.isFinite(Number(x)) ? null : Number(x));
     // sampled_at is NOT NULL in the table, so its absence means the LEFT JOIN found no row at
     // all: this VM has never been sampled. That is a different fact from "sampled, and the
     // readings were empty", and only the first may render as "no data yet".
+    vm.health = (proscript || vm_sql || vm_scardsvr || health_error)
+      ? { proscript: proscript || null, sql: vm_sql || null, scardsvr: vm_scardsvr || null, error: health_error || null }
+      : null;
+    vm.lastBackupAt = last_backup_at || null;
+    vm.backupError = backup_error || null;
     if (capacity_sampled_at == null) {
       vm.capacity = null;
       return vm;
@@ -2269,7 +2336,9 @@ function makePgStore(poolOrConfig) {
               cap.mem_bytes_1d, cap.mem_bytes_7d, cap.mem_bytes_30d, cap.mem_pressure_1d,
               cap.disk_mount, cap.disk_used_bytes, cap.disk_total_bytes,
               cap.disk_used_1d, cap.disk_used_7d, cap.disk_used_30d, cap.disk_source,
-              cap.rrd_error AS capacity_rrd_error, cap.sampled_at AS capacity_sampled_at
+              cap.rrd_error AS capacity_rrd_error, cap.sampled_at AS capacity_sampled_at,
+                cap.proscript, cap.vm_sql, cap.vm_scardsvr, cap.health_error,
+                cap.last_backup_at, cap.backup_error
          FROM pharmacy_vms_v v
          LEFT JOIN proxmox_vms pv ON pv.vmid = v.vmid
          LEFT JOIN pmr_vm_capacity cap ON cap.vmid = v.vmid
@@ -2593,6 +2662,11 @@ function makePgStore(poolOrConfig) {
            FROM printers pr
           WHERE pr.pharmacy_id IN (SELECT pharmacy_id FROM site WHERE pharmacy_id IS NOT NULL)
             AND pr.address IS NOT NULL
+            -- A row nothing has mentioned for a fortnight is not an address to offer someone
+            -- as a live host. findRelayTarget deliberately does NOT carry this condition: it
+            -- is the access gate, and refusing the tunnel to a printer that has gone quiet
+            -- takes the diagnostic route away at the moment it is wanted.
+            AND pr.hidden_at IS NULL
             AND NOT EXISTS (SELECT 1 FROM lan WHERE lan.ip = pr.address)
        )
        SELECT * FROM lan
@@ -2864,9 +2938,26 @@ function makePgStore(poolOrConfig) {
   // Reported by an agent on the pharmacy LAN (the counter Pi), since nothing in the
   // datacentre can reach a printer on a site network.
 
-  async function listPrinters(pharmacyId) {
-    if (pharmacyId) return rows(`SELECT * FROM printers_v WHERE pharmacy_id = $1 ORDER BY name`, [pharmacyId]);
-    return rows(`SELECT * FROM printers_v ORDER BY pharmacy_code, name`, []);
+  // Hidden rows are OMITTED BY DEFAULT, so every consumer of this feed gets the quiet answer
+  // without having to know the reaper exists. opts.includeHidden returns the lot, and the
+  // printing page asks for it because that page owns the parked drawer and has to be able to
+  // hand a row back. The flag is a BOUND BOOLEAN, not string-built SQL: one plan, no branch.
+  async function listPrinters(pharmacyId, opts) {
+    const includeHidden = !!(opts && opts.includeHidden);
+    if (pharmacyId) {
+      return rows(
+        `SELECT * FROM printers_v
+          WHERE pharmacy_id = $1 AND ($2 OR hidden_at IS NULL)
+          ORDER BY name`,
+        [pharmacyId, includeHidden]
+      );
+    }
+    return rows(
+      `SELECT * FROM printers_v
+        WHERE ($1 OR hidden_at IS NULL)
+        ORDER BY pharmacy_code, name`,
+      [includeHidden]
+    );
   }
 
   async function upsertPrinter(f) {
@@ -2884,7 +2975,11 @@ function makePgStore(poolOrConfig) {
          model          = COALESCE(EXCLUDED.model,      printers.model),
          serial         = COALESCE(EXCLUDED.serial,     printers.serial),
          discovered_via = COALESCE(EXCLUDED.discovered_via, printers.discovered_via),
-         notes          = COALESCE(EXCLUDED.notes,      printers.notes)
+         notes          = COALESCE(EXCLUDED.notes,      printers.notes),
+         -- A human saving this row is the strongest un-hide there is, and it means no new
+         -- endpoint is needed to bring one back: the page already has this call.
+         hidden_at      = NULL,
+         hidden_reason  = NULL
        RETURNING id`,
       [r.pharmacy_id, nz(r.counter_id), String(r.name || '').trim(), nz(r.address),
        nz(r.make), nz(r.model), nz(r.serial), nz(r.discovered_via), nz(r.notes)]
@@ -2903,29 +2998,102 @@ function makePgStore(poolOrConfig) {
     const arr = Array.isArray(list) ? list : [];
     const uniq = dedupeBy(arr.filter((p) => p && String(p.name || '').trim()), (p) => String(p.name).trim());
     if (!uniq.length) return { printers: 0 };
+    // WHICH PI IS SPEAKING, as a counter. 'printers' stays UNIQUE (pharmacy_id, name) -- one
+    // row per physical printer -- so the half of this report that is true of ONE PI goes to
+    // printer_reports, keyed (counter_id, queue), instead of fighting for the shared row.
+    //
+    // Resolved HERE rather than passed in from the route, and that is the point: the wire
+    // format, the route, the handler and the agent are all unchanged by this table, so
+    // nothing ships to the fleet. counters.pi_device_id is UNIQUE, and this runs once per
+    // printer report -- printer_every 15 x poll_interval_s 30, about every 7.5 minutes per Pi.
+    const counter = isUuid(deviceId)
+      ? await one(
+        `SELECT id FROM counters WHERE pi_device_id = $1 AND pharmacy_id = $2`,
+        [deviceId, pharmacyId]
+      )
+      : null;
+    // A LAN-SWEEP HIT IS NOT A QUEUE THIS PI HOLDS. discover_printers() has stamped every
+    // sweep record with unconfigured:true since the sweep shipped and the server has never
+    // read it -- this is the first reader. Without the filter ipharm-01's four 10.10.2.x probe
+    // hits are filed as queues it holds, which is the category error desktopPrinters.js's
+    // identified() exists to undo, and 10.10.2.0/24 is not even that site's subnet. Sweep
+    // hits keep going to 'printers' exactly as today; only the child feed is narrowed.
+    const queues = counter ? uniq.filter((p) => !p.unconfigured) : [];
     await tx(async (client) => {
       await bulkInsert(
         client,
         `INSERT INTO printers (pharmacy_id, name, address, make, model, serial, discovered_via,
                                status, state_reasons, page_count, supplies, queue_depth,
-                               jobs_failed, reported_by, last_seen_at)`,
+                               jobs_failed, odometer_in, hw_id, reported_by, last_seen_at)`,
         `ON CONFLICT (pharmacy_id, name) DO UPDATE SET
-           address        = COALESCE(printers.address, EXCLUDED.address),
+           -- First non-null wins, EXCEPT that a reporter which actually read the printer
+           -- (status set) and says it has no address is asserting a fact, not failing to
+           -- know one: a cabled printer HAS no address. Without that arm the consumer Pi's
+           -- route to the gateway — the Pi's own IP — got stored as the printer's address,
+           -- and the card read "network at 192.168.55.17" about a Zebra on a USB cable.
+           address        = CASE
+                              WHEN EXCLUDED.status IS NOT NULL AND EXCLUDED.address IS NULL
+                                THEN NULL
+                              -- ...and once ANY reporter has characterised this printer, one
+                              -- that did not read it has nothing to say about where it lives.
+                              -- Without this arm the two Pis oscillated: the gateway cleared
+                              -- the address every poll and the consumer put its own IP back
+                              -- the next, so the card alternated between 'USB into ipharm-01'
+                              -- and 'network at 192.168.55.17' for one Zebra on one cable.
+                              WHEN EXCLUDED.status IS NULL AND printers.status IS NOT NULL
+                                THEN printers.address
+                              ELSE COALESCE(printers.address, EXCLUDED.address) END,
            make           = COALESCE(printers.make,   EXCLUDED.make),
            model          = COALESCE(printers.model,  EXCLUDED.model),
            serial         = COALESCE(printers.serial, EXCLUDED.serial),
+           -- WF-037: a MAC is stable and a reporter that could not read the printer-uuid must
+           -- not blank one that did -- so first non-null wins, exactly like serial above.
+           hw_id          = COALESCE(printers.hw_id, EXCLUDED.hw_id),
            discovered_via = COALESCE(printers.discovered_via, EXCLUDED.discovered_via),
-           status         = EXCLUDED.status,
-           state_reasons  = EXCLUDED.state_reasons,
+           -- ⛔ A REPORTER THAT DID NOT LOOK MUST NOT OVERWRITE ONE THAT DID.
+           --
+           -- These columns used to be replaced wholesale by whichever Pi posted last, and at
+           -- a site built the normal way that is the wrong Pi half the time. iPharm's GK420d
+           -- is USB into ipharm-01, which reads its state and its media off the cable;
+           -- ipharm-02 knows the same queue only as 'ipp://192.168.55.17/...', cannot ask it
+           -- anything, and posts nulls. Last writer won, so a printer that had just reported
+           -- itself idle with media loaded went blank every other poll.
+           --
+           -- 'status' is the tell for whether a reporter looked at all: every path that
+           -- reads a printer — SNMP, IPP, the USB back-channel — sets it, and a path that
+           -- could not reach the device leaves it null. So status carries the whole decision
+           -- and state_reasons/supplies follow it, which also keeps the three consistent:
+           -- they come from ONE read, and mixing a fresh status with stale reasons would be
+           -- worse than either.
+           --
+           -- This is deliberately NOT a COALESCE on each column. A reporter that DID look and
+           -- found no fault must be able to clear a stale "media out", and COALESCE would
+           -- pin the first fault a printer ever had to it for good.
+           status         = COALESCE(EXCLUDED.status, printers.status),
+           state_reasons  = CASE WHEN EXCLUDED.status IS NULL
+                                 THEN printers.state_reasons ELSE EXCLUDED.state_reasons END,
            -- Lifetime page count only ever goes up; a lower value means a failed read or a
            -- replaced unit, and taking it would corrupt any usage figure derived from it.
            page_count     = GREATEST(COALESCE(printers.page_count, 0), COALESCE(EXCLUDED.page_count, 0)),
-           supplies       = EXCLUDED.supplies,
+           -- Same ratchet, same reason: a meter only ever goes up, so a lower reading is a
+           -- failed read or a swapped unit and taking it would corrupt any usage figure.
+           odometer_in    = GREATEST(COALESCE(printers.odometer_in, 0), COALESCE(EXCLUDED.odometer_in, 0)),
+           supplies       = CASE WHEN EXCLUDED.status IS NULL
+                                 THEN printers.supplies ELSE EXCLUDED.supplies END,
            queue_depth    = EXCLUDED.queue_depth,
            jobs_failed    = EXCLUDED.jobs_failed,
            reported_by    = EXCLUDED.reported_by,
-           last_seen_at   = now()`,
-        14,
+           last_seen_at   = now(),
+           -- NOT COALESCEd, unlike almost everything above it, and the difference is the
+           -- point. The COALESCE arms exist so a reporter that did not look cannot blank what
+           -- one that did wrote. This column is the opposite kind of fact: the reaper hides a
+           -- row when its NAME falls out of the feed, so a row appearing in ANY batch is the
+           -- whole disproof, whether or not that Pi could read the device. Hide and un-hide
+           -- are then driven by the same signal as last_seen_at on the line above, which is
+           -- what stops a row flapping between the table and the parked drawer.
+           hidden_at      = NULL,
+           hidden_reason  = NULL`,
+        16,
         uniq.map((p) => [
           pharmacyId, String(p.name).trim(), nz(p.address), nz(p.make), nz(p.model), nz(p.serial),
           nz(p.discovered_via), nz(p.status), nz(p.state_reasons),
@@ -2933,12 +3101,141 @@ function makePgStore(poolOrConfig) {
           JSON.stringify(Array.isArray(p.supplies) ? p.supplies : []),
           p.queue_depth == null ? null : Number(p.queue_depth),
           p.jobs_failed == null ? null : Number(p.jobs_failed),
+          p.odometer_in == null ? null : Number(p.odometer_in),
+          nz(p.hw_id),
           nz(deviceId),
         ]),
-        placeholders(14, 'now()')
+        placeholders(16, 'now()')
       );
+      // ── the per-counter half of the same report ────────────────────────
+      //
+      // EVERY OBSERVED COLUMN IS REPLACED WHOLESALE AND NONE OF THE GUARDS ABOVE ARE
+      // REPEATED. Read that as a deliberate asymmetry, not an oversight. The guards above
+      // exist ONLY because two Pis share one row: "a reporter that did not look must not
+      // overwrite one that did" is the right rule for a row with two writers and the WRONG
+      // rule for a row with one. If ipharm-01 could read the GK420d at 10:12 and cannot at
+      // 10:20, THIS ROW MUST SAY SO -- that is the fault, and COALESCE-ing it away would
+      // rebuild inside the child table the exact staleness the child table removes.
+      //
+      // first_seen_at is absent from the SET list on purpose: it dates when this Pi was first
+      // seen holding this queue, and a queue that appears on a Pi nobody staged it on is
+      // drift worth dating.
+      //
+      // TWELVE values for the twelve bound columns; last_seen_at comes from now(). Counted
+      // against the placeholder list, because this file has twice shipped an INSERT whose
+      // bound values and $n list disagreed.
+      if (queues.length) {
+        await bulkInsert(
+          client,
+          `INSERT INTO printer_reports (pharmacy_id, counter_id, queue, reported_by, address,
+                                        serial, discovered_via, status, state_reasons,
+                                        supplies, queue_depth, jobs_failed, last_seen_at)`,
+          `ON CONFLICT (counter_id, queue) DO UPDATE SET
+             pharmacy_id    = EXCLUDED.pharmacy_id,
+             reported_by    = EXCLUDED.reported_by,
+             address        = EXCLUDED.address,
+             serial         = EXCLUDED.serial,
+             discovered_via = EXCLUDED.discovered_via,
+             status         = EXCLUDED.status,
+             state_reasons  = EXCLUDED.state_reasons,
+             supplies       = EXCLUDED.supplies,
+             queue_depth    = EXCLUDED.queue_depth,
+             jobs_failed    = EXCLUDED.jobs_failed,
+             last_seen_at   = now()`,
+          12,
+          queues.map((p) => [
+            pharmacyId, counter.id, String(p.name).trim(), nz(deviceId), nz(p.address),
+            nz(p.serial), nz(p.discovered_via), nz(p.status), nz(p.state_reasons),
+            JSON.stringify(Array.isArray(p.supplies) ? p.supplies : []),
+            p.queue_depth == null ? null : Number(p.queue_depth),
+            p.jobs_failed == null ? null : Number(p.jobs_failed),
+          ]),
+          placeholders(12, 'now()')
+        );
+      }
     });
-    return { printers: uniq.length };
+    return { printers: uniq.length, queue_reports: queues.length };
+  }
+
+  // ── the stale-row reaper ────────────────────────────────────────
+  // Rows are keyed by (pharmacy_id, name), so a renamed CUPS queue orphans the old row and
+  // nothing ever removed it. This hides such a row; it never deletes one.
+  //
+  // FOURTEEN DAYS. A live queue is reported roughly 192 times a day (printer_every 15 x
+  // poll_interval_s 30 is one printer pass every 7.5 minutes), so this is about 2,700
+  // consecutive missed reports -- longer than any gap a working Pi produces, two full working
+  // weeks so a row cannot age out inside one engineer's leave, and short enough that today's
+  // probe hits clear inside a sprint rather than a month.
+  const PRINTER_STALE_DAYS = 14;
+  // The site's feed must be MOVING before anything at that site may be hidden. One hour is
+  // eight missed printer passes: a site that is down cannot satisfy it, a Pi that rebooted can.
+  const PRINTER_FEED_LIVE = '1 hour';
+
+  async function hideStalePrinters() {
+    const r = await q(
+      `WITH feed AS (
+         -- THE GATE THAT STOPS A DEAD PI ERASING A SITE. printers.last_seen_at is stamped
+         -- for every NAME in a Pi's batch whether or not that Pi could read the device, so
+         -- when the site's only Pi dies every row at the site goes stale together and an
+         -- age-only rule would hide real printers at exactly the site that has just broken.
+         -- RX54554 is the worked example: two rows, both 7.8 days stale, because its only Pi
+         -- has been dead six days. Both must stay on the page.
+         --
+         -- The test is the FEED ITSELF, not a proxy for it. devices.last_seen_at would be
+         -- worse: a Pi that is online while its printer poll fails would read as healthy and
+         -- the sweep would hide the whole site.
+         --
+         -- A site with exactly ONE printer row can never satisfy this, so its row is never
+         -- hidden. That is deliberate: with one row there is no way to tell "the printer went"
+         -- from "the Pi went", and the conservative answer is the only honest one.
+         SELECT pharmacy_id, max(last_seen_at) AS feed_at
+           FROM printers
+          GROUP BY pharmacy_id
+       )
+       UPDATE printers pr
+          SET hidden_at = now(), hidden_reason = 'stale'
+         FROM feed f
+        WHERE f.pharmacy_id = pr.pharmacy_id
+          AND pr.hidden_at IS NULL
+          -- NULL means nobody has ever polled it, which is the signature of a row a human
+          -- typed in and no Pi covers. A table full of dashes is not a fault; hiding it is.
+          AND pr.last_seen_at IS NOT NULL
+          AND pr.last_seen_at < now() - ($1::int * interval '1 day')
+          AND f.feed_at       > now() - $2::interval
+          -- A ROW A HUMAN TOUCHED IS NEVER HIDDEN, and these are the four ways to touch one.
+          -- The first three are columns only upsertPrinter writes; it is the sole writer of
+          -- counter_id and notes anywhere in this repository, and the agent only ever sends
+          -- ipp, cups or snmp for discovered_via, so 'manual' can only have come from a person
+          -- through the operator route.
+          AND pr.counter_id IS NULL
+          AND pr.notes IS NULL
+          AND pr.discovered_via IS DISTINCT FROM 'manual'
+          -- AND THE FOURTH IS THE ONLY ONE WITH ANY DATA IN IT TODAY. Not one printers row
+          -- in the estate carries counter_id, notes or 'manual' -- but pmr_printer_queues holds
+          -- fourteen operator-built rows naming all seven of iPharm's real queues, and holds
+          -- nothing for the four probe hits that are the actual noise. A guard that checked
+          -- only the columns above would spare nothing and would happily hide every printer
+          -- anyone has ever worked on.
+          --
+          -- Matched on (pharmacy_id, name) -- the printers row's OWN unique key -- rather than
+          -- on a resolved host counter. A row whose reporting Pi has been swapped resolves to
+          -- no counter at all, and a guard that quietly stops guarding during a site rebuild
+          -- is worse than one that occasionally spares a row too many. The cost of the broad
+          -- match is that a queue renamed on the Pi but not yet in Watchman stays visible, and
+          -- that disagreement is itself a fault worth seeing.
+          AND NOT EXISTS (
+                SELECT 1 FROM pmr_printer_queues qq
+                 WHERE qq.pharmacy_id = pr.pharmacy_id AND qq.queue = pr.name)
+          -- Empty today, one drag from not being. printer_id is checked AND the name is, because
+          -- the contract calls printer_id a hint and never the identity, and its FK is ON DELETE
+          -- SET NULL -- so an assignment can name this queue with no printer_id at all.
+          AND NOT EXISTS (
+                SELECT 1 FROM pmr_printer_assignments a
+                 WHERE a.printer_id = pr.id
+                    OR (a.pharmacy_id = pr.pharmacy_id AND a.queue = pr.name))`,
+      [PRINTER_STALE_DAYS, PRINTER_FEED_LIVE]
+    );
+    return { hidden: r.rowCount || 0 };
   }
 
   // ── THE PRINTER MODEL (docs/pmr-printer-contract.md §1) ────────────────────
@@ -3039,11 +3336,35 @@ function makePgStore(poolOrConfig) {
               q.notes, q.set_by, q.created_at, q.updated_at,
               a.vmids AS assigned_vmids,
               c.n     AS counter_n,
-              c.label AS counter_label
+              c.label AS counter_label,
+              -- IS IT ACTUALLY THERE? pmr_printer_queues is what Watchman INTENDS; these
+              -- columns are what the Pi reported holding, joined on the key they share.
+              (r.counter_id IS NOT NULL)  AS observed,
+              r.last_seen_at              AS observed_at,
+              r.via                       AS observed_via,
+              r.via_counter_id            AS observed_via_counter_id,
+              r.status                    AS observed_status,
+              r.state_reasons             AS observed_state_reasons,
+              r.read_ok                   AS observed_read_ok,
+              r.stale                     AS observed_stale,
+              r.queue_depth               AS observed_queue_depth,
+              r.jobs_failed               AS observed_jobs_failed,
+              r.serial                    AS observed_serial,
+              r.address                   AS observed_address,
+              -- THE THREE-VALUED GUARD, AND NOTHING MAY RENDER 'observed' WITHOUT IT.
+              -- observed=false has TWO causes: this Pi reported its queues and this one was
+              -- not among them (a real "not built here"), or this Pi has never reported any
+              -- queue at all (printer_every 0, never polled, newly enrolled). NULL here means
+              -- the second, and an unknown value must never render as a confident one.
+              -- A false "not built" on a live counter is a call-out.
+              (SELECT max(rr.last_seen_at) FROM printer_reports rr
+                WHERE rr.counter_id = q.counter_id) AS counter_reported_at
          FROM pmr_printer_queues q
          LEFT JOIN pmr_printer_assignments a
                 ON a.counter_id = q.counter_id AND a.queue = q.queue
          LEFT JOIN counters c ON c.id = q.counter_id
+         LEFT JOIN printer_reports_v r
+                ON r.counter_id = q.counter_id AND r.queue = q.queue
          ${where}
         ORDER BY q.counter_id, q.queue`,
       pharmacyId == null ? [] : [pharmacyId]
@@ -4016,7 +4337,7 @@ function makePgStore(poolOrConfig) {
                                       cpu_pct_1d, cpu_pct_7d, cpu_pct_30d,
                                       mem_bytes_1d, mem_bytes_7d, mem_bytes_30d, mem_pressure_1d,
                                       disk_mount, disk_used_bytes, disk_total_bytes, disk_source,
-                                      rrd_error, sampled_at, updated_at)`,
+                                      rrd_error, proscript, vm_sql, vm_scardsvr, health_error, last_backup_at, backup_error, sampled_at, updated_at)`,
         // Two different rules in one SET list, and the difference is deliberate:
         //
         // CPU/RAM are COALESCEd, like agent_ok on proxmox_vms — a tick where the RRD read
@@ -4051,6 +4372,12 @@ function makePgStore(poolOrConfig) {
            disk_total_bytes = EXCLUDED.disk_total_bytes,
            disk_source = EXCLUDED.disk_source,
            rrd_error = EXCLUDED.rrd_error,
+             proscript = COALESCE(EXCLUDED.proscript, pmr_vm_capacity.proscript),
+             vm_sql = COALESCE(EXCLUDED.vm_sql, pmr_vm_capacity.vm_sql),
+             vm_scardsvr = COALESCE(EXCLUDED.vm_scardsvr, pmr_vm_capacity.vm_scardsvr),
+             health_error = EXCLUDED.health_error,
+             last_backup_at = COALESCE(EXCLUDED.last_backup_at, pmr_vm_capacity.last_backup_at),
+             backup_error = EXCLUDED.backup_error,
            sampled_at = CASE
              WHEN COALESCE(EXCLUDED.cpu_pct_1d, EXCLUDED.cpu_pct_7d, EXCLUDED.cpu_pct_30d,
                            EXCLUDED.mem_pressure_1d) IS NOT NULL
@@ -4060,7 +4387,7 @@ function makePgStore(poolOrConfig) {
            updated_at = now()`,
         // 17 BOUND PARAMS. sampled_at and updated_at are the 18th and 19th COLUMNS but are
         // supplied as literals by the trailing argument below, so they are not counted here.
-        17,
+        23,
         uniq.map((v) => [
           Number(v.vmid), nz(v.node), nz(v.name),
           num(v.cores), num(v.mem_max_bytes),
@@ -4073,12 +4400,15 @@ function makePgStore(poolOrConfig) {
           // CHECK-constrained to these two values; anything else would abort the transaction.
           withDisk(v) ? 'agent' : 'unknown',
           nz(v.rrd_error),
+          nz(v.proscript), nz(v.vm_sql), nz(v.vm_scardsvr), nz(v.health_error),
+          v.last_backup_at != null ? new Date(Number(v.last_backup_at) * 1000).toISOString() : null,
+          nz(v.backup_error),
         ]),
         // ONE string, TWO literals — placeholders() joins its parts with commas, so this
         // renders `,now(), now()` and fills both trailing columns. The count above (17) must
         // stay equal to the number of values in each .map() row: they are separate literals,
         // nothing derives one from the other, and a mismatch makes every tick 500 at bind time.
-        placeholders(17, 'now(), now()')
+        placeholders(23, 'now(), now()')
       );
 
       // Our own disk history. Proxmox keeps none — its RRD `disk` is always 0 for a qemu VM —
@@ -4357,7 +4687,9 @@ function makePgStore(poolOrConfig) {
               cap.mem_bytes_1d, cap.mem_bytes_7d, cap.mem_bytes_30d, cap.mem_pressure_1d,
               cap.disk_mount, cap.disk_used_bytes, cap.disk_total_bytes,
               cap.disk_used_1d, cap.disk_used_7d, cap.disk_used_30d, cap.disk_source,
-              cap.rrd_error AS capacity_rrd_error, cap.sampled_at AS capacity_sampled_at
+              cap.rrd_error AS capacity_rrd_error, cap.sampled_at AS capacity_sampled_at,
+                cap.proscript, cap.vm_sql, cap.vm_scardsvr, cap.health_error,
+                cap.last_backup_at, cap.backup_error
          FROM proxmox_vms_v v
          LEFT JOIN pmr_vm_capacity cap ON cap.vmid = v.vmid
         ORDER BY v.vlan_tag NULLS LAST, v.vmid`,
@@ -5640,6 +5972,7 @@ function makePgStore(poolOrConfig) {
     upsertPrinter,
     deletePrinter,
     reportPrinters,
+    hideStalePrinters,
     // ── the printer model (docs/pmr-printer-contract.md §1) ──
     reportCounterPrinters,
     listPrinterDevices,
@@ -5687,6 +6020,8 @@ function makePgStore(poolOrConfig) {
     linkCounterPi,
     listLanPrinters,
     getPrinter,
+    adoptPrinter,
+    identifyPrinter,
     setCounterActionForDevice,
     listUnclaimedPis,
     adoptPi,

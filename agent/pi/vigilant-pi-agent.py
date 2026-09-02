@@ -31,6 +31,7 @@ import glob
 import json
 import os
 import re
+import select
 import shutil
 import socket
 import ssl
@@ -1845,10 +1846,17 @@ def decode_error_bits(octet_string):
     return flags
 
 
-def snmp_get(host, community, oid):
+def snmp_get(host, community, oid, t="2", r="1"):
+    """One SNMP GET. `t` and `r` are snmpget's own timeout and retry count.
+
+    ⚠️ THE DEFAULTS ARE FOR A PRINTER THAT ANSWERS. A host that does not speak SNMP costs
+    t x (r+1) seconds on EVERY call, and a full read is six GETs and five WALKs — so one
+    silent host at the defaults costs around forty seconds. That is why snmp_read() gates
+    the whole read behind a single call made with t="1", r="0".
+    """
     if not have("snmpget"):
         return None
-    out = run(["snmpget", "-v2c", "-c", community, "-Ovq", "-t", "2", "-r", "1", host, oid], timeout=6)
+    out = run(["snmpget", "-v2c", "-c", community, "-Ovq", "-t", t, "-r", r, host, oid], timeout=6)
     out = out.strip().strip('"')
     return out or None
 
@@ -1969,35 +1977,617 @@ def cups_devices():
     return found
 
 
-def poll_printer(spec, community="public"):
-    """spec is 'name@host' or just 'host'.
+# ── IPP: ask the printer to describe itself ──────────────────────────────────
+#
+# WHY THIS EXISTS. poll_printer() had exactly one way to learn anything about a network
+# printer — SNMP — and `snmpget` is NOT installed on these images. So every network printer
+# reported a name and an address and nothing else: no make, no model, no state, no supplies.
+# Watchman could then not even decide the row WAS a printer; it listed it under "rows we
+# could not tie to a device" with "not reported" against every field, and the only thing an
+# operator could see was an IP.
+#
+# IPP needs no new package. `ipptool` ships with CUPS and is already on every Pi, and these
+# printers already answer it — the queues are ipp:// URIs pointing at :631.
+#
+# MEASURED against iPharm's Brother HL-L5100DN, 2026-08-26:
+#     printer-make-and-model = Brother HL-L5100DN series
+#     printer-device-id      = MFG:Brother;CMD:PJL,PCL,PCLXL,URF;MDL:HL-L5100DN series;...
+#     printer-state          = idle        printer-state-reasons = other-warning
+#     marker-names = BK    marker-levels = 90    marker-high-levels = 100    marker-types = toner
+#
+# ⛔ NO LIFETIME PAGE COUNT, AND DO NOT INVENT ONE. IPP has no standard "pages this device
+# has ever printed". This Brother offers none — `printer-impressions-completed` is absent and
+# `job-impressions-supported` is a capability range, not a total. Page count stays SNMP's
+# job and stays honestly unreported until net-snmp is installed. Said out loud because the
+# job counter is RIGHT THERE and wiring it up would quietly turn "pages since this queue was
+# made" into "pages this printer has printed", which is a different number.
+#
+# ⛔ EVERY STRING HERE IS DEVICE-SUPPLIED, and is treated the way the rest of this file
+# treats IEEE-1284 data: control characters stripped and length capped. A printer that lies
+# about its model puts a wrong name on a row; it must not put a control sequence into
+# anything that renders.
 
-    An unreachable printer is REPORTED as unreachable rather than dropped, so it can be
-    seen and alerted on. But "SNMP tooling isn't installed" is not the same as "the printer
-    is down", and conflating them would put a false fault on every site without net-snmp.
+IPP_TEST = "/usr/share/cups/ipptool/get-printer-attributes.test"
+
+# The resource path is not discoverable and differs by vendor, so the usual ones are tried in
+# turn. Ordered by how often they answer, and the list is SHORT on purpose — each miss costs
+# a timeout, and this runs inside the printer poll.
+IPP_RESOURCES = ("/ipp/print", "/", "/ipp/printer")
+
+# ipptool prints the state as IPP's own word. Translated to the vocabulary the rest of the
+# platform already uses for SNMP-derived status, so one printer cannot read two ways.
+IPP_STATE = {"idle": "idle", "processing": "printing", "stopped": "stopped"}
+
+_IPP_ATTR_RE = re.compile(r"^\s+([a-zA-Z][a-zA-Z0-9._-]*)\s+\(([^)]*)\)\s*=\s*(.*)$")
+
+
+def _ipp_clean(s, limit=120):
+    """Device-supplied text made safe to store and to render."""
+    s = re.sub(r"[\x00-\x1f\x7f]", " ", str(s or "")).strip()
+    return s[:limit] or None
+
+
+def _ipp_list(attrs, name):
+    """A multi-valued IPP attribute, split.
+
+    ⚠️ ONLY the marker-* attributes and state-reasons are safe to split on a comma.
+    `printer-device-id` legitimately CONTAINS commas (`URF:W8,CP1,IS19-1-21,…`) and
+    splitting it shreds the field, so attributes are stored whole and split only here, by
+    the callers that know their attribute is a list.
     """
-    name, _, host = spec.partition("@")
+    v = attrs.get(name)
+    return [x.strip() for x in v.split(",") if x.strip()] if v else []
+
+
+def resolve_host(host):
+    """An IPv4 address for a CUPS URI authority, or None if it is not resolvable.
+
+    A device URI may carry a NAME rather than an address — iPharm's Brother is
+    `BRNB4220013EDFD.local`, an mDNS name that only something on the pharmacy LAN can
+    resolve. Stored as-is it hands the platform a string it can neither route to nor match
+    against a sweep result, which is exactly why the row read "no address is stored".
+
+    Returning None for anything unresolvable is also what keeps IPP away from usb:// queues:
+    their authority is a VENDOR STRING (`Zebra%20Technologies`), never a host, and the
+    caller uses a None here to skip the network read entirely rather than spending three
+    timeouts discovering that a vendor name is not a printer.
+    """
     if not host:
-        host, name = name, name
-    p = {"name": name, "address": host}
+        return None
+    if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", host):
+        return host
+    if not re.match(r"^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$", host):
+        return None
+    try:
+        return socket.gethostbyname(host)
+    except Exception:
+        return None
 
+
+def ipp_attributes(host, port=631, resources=IPP_RESOURCES):
+    """Get-Printer-Attributes against `host`, as {attribute: raw value string}.
+
+    A one-second TCP check comes first: without it a host with 9100 open and 631 closed
+    costs three ipptool timeouts, and discovery calls this once per swept host.
+    """
+    if not have("ipptool") or not os.path.exists(IPP_TEST):
+        return {}
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+            sk.settimeout(1.0)
+            if sk.connect_ex((host, port)) != 0:
+                return {}
+    except Exception:
+        return {}
+    for res in resources:
+        out = run(["ipptool", "-T", "5", "-tv", "ipp://%s:%d%s" % (host, port, res), IPP_TEST],
+                  timeout=20)
+        attrs = {}
+        for line in (out or "").splitlines():
+            m = _IPP_ATTR_RE.match(line)
+            if m:
+                # FIRST value wins: ipptool echoes the request group before the response
+                # group, so an attribute can appear twice and the later copy is not a
+                # second printer.
+                attrs.setdefault(m.group(1), m.group(3).strip())
+        if attrs.get("printer-state") or attrs.get("printer-make-and-model"):
+            return attrs
+    return {}
+
+
+def apply_ipp(p, host, port=631, resources=IPP_RESOURCES):
+    """Fill make / model / serial / status / state_reasons / supplies on `p` from IPP.
+
+    Returns True when the printer actually told us something, so the caller can stop rather
+    than fall through to claiming it is unreachable.
+    """
+    try:
+        a = ipp_attributes(host, port, resources)
+    except Exception as e:
+        print("vigilant-pi-agent: ipp read failed for %s: %s: %s"
+              % (host, type(e).__name__, e), flush=True)
+        return False
+    if not a:
+        return False
+
+    dev_id = _ipp_clean(a.get("printer-device-id"), 400) or ""
+    fields = {}
+    for kv in dev_id.split(";"):
+        if ":" in kv:
+            k, _, v = kv.partition(":")
+            fields[k.strip().upper()] = v.strip()
+
+    model = _ipp_clean(a.get("printer-make-and-model") or a.get("printer-info")) \
+        or _ipp_clean(fields.get("MDL"))
+    make = _ipp_clean(fields.get("MFG") or fields.get("MANUFACTURER")) \
+        or (model.split()[0] if model else None)
+    if model:
+        p["model"] = model
+    if make:
+        p["make"] = make
+
+    # ⛔ THE UUID IS NOT A SERIAL. Brother's `printer-uuid` encodes the MAC
+    # (…8000-b4220013edfd) and is a fine identity, but putting it in `serial` shows an
+    # engineer holding the printer a number that is not on its label. Only a real 1284
+    # serial is stored; absent one, the field stays honestly empty.
+    sn = _ipp_clean(fields.get("SN") or fields.get("SERN") or fields.get("SERIALNUMBER"), 60)
+    if sn:
+        p["serial"] = sn
+
+    # WF-037: the UUID is refused as a serial above, but for a NETWORK printer its last 12 hex
+    # ARE the NIC MAC (Brother: urn:uuid:…-b4220013edfd -> b4:22:00:13:ed:fd). That is a
+    # DHCP-STABLE hardware id — it survives a lease change, unlike the IP a printer is otherwise
+    # tracked by — so it is stored in its own field, never in `serial`. The agent author's rule
+    # holds: this is not a serial and is not shown as one; it is an identity of last resort.
+    uuid_val = _ipp_clean(a.get("printer-uuid"), 80)
+    if uuid_val:
+        hexes = re.sub(r"[^0-9a-fA-F]", "", uuid_val)
+        if len(hexes) >= 12:
+            p["hw_id"] = ":".join(hexes[-12:][i:i + 2] for i in range(0, 12, 2)).lower()
+            p["hw_id_source"] = "printer-uuid"
+
+    state = (a.get("printer-state") or "").strip().lower()
+    if state:
+        p["status"] = IPP_STATE.get(state, _ipp_clean(state, 40))
+    reasons = [r for r in _ipp_list(a, "printer-state-reasons") if r.lower() != "none"]
+    if reasons:
+        p["state_reasons"] = "; ".join(x for x in (_ipp_clean(r, 60) for r in reasons[:4]) if x)
+
+    names = _ipp_list(a, "marker-names")
+    levels = _ipp_list(a, "marker-levels")
+    highs = _ipp_list(a, "marker-high-levels")
+    types = _ipp_list(a, "marker-types")
+
+    def _n(seq, i):
+        try:
+            return int(seq[i])
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    supplies = []
+    for i in range(len(levels)):
+        lvl = _n(levels, i)
+        mx = _n(highs, i)
+        if mx is None or mx <= 0:
+            # IPP marker levels are a percentage of marker-high-levels, and a device that
+            # omits the high level means the plain 0-100 scale.
+            mx = 100
+        entry = {
+            "name": (_ipp_clean(names[i], 60) if i < len(names) else None) or ("supply %d" % (i + 1)),
+            "type": (_ipp_clean(types[i], 40) if i < len(types) else None) or "supply",
+            "level": lvl,
+            "max_capacity": mx,
+        }
+        # Same RFC 3805 sentinels as the SNMP path, so they get the same words. -3 is the
+        # printer SAYING there is some left and refusing to quantify it, which is not the
+        # same answer as a sensor that did not report.
+        if lvl == -3:
+            entry["state"] = "some_remaining"
+        elif lvl is None or lvl in (-1, -2):
+            entry["state"] = "unknown"
+        else:
+            entry["pct"] = round(100.0 * lvl / mx, 1)
+            entry["state"] = "measured"
+        supplies.append(entry)
+    if supplies:
+        p["supplies"] = supplies
+
+    if p.get("model") or p.get("status") or supplies:
+        p["discovered_via"] = "ipp"
+        return True
+    return False
+
+
+# ── USB label printers: the back-channel ─────────────────────────────────────
+#
+# WHY. A cabled printer has no address, so every network reader above is useless on it and
+# the card said "not reported — this printer has no address anything can poll" against state,
+# supplies and pages. That is true of IP polling and false of the printer: these Zebras are
+# `bidirectional` (the agent already reports it), and they answer ZPL host queries down the
+# same cable they take print jobs on.
+#
+# MEASURED on iPharm's GK420d and ZD420, 2026-08-26 — both answered every one:
+#     ~HQES  -> ERRORS: 0 00000000 00000000 / WARNINGS: 0 00000000 00000000
+#     ~HS    -> 030,0,0,1236,000,0,0,0,000,0,0,0 | 000,0,0,0,0,2,4,0,00000000,1,000 | 1234,0
+#     ~HQOD  -> TOTAL NONRESETTABLE: 912767 "
+#
+# ⛔ `~HQ`/`~HS` ARE QUERIES. They return a status block and print nothing. Nothing in here
+# may ever send a command that marks media — this runs unattended against a live dispensing
+# counter.
+#
+# ⛔ THE ODOMETER IS A DISTANCE, NOT A PAGE COUNT. `~HQOD` answers in the printer's own
+# measurement units and these report INCHES (the trailing `"`). 912767 is fourteen miles of
+# label stock, not nine hundred thousand labels. It is carried as `odometer_in` and is
+# deliberately NOT put in `page_count`, because a field labelled "pages printed" showing a
+# length is a wrong number presented as a right one. Converting it to labels by dividing by
+# the label length would be an estimate wearing a measurement's clothes.
+
+ZPL_USB_VIDS = ("0a5f",)   # Zebra Technologies
+
+
+def usb_bind_usblp(serial):
+    """Give a cabled printer a device node by binding the kernel's usblp driver to it.
+
+    WHY. CUPS prints through libusb, which DETACHES the kernel driver to claim the interface
+    — and does not always put it back. On ipharm-02 the ZD421's printer interface was left
+    with NO driver at all, so /dev/usb was empty and the printer could not be asked anything,
+    while the identical arrangement on ipharm-01 had its nodes and printed perfectly. Binding
+    restores the stock state rather than inventing one: usblp is the normal driver for a
+    printer-class interface, CUPS detaches it again for each job, and ipharm-01 is the
+    standing proof that a bound node and CUPS printing coexist.
+
+    ⛔ ONLY AN INTERFACE WITH NO DRIVER. If anything already owns it — libusb mid-job, or
+    usblp already bound — this does nothing at all. Combined with the caller's empty-queue
+    check, that is what keeps it away from a label somebody is waiting for.
+    """
+    try:
+        for devdir in glob.glob("/sys/bus/usb/devices/*/"):
+            try:
+                with open(os.path.join(devdir, "serial")) as fh:
+                    if fh.read().strip() != serial:
+                        continue
+            except Exception:
+                continue
+            base = os.path.basename(devdir.rstrip("/"))
+            for iface in sorted(glob.glob(os.path.join(devdir, base + ":*"))):
+                try:
+                    with open(os.path.join(iface, "bInterfaceClass")) as fh:
+                        if fh.read().strip() != "07":       # USB class 07 = Printer
+                            continue
+                except Exception:
+                    continue
+                if os.path.exists(os.path.join(iface, "driver")):
+                    continue
+                name = os.path.basename(iface.rstrip("/"))
+                with open("/sys/bus/usb/drivers/usblp/bind", "w") as fh:
+                    fh.write(name)
+                print("vigilant-pi-agent: bound usblp to %s (printer %s)" % (name, serial),
+                      flush=True)
+                time.sleep(0.5)
+                return True
+    except Exception as e:
+        print("vigilant-pi-agent: usblp bind skipped for %s: %s"
+              % (serial, type(e).__name__), flush=True)
+    return False
+
+
+def usb_lp_node(serial, _bind=True):
+    """The /dev/usb/lpN whose device carries this USB serial, or None.
+
+    Matched on SERIAL rather than on enumeration order: lp0/lp1 are assigned in the order the
+    kernel bound them, so at iPharm lp0 is the ZD420 and lp1 the GK420d, and a reboot may
+    swap them. Keying on the serial is the same identity the queue URI carries.
+
+    ⚠️ These nodes come and go. `usblp` is unbound while the CUPS libusb backend has the
+    device open for a job, so /dev/usb can be EMPTY at a perfectly healthy moment. Absent
+    means "could not ask this time", never "no such printer".
+    """
+    if not serial:
+        return None
+    for node in sorted(glob.glob("/dev/usb/lp*")):
+        base = os.path.basename(node)
+        try:
+            dev = os.path.realpath("/sys/class/usbmisc/%s/device" % base)
+            with open(os.path.join(os.path.dirname(dev), "serial")) as fh:
+                if fh.read().strip() == serial:
+                    return node
+        except Exception:
+            continue
+    # No node for a printer we can see on the bus: the driver has been detached and left off.
+    # Bind it back ONCE and look again — `_bind` makes that a single retry, never a loop.
+    if _bind and usb_bind_usblp(serial):
+        return usb_lp_node(serial, _bind=False)
+    return None
+
+
+def zpl_query(node, cmd, wait=2.5, blocks=1):
+    """Send one ZPL host query and return the reply bytes (b"" on any failure).
+
+    Non-blocking throughout and hard-bounded: this opens a device a live counter prints to,
+    so it must never hold it and must never block. Any error is swallowed — a status read
+    that fails is a status we do not have, not an incident.
+
+    ⛔ STOP ON THE BLOCK COUNT, NOT ON A QUIET GAP. Each reply block is ETX-terminated, and
+    `blocks` says how many this command answers with (~HS sends three). Waiting for a gap in
+    the stream instead cut multi-block replies in half, because the printer pauses between
+    them.
+
+    ⚠️ THE GK420d KEEPS ITS LAST REPLY. Measured 2026-08-26: a first ~HS came back holding
+    the PREVIOUS answer followed by the new one, and the very next query returned nothing at
+    all — the drain below had taken the reply that was still in flight. So the drain is kept
+    (a half-read stale block would be parsed as this one's answer) and the CALLER retries
+    instead of trusting a single empty read. A doubled reply is harmless: the blocks are
+    identical and the parser reads the first of each.
+    """
+    fd = None
+    try:
+        fd = os.open(node, os.O_RDWR | os.O_NONBLOCK)
+        # Drain anything a previous reader left behind, or the reply is read misaligned.
+        try:
+            while select.select([fd], [], [], 0)[0]:
+                if not os.read(fd, 4096):
+                    break
+        except OSError:
+            pass
+        os.write(fd, cmd.encode())
+        buf, deadline = b"", time.time() + wait
+        while time.time() < deadline:
+            if not select.select([fd], [], [], 0.2)[0]:
+                continue
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            if buf.count(b"\x03") >= blocks:
+                break
+        return buf
+    except Exception:
+        return b""
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+
+def _hs_fields(raw):
+    """The three comma-separated strings of a ~HS reply, STX/ETX stripped."""
+    txt = raw.decode("ascii", "replace")
+    out = []
+    for part in re.findall(r"\x02([^\x03]*)\x03", txt):
+        out.append(part.split(","))
+    if not out:
+        for line in txt.splitlines():
+            line = line.strip("\x02\x03 \r\n")
+            if line and "," in line:
+                out.append(line.split(","))
+    return out
+
+
+def usb_device_status(p):
+    """Ask a cabled Zebra for its state, its media and its odometer.
+
+    Fills status / state_reasons / supplies / odometer_in on `p`. Silent no-op for anything
+    that is not a Zebra, or when the node is not there to open.
+    """
+    node = usb_lp_node(p.get("serial"))
+    if not node:
+        return False
+    def usable(rows):
+        return len(rows) >= 2 and len(rows[0]) >= 12 and len(rows[1]) >= 9
+
+    # Retried once: see zpl_query — a drained GK420d can answer the first query with nothing.
+    hs = _hs_fields(zpl_query(node, "~HS", blocks=3))
+    if not usable(hs):
+        hs = _hs_fields(zpl_query(node, "~HS", blocks=3))
+    if not usable(hs):
+        return False
+
+    def flag(row, i):
+        try:
+            return hs[row][i].strip() not in ("", "0")
+        except IndexError:
+            return False
+
+    paper_out = flag(0, 1)
+    paused = flag(0, 2)
+    under_temp = flag(0, 10)
+    over_temp = flag(0, 11)
+    head_up = flag(1, 2)
+    ribbon_out = flag(1, 3)
+    # 1 = thermal TRANSFER (ribbon fitted and expected); 0 = direct thermal, which has no
+    # ribbon at all. Reporting "ribbon out" on a direct-thermal printer would invent a
+    # consumable that does not exist on the machine.
+    transfer_mode = flag(1, 4)
+
+    reasons = []
+    if head_up:
+        reasons.append("head open")
+    if paper_out:
+        reasons.append("media out")
+    if ribbon_out and transfer_mode:
+        reasons.append("ribbon out")
+    if paused:
+        reasons.append("paused")
+    if over_temp:
+        reasons.append("printhead over temperature")
+    if under_temp:
+        reasons.append("printhead under temperature")
+
+    p["status"] = "stopped" if (head_up or paper_out or paused
+                                or (ribbon_out and transfer_mode)) else "idle"
+    if reasons:
+        p["state_reasons"] = "; ".join(reasons[:4])
+
+    # Supplies, in the SAME RFC 3805 vocabulary the SNMP path uses, because a label printer
+    # measures nothing: it knows media is present or absent and refuses to quantify it. -3 is
+    # exactly that answer, and it already renders as "some remaining" rather than as a broken
+    # sensor. Media OUT is a real measurement of zero, so it is reported as one.
+    supplies = [{
+        "name": "labels",
+        "type": "media",
+        "level": 0 if paper_out else -3,
+        "max_capacity": 1,
+        "pct": 0.0 if paper_out else None,
+        "state": "measured" if paper_out else "some_remaining",
+    }]
+    if transfer_mode:
+        supplies.append({
+            "name": "ribbon",
+            "type": "ribbon",
+            "level": 0 if ribbon_out else -3,
+            "max_capacity": 1,
+            "pct": 0.0 if ribbon_out else None,
+            "state": "measured" if ribbon_out else "some_remaining",
+        })
+    for s in supplies:
+        if s["pct"] is None:
+            del s["pct"]
+    p["supplies"] = supplies
+
+    od = zpl_query(node, "~HQOD").decode("ascii", "replace")
+    if "TOTAL NONRESETTABLE" not in od:
+        od = zpl_query(node, "~HQOD").decode("ascii", "replace")
+    m = re.search(r"TOTAL NONRESETTABLE:\s+(\d+)", od)
+    if m:
+        # The raw meter, in inches, kept exactly as the device gave it. This is the
+        # measurement; `page_count` below is a DERIVED figure and this is what audits it.
+        p["odometer_in"] = int(m.group(1))
+
+    # ── inches of media -> labels printed ────────────────────────────────────
+    #
+    # ~HI answers "<model>-<dpi>dpi,<firmware>,<dots per mm>,<memory>", e.g.
+    # "GK420d-200dpi,V61.17.17Z,8,2104KB". The THIRD field is DOTS PER MILLIMETRE and it is
+    # the one to use: these print at 8 dots/mm = 203.2 dpi and merely round it to "200dpi" in
+    # their own name, so taking the name's number would bend every count by 1.6%.
+    #
+    # ⚠️ THE RESULT IS AN ESTIMATE AND IS ONLY AS GOOD AS THE STOCK IN THE PRINTER NOW.
+    # The odometer covers the machine's whole life; the label length is whatever is loaded
+    # today. Change to shorter labels and the estimate steps up. That is why the raw inches
+    # are stored alongside it rather than thrown away, and why the upsert only ever ratchets
+    # page_count upward.
+    hi = zpl_query(node, "~HI").decode("ascii", "replace")
+    if "dpi," not in hi:
+        hi = zpl_query(node, "~HI").decode("ascii", "replace")
+    dpmm = None
+    mhi = re.search(r"dpi,[^,]*,(\d+),", hi)
+    if mhi:
+        try:
+            dpmm = int(mhi.group(1))
+        except ValueError:
+            dpmm = None
+    try:
+        label_dots = int(hs[0][3])
+    except (IndexError, ValueError):
+        label_dots = 0
+    if p.get("odometer_in") and dpmm and label_dots:
+        label_in = label_dots / float(dpmm * 25.4)
+        # Continuous media reports a length of zero, and anything under a tenth of an inch is
+        # not a label — dividing by either would manufacture a colossal count out of nothing.
+        if label_in >= 0.1:
+            p["page_count"] = int(p["odometer_in"] / label_in)
+    p["discovered_via"] = "cups"
+    return True
+
+
+def usb_identity(queue):
+    """make / model / serial for a usb:// queue, straight off its CUPS device URI.
+
+    `usb://Zebra%20Technologies/ZTC%20GK420d?serial=28J144002037` already carries everything
+    an operator needs to recognise the thing sitting on the bench — and it is the ONLY
+    identity a USB printer has here, because there is nothing to poll: no SNMP, no IPP, no
+    address at all.
+
+    ⛔ AND IT STOPS A VENDOR STRING BEING STORED AS AN ADDRESS. Before this a USB printer
+    reported `address = "Zebra%20Technologies"`. That is not an address: nothing can route to
+    it, no sweep can match it, and any surface keying an action off the address field acts on
+    a make of printer rather than a printer. The field is now left empty, which is the true
+    answer for a device reached over a cable, and the identity goes where identity belongs.
+
+    Percent-decoded because CUPS escapes the 1284 strings into the URI, and a reader should
+    see "Zebra Technologies", not "Zebra%20Technologies".
+    """
+    from urllib.parse import unquote
+
+    uri = cups_queue_uris().get(queue) or ""
+    m = re.match(r"^usb://([^/?#]+)/([^?#]*)(?:\?(.*))?$", uri)
+    if not m:
+        return {}
+    out = {
+        "make": _ipp_clean(unquote(m.group(1)), 60),
+        "model": _ipp_clean(unquote(m.group(2)), 120),
+    }
+    for kv in (m.group(3) or "").split("&"):
+        k, _, v = kv.partition("=")
+        if k.lower() == "serial" and v:
+            out["serial"] = _ipp_clean(unquote(v), 60)
+    return {k: v for k, v in out.items() if v}
+
+
+# Supply kinds too vague to prove two readings describe the same thing. A protocol that
+# answers "other" has not identified the supply, so such a reading must neither suppress a
+# reading that DID identify one nor be suppressed by one.
+GENERIC_SUPPLY = {"", "other", "unknown", "supply"}
+
+
+def merge_supplies(ipp_supplies, snmp_supplies):
+    """Every IPP supply, plus each SNMP supply of a KIND that IPP did not report.
+
+    ⛔ IPP IS NEVER OVERWRITTEN, ONLY EXTENDED — nothing already on a card can move. The
+    match is on the supply TYPE, not the name: the two protocols name one cartridge
+    differently (IPP "BK", SNMP "Black Toner Cartridge") while both normalise the kind into
+    the same RFC 3805 word.
+
+    ⭐ MATCHING BY TYPE IS WHAT GETS A COLOUR PRINTER RIGHT. Measured 2026-08-27 on the
+    DCP-L8410CDW at 10.10.2.161: IPP returns four toners at 80%, SNMP returns those same
+    four as level -3 PLUS a belt at 99.2%, a drum at 98.4% and a waste box. IPP's four
+    suppress SNMP's four as a GROUP — nothing is duplicated — and the three supplies IPP has
+    never heard of are added.
+    """
+    ipp_supplies = list(ipp_supplies or [])
+    snmp_supplies = list(snmp_supplies or [])
+    if not ipp_supplies:
+        # Nothing to protect. 10.10.2.110 is exactly this case: IPP says nothing at all
+        # about it, and SNMP knows it is an HL-L6400DW with a drum at 0%.
+        return snmp_supplies
+
+    def kind(s):
+        return str((s or {}).get("type") or "").strip().lower()
+
+    covered = {kind(s) for s in ipp_supplies} - GENERIC_SUPPLY
+    return ipp_supplies + [s for s in snmp_supplies if kind(s) not in covered]
+
+
+def snmp_read(host, community="public"):
+    """Everything SNMP knows about the printer at `host`, in its OWN dict. None when the
+    tooling is absent or the host does not answer.
+
+    ⛔ RETURNING A DICT INSTEAD OF WRITING INTO THE RECORD IS THE POINT. This was the body of
+    poll_printer(), writing straight into `p` and returning — which made SNMP a REPLACEMENT
+    for the IPP read rather than an addition to it. Reporting separately is what lets the
+    caller state, field by field, which protocol wins.
+    """
     if not have("snmpget"):
-        # No SNMP available: whatever CUPS knows is all we can honestly claim.
-        p["discovered_via"] = "cups"
-        return p
+        return None
 
-    p["discovered_via"] = "snmp"
-    descr = snmp_get(host, community, OID["descr"])
+    # ⚠️ ONE FAST PROBE GATES THE OTHER TEN CALLS. This runs on the SWEEP path too —
+    # discover_printers() calls poll_printer() once per swept host with a printer port open
+    # (7 of them at iPharm, from 506 addresses). At -t 1 -r 0 a silent host costs one second
+    # and a live one costs nothing: measured 2026-08-27, 10.10.2.49 never answers and the
+    # four Brothers answered a six-OID probe in 0.01-0.62s.
+    descr = snmp_get(host, community, OID["descr"], t="1", r="0")
     if descr is None:
-        p["status"] = "unreachable"
-        return p
+        return None
 
-    p["model"] = descr
-    p["make"] = descr.split()[0] if descr else None
-    p["serial"] = snmp_get(host, community, OID["serial"])
+    s = {"model": descr, "make": descr.split()[0] if descr else None}
+    s["serial"] = snmp_get(host, community, OID["serial"])
     pages = snmp_get(host, community, OID["pages"])
     if pages and pages.isdigit():
-        p["page_count"] = int(pages)
+        s["page_count"] = int(pages)
 
     # Parallel arrays joined by index: description, level, max capacity, type.
     descs = snmp_walk(host, community, OID["supply_desc"])
@@ -2013,7 +2603,9 @@ def poll_printer(spec, community="public"):
 
     supplies = []
     # Drive off the LEVEL table: it is the one the printer always populates fully, whereas a
-    # description can be blank (Brother leaves Black's empty).
+    # description can be blank (Brother leaves Black's empty) or simply run out — the
+    # DCP-L8410CDW answers with FIVE descriptions and SEVEN levels, and the belt and the drum
+    # are the two with no description at all.
     for i in range(len(levels)):
         lvl, mx = num(levels, i), num(maxes, i)
         name = (descs[i] if i < len(descs) else "") or f"{SUPPLY_TYPE.get(num(types, i), 'supply')} {i + 1}"
@@ -2035,12 +2627,11 @@ def poll_printer(spec, community="public"):
             entry["pct"] = round(100.0 * lvl / mx, 1)
             entry["state"] = "measured"
         supplies.append(entry)
-    p["supplies"] = supplies
+    s["supplies"] = supplies
 
     # Status comes from hrPrinterStatus + hrPrinterDetectedErrorState, NOT from the alert
     # table. prtAlertDescription carries normal states like "Sleep" as entries, so treating
-    # any alert as a fault reported a healthy sleeping printer as stopped — a false fault on
-    # essentially every printer with power saving on.
+    # any alert as a fault reported a healthy sleeping printer as stopped.
     errors = decode_error_bits(snmp_get(host, community, OID["hr_errors"]))
     hr = snmp_get(host, community, OID["hr_status"])
     try:
@@ -2050,19 +2641,135 @@ def poll_printer(spec, community="public"):
 
     blocking = [e for e in errors if e in BLOCKING]
     if blocking:
-        p["status"] = "stopped"
+        s["status"] = "stopped"
     elif hr_status:
-        p["status"] = hr_status
+        s["status"] = hr_status
     else:
-        p["status"] = "idle"
+        s["status"] = "idle"
 
-    # Reasons are for a human reading the row: real error bits first, then any alert text
-    # that isn't just a normal operating state.
+    # ⚠️ THESE ARE ONLY EVER USED WHEN IPP SAID NOTHING (see the merge below). Brother keeps
+    # MAINTENANCE items in the alert table alongside live faults: measured 2026-08-27,
+    # 192.168.55.16 is idle with NO error bits set and still lists "Replace Fuser", "Replace
+    # Laser" and "Replace PF Kit2" — true enough for a printer at 291,524 pages, and read as
+    # three faults if it were ever allowed past a printer IPP had already described.
     alerts = [a for a in snmp_walk(host, community, OID["alerts"])
               if a and a.strip().lower() not in BENIGN_ALERTS]
     reasons = errors + alerts
     if reasons:
-        p["state_reasons"] = "; ".join(reasons[:4])
+        s["state_reasons"] = "; ".join(reasons[:4])
+    return s
+
+
+def poll_printer(spec, community="public"):
+    """spec is 'name@host' or just 'host'.
+
+    BOTH protocols are asked and their answers are MERGED — the block below says which one
+    wins each field and why. A printer that answers NEITHER is returned with `status` left
+    unset rather than marked unreachable: at a site with two counter Pis only one of them
+    can reach a given device, so a Pi announcing "unreachable" would blank a row the other
+    Pi had just read correctly.
+    """
+    name, _, host = spec.partition("@")
+    if not host:
+        host, name = name, name
+    p = {"name": name, "address": host}
+
+    # A cabled printer is identified and returned here: there is no address to resolve and
+    # nothing on a network to ask, so everything that follows would be wasted on it.
+    usb = usb_identity(name)
+    if usb:
+        p.update(usb)
+        p["address"] = None
+        p["discovered_via"] = "cups"
+        # Seeded so collect_printers() can overwrite it with what CUPS says about the queue,
+        # exactly as it does for an SNMP-polled printer. The queue's state is the only state
+        # anything here knows about a USB device.
+        p["status"] = "idle"
+        return p
+
+    # A CUPS device URI may carry a NAME, not an address. Store what it resolves to, so the
+    # platform holds something it can route to and match a sweep against instead of a string
+    # only this Pi can make sense of. None here means "not a host at all" — a usb:// vendor
+    # string — and is what keeps the network reads below away from USB queues.
+    addr = resolve_host(host)
+    if addr:
+        p["address"] = addr
+
+    # ── the merged read: BOTH protocols are asked, then merged ───────────────
+    #
+    # ⛔ MERGE, NOT SWITCH. This used to be an if/else: when `snmpget` existed SNMP ran and
+    # IPP was never called at all. `snmpget` existed on none of these Pis, so the branch that
+    # actually ran was the IPP one — which means installing net-snmp would, on its own, have
+    # moved every network printer onto the SNMP branch and REPLACED what is on screen.
+    #
+    # On this estate the two protocols know the OPPOSITE things. Measured 2026-08-27 against
+    # every Brother reachable from ipharm-01 (192.168.55.16, HL-L5100DN, shown):
+    #
+    #                     IPP                          SNMP
+    #   serial            absent                       E75331K0N161501
+    #   lifetime pages    absent                       291524   (prtMarkerLifeCount)
+    #   black toner       90%, measured                level -3 / capacity -2
+    #   drum              NOT REPORTED AT ALL          3316 / 50000  =  6.6%
+    #
+    # SNMP WINS serial and page_count: it is the only source for either, and IPP's one
+    # serial-shaped field is the MAC inside `printer-uuid`, which apply_ipp() refuses on
+    # purpose. IPP WINS status and supplies: Brother answers the SNMP supplies table with the
+    # RFC 3805 sentinels, which can only say "some remaining", and taking those would replace
+    # a percentage on screen with a shrug.
+    #
+    # ⚠️ BOTH READS TARGET `addr`, NOT `host`. The SNMP path used to be handed the raw URI
+    # authority, which at iPharm is the mDNS name BRNB4220013EDFD.local — resolvable here
+    # only while nss-mdns is happy. `addr` is the address this function has already resolved
+    # and already stores, so both protocols now ask the same thing in the same place; and a
+    # None `addr` is a usb:// vendor string, which is what keeps every network read off a
+    # cabled printer.
+    ipp_ok = bool(addr) and apply_ipp(p, addr)
+    # ⚠️ GUARDED SEPARATELY. Until net-snmp was installed this parsing had never run in
+    # production on this fleet, and poll_printer() is called from collect_printers() with no
+    # try/except of its own — so one malformed answer from one printer would cost the whole
+    # printer report, on every pass, for every printer at the site. A failed SNMP read must
+    # degrade to the IPP read, which is exactly what today already does.
+    snmp = None
+    if addr:
+        try:
+            snmp = snmp_read(addr, community)
+        except Exception as e:
+            print("vigilant-pi-agent: snmp read failed for %s: %s: %s"
+                  % (addr, type(e).__name__, e), flush=True)
+
+    if snmp:
+        # SNMP alone. IPP has no field for either of these on any printer here.
+        for k in ("serial", "page_count"):
+            if snmp.get(k) is not None:
+                p[k] = snmp[k]
+        # IPP first, SNMP only where IPP said nothing. apply_ipp() has already written its
+        # values into `p`, so "IPP said nothing" is exactly "the key is still absent".
+        for k in ("make", "model", "status", "state_reasons"):
+            if p.get(k) is None and snmp.get(k) is not None:
+                p[k] = snmp[k]
+        # ⭐ A UNION, NOT A CHOICE. Nothing already on a card can move; the drum can only
+        # appear. That matters today: 192.168.55.15 is sitting on a drum at 0% with "Replace
+        # Drum" in its alert table and nothing in Watchman can currently show it.
+        p["supplies"] = merge_supplies(p.get("supplies"), snmp.get("supplies"))
+
+    if ipp_ok or snmp:
+        # apply_ipp() stamps 'ipp' when it characterised the row; if only SNMP answered, SNMP
+        # is what identified it. Both satisfy printers_discovered_via_check — there is no
+        # 'both', and inventing one would fail the insert.
+        p.setdefault("discovered_via", "snmp")
+        return p
+
+    # Nothing answered either way.
+    #
+    # ⛔ DO NOT WRITE status = "unreachable" HERE, however tempting. reportPrinters() reads
+    # `status` as the tell for whether a reporter LOOKED, and a reporter that looked replaces
+    # status, state_reasons AND supplies for every other reporter of the row. At iPharm two
+    # Pis report the same queue names and only one of them can reach a given device — so a Pi
+    # announcing "unreachable" would blank a printer the other Pi had just read correctly.
+    # Leaving `status` unset is what makes the second Pi harmless. It is also what every
+    # counter runs today: the "unreachable" line this replaces only ever executed on a Pi
+    # that had net-snmp, which until now was none of them.
+    p["discovered_via"] = "cups"
     return p
 
 
@@ -2189,12 +2896,24 @@ def discover_printers(known_addresses):
         # than padded with guesses.
         p = poll_printer(f"{ip}@{ip}") or {}
         rec = {
-            "name": p.get("descr") or p.get("model") or ip,
+            # ⛔ THE NAME STAYS THE ADDRESS. `printers` is keyed (pharmacy_id, name), so
+            # naming a discovered row after its model merges two identical printers at one
+            # site into a single row AND orphans the address-named row already there. Now
+            # that IPP fills make/model on nearly every network printer, that rename would
+            # fire constantly instead of never. Identity belongs in make/model, which is
+            # what the UI reads to decide a row is identifiable.
+            "name": ip,
             "address": ip,
-            # 'probe' is honest about the weakest case: a port answered and nothing more is
-            # known. It is NOT called snmp/ipp unless that is actually what identified it.
-            "discovered_via": "snmp" if p.get("page_count") is not None or p.get("descr")
-                              else ("ipp" if 631 in ports else "probe"),
+            # ⛔ TAKE THE LABEL FROM THE READ. The old test keyed off p["descr"], which
+            # poll_printer() has never set — so it could only ever fall through to the port
+            # guess, and an SNMP-identified find was still labelled by which port answered.
+            # poll_printer() now says which protocol characterised the row. 'cups' is not a
+            # possible answer for a swept address (there is no queue), so that falls back to
+            # the guess, and 'probe' stays the honest weakest case: a port answered and
+            # nothing more is known.
+            "discovered_via": (p.get("discovered_via")
+                               if p.get("discovered_via") in ("snmp", "ipp")
+                               else ("ipp" if 631 in ports else "probe")),
             "unconfigured": True,
             "open_ports": ports,
         }
@@ -2230,6 +2949,29 @@ def collect_printers(conf):
         p["queue_depth"] = q.get("queue_depth", 0)
         if q.get("status") and p.get("status") == "idle":
             p["status"] = q["status"]
+        # A cabled printer is asked directly, and its answer outranks the queue: CUPS calls a
+        # queue idle whether or not the printer it points at has its head open.
+        #
+        # ONLY WHEN THE QUEUE IS EMPTY. The status read opens the same device the CUPS
+        # backend prints through, and there is no lock between the two — so it is never done
+        # while there is a label waiting to come out at a counter.
+        if p.get("serial") and not p.get("address") and not p["queue_depth"]:
+            try:
+                usb_device_status(p)
+            except Exception as e:
+                print("vigilant-pi-agent: usb status skipped for %s: %s"
+                      % (p.get("name"), type(e).__name__), flush=True)
+        # USB-CUPS-SUPPLY: a non-Zebra USB printer answers no ZPL, but its driver may have
+        # reported supply levels to the LOCAL CUPS. Read them over IPP against the queue on
+        # 127.0.0.1 -- a read of CUPS, not of the lp node, so it is safe with a job queued and
+        # needs no daemon claiming the USB device (which would fight the print backend). Only when
+        # ZPL left the supplies empty, so a Zebra is never asked a second time.
+        if p.get("serial") and not p.get("address") and not p.get("supplies") and p.get("name"):
+            try:
+                apply_ipp(p, "127.0.0.1", 631, resources=("/printers/%s" % p["name"],))
+            except Exception as e:
+                print("vigilant-pi-agent: cups supply read skipped for %s: %s"
+                      % (p.get("name"), type(e).__name__), flush=True)
         out.append(p)
 
     # Discovery is SEPARATE from polling and much slower, so it runs on its own cadence
@@ -3243,6 +3985,43 @@ ACTIONS = {
 }
 
 
+# A queue points at a LABEL printer when its device URI or its name says Zebra/ZPL/label —
+# usb://Zebra…/ZTC ZD420…ZPL, or a queue called Label-GK420d, or a network ZD via ipp. A plain
+# text page sent to one of these prints a single oversized, useless label; it needs ZPL instead.
+_LABEL_RE = re.compile(r"zebra|zpl|eltron|label|\bz[dgtq]\d|\bg[kx]\d", re.I)
+
+
+def _is_label_queue(queue):
+    try:
+        uri = cups_queue_uris().get(queue, "")
+    except Exception:
+        uri = ""
+    return bool(_LABEL_RE.search(f"{uri} {queue}"))
+
+
+def _test_label(queue):
+    """Send a small ZPL test label — sized to whatever media is loaded, raw so the driver passes
+    it through untouched."""
+    host = socket.gethostname()
+    ts = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+    zpl = (
+        "^XA^CI28"
+        "^FO30,25^A0N,30,30^FDWCN test label^FS"
+        f"^FO30,65^A0N,24,24^FD{host}^FS"
+        f"^FO30,97^A0N,24,24^FDqueue: {queue}^FS"
+        f"^FO30,129^A0N,24,24^FD{ts}^FS"
+        "^FO30,170^A0N,22,22^FDQueue and printer both work.^FS"
+        "^XZ"
+    )
+    try:
+        pr = subprocess.run(["lp", "-d", queue, "-o", "raw", "-t", "vigilant-test"],
+                            input=zpl, capture_output=True, text=True, timeout=25)
+        out = (pr.stdout or pr.stderr or "").strip()
+        print(f"vigilant-pi-agent: test label -> {queue}: {out or 'submitted'}", flush=True)
+    except Exception as e:
+        print(f"vigilant-pi-agent: test label failed: {type(e).__name__}: {e}", flush=True)
+
+
 def test_print(queue):
     """Print a page identifying this counter, so whoever is standing at the printer knows
     which thin client produced it — a blank test page proves the queue works but not which
@@ -3255,6 +4034,9 @@ def test_print(queue):
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", queue or ""):
         print(f"vigilant-pi-agent: refusing malformed print queue {queue!r}", flush=True)
         return
+    # A label printer gets a ZPL label; everything else gets the plain page below.
+    if _is_label_queue(queue):
+        return _test_label(queue)
     body = (
         "Vigilant test print\n"
         "===================\n\n"
@@ -3273,7 +4055,31 @@ def test_print(queue):
         print(f"vigilant-pi-agent: test print failed: {type(e).__name__}: {e}", flush=True)
 
 
-def run_action(name):
+def identify(address, conf):
+    """Poll a printer address on demand and report it, so an unidentified sweep row fills in its
+    make/model/serial (and supplies/page count). Read-only — the same poll the sweep does, just
+    aimed at one address and reported now, which is how 'adopt/identify' turns a bare IP into a
+    known printer. Only the platform cannot reach the pharmacy LAN; this Pi can."""
+    if not conf or not re.fullmatch(r"[A-Za-z0-9_.:%-]+", address or ""):
+        return
+    url, token = conf.get("VIGILANT_URL"), conf.get("VIGILANT_TOKEN")
+    if not (url and token):
+        return
+    try:
+        p = poll_printer(address)
+    except Exception as e:
+        print(f"vigilant-pi-agent: identify poll failed for {address}: {type(e).__name__}", flush=True)
+        return
+    if not p:
+        return
+    try:
+        st, _ = post(url, token, "/printers/report", {"printers": [p]})
+        print(f"vigilant-pi-agent: identify {address} -> {st}", flush=True)
+    except Exception as e:
+        print(f"vigilant-pi-agent: identify report failed for {address}: {type(e).__name__}", flush=True)
+
+
+def run_action(name, conf=None):
     """Carry out a one-shot action the server handed us.
 
     The server has ALREADY cleared it before sending, so this runs at most once per
@@ -3288,6 +4094,10 @@ def run_action(name):
     # being silently truncated into a different queue.
     if name.startswith("test-print:"):
         return test_print(name.split(":", 1)[1])
+    # 'identify:<address>' — go and read what is at that address, now. Parameterised like
+    # test-print; the address is validated inside identify() before it is polled.
+    if name.startswith("identify:"):
+        return identify(name.split(":", 1)[1], conf)
     cmd = ACTIONS.get(name)
     if not cmd:
         print(f"vigilant-pi-agent: ignoring unknown action {name!r}", flush=True)
@@ -4941,7 +5751,7 @@ def tick(conf, do_printers):
         # And deliberately BEFORE the job settle below: takeCounterAction() clears
         # pending_action as it hands it over, so this channel is at-most-once too, and a
         # reboot job that ran first would swallow a queued action outright.
-        run_action(parsed.get("action"))
+        run_action(parsed.get("action"), conf)
         # Its own guard, inside this one: the relay is a convenience, and a malformed session
         # must not cost the tick the interval negotiation below — nor the printer report.
         try:

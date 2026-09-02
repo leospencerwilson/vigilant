@@ -467,6 +467,13 @@ PRINTER_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # never render as a finding. So the script states its own count first, and an answer without
 # that line is reported as an ERROR with no list, never as an empty list.
 _PRINTER_PS = (
+    # ⛔ THE PROGRESS STREAM IS WHY THIS READ RETURNED NOTHING FOR THREE VMs. PowerShell writes a
+    # CLIXML <Obj S="progress"> blob to STDERR on a first-use module load, `qm guest exec` carries
+    # it back inside err-data, and that blob ALONE is about 1KB — which run_local's output bound
+    # then truncated, so the JSON answer was cut mid-string and every VM reported a parse error
+    # while Get-Printer had actually succeeded. Silencing it is the fix; the wider bound below is
+    # the belt to its braces.
+    "$ProgressPreference = 'SilentlyContinue'; "
     "$ErrorActionPreference = 'Stop'; "
     "$p = @(Get-Printer | ForEach-Object { $_.Name }); "
     "Write-Output ('VIGILANT-PRINTERS ' + $p.Count); "
@@ -533,7 +540,9 @@ def vm_printers(node, vmid, local_node):
             "-EncodedCommand", _PRINTER_ENC]
     # A little longer than the guest's own timeout so `qm` gets to report the guest timing out
     # rather than being killed mid-sentence and looking like a broken node.
-    rc, out = run_local(argv, PRINTER_EXEC_TIMEOUT_S + 5)
+    # Enough for the JSON envelope plus PRINTER_LIST_CAP names, not enough to be a memory
+    # question. The list itself is capped after parsing, so this bounds only the read.
+    rc, out = run_local(argv, PRINTER_EXEC_TIMEOUT_S + 5, limit=16000)
     body = (out or "").strip()
     if rc == 127:
         return None, body[:200] or "qm not found on this node"
@@ -692,6 +701,90 @@ def collect_nodes():
     return out
 
 
+# ── VM Windows health: ProScript, its SQL, and the VM-side smartcard service ──
+#
+# ⛔ NAMES DISCOVERED, NOT GUESSED (2026-08-28, on VM 305). The dispensing gate is the
+# `ProScriptConnect Server Service` plus the SQL instance it needs (`MSSQL$<instance>`), and the
+# VM-side smartcard is `SCardSvr`. Guessing a service name would report a running pharmacy as
+# down, so these are read from the live estate and matched by the stable service name (SQL by the
+# `MSSQL$` prefix because the instance suffix varies per site). READ-ONLY: Get-Service only.
+_HEALTH_PS = (
+    "$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='SilentlyContinue'; "
+    "$ps = (Get-Service -Name 'ProScriptConnect Server Service').Status; "
+    "$sql = (Get-Service | Where-Object { $_.Name -like 'MSSQL$*' } | Select-Object -First 1).Status; "
+    "$sc = (Get-Service -Name 'SCardSvr').Status; "
+    "Write-Output ('VIGILANT-HEALTH proscript=' + $ps + ' sql=' + $sql + ' scardsvr=' + $sc)"
+)
+_HEALTH_ENC = base64.b64encode(_HEALTH_PS.encode("utf-16-le")).decode("ascii")
+_HEALTH_RE = re.compile(r"VIGILANT-HEALTH proscript=(\S*) sql=(\S*) scardsvr=(\S*)")
+
+
+def _svc_state(v):
+    """A Windows service status string -> our tri-state. Empty/absent -> 'unknown', never a
+    confident 'stopped', because a service that is not installed and one we could not read are
+    different facts."""
+    t = (v or "").strip().lower()
+    if t in ("running",):
+        return "running"
+    if t in ("stopped", "startpending", "stoppending", "paused"):
+        return "stopped"
+    return "unknown"
+
+
+def vm_windows_health(node, vmid, local_node):
+    """(dict, error). Only for a LOCAL, agent-answering Windows VM — same gate as vm_printers.
+
+    Returns proscript / sql / scardsvr tri-states. `None` dict means not asked (another node,
+    no agent); the columns then stay as they were rather than degrading to a confident value.
+    """
+    if not local_node or node != local_node or not vm_is_local(local_node, int(vmid)):
+        return None, None
+    argv = ["qm", "guest", "exec", str(int(vmid)),
+            "--timeout", str(PRINTER_EXEC_TIMEOUT_S),
+            "--", "powershell.exe", "-NoProfile", "-NonInteractive",
+            "-EncodedCommand", _HEALTH_ENC]
+    rc, out = run_local(argv, PRINTER_EXEC_TIMEOUT_S + 5, limit=16000)
+    body = (out or "").strip()
+    try:
+        answer = json.loads(body)
+    except ValueError:
+        return None, ("qm guest exec exited %s: %s" % (rc, body[:150])).strip()
+    if not isinstance(answer, dict) or not answer.get("exited"):
+        return None, "the guest did not finish"
+    data = answer.get("out-data")
+    if not isinstance(data, str):
+        return None, "the guest returned no output"
+    m = _HEALTH_RE.search(data)
+    if not m:
+        return None, "the guest's answer did not carry the health marker"
+    return {"proscript": _svc_state(m.group(1)), "sql": _svc_state(m.group(2)),
+            "scardsvr": _svc_state(m.group(3))}, None
+
+
+def vm_last_backup(node, vmid):
+    """(epoch_seconds_or_None, error). The end time of this VM's most recent SUCCESSFUL vzdump,
+    from the node's task history. None with no error means no successful backup is on record —
+    which, with the estate's NFS backup stores offline, is the true and important answer."""
+    tasks, err = pvesh("/nodes/%s/tasks" % node, timeout=20,
+                       args=("--typefilter", "vzdump", "--limit", "500"))
+    if err:
+        return None, err
+    if not isinstance(tasks, list):
+        return None, "unexpected task list"
+    best = None
+    want = str(int(vmid))
+    for t in tasks:
+        if t.get("status") != "OK":
+            continue
+        # vzdump task id looks like 'UPID:node:...:vzdump:' with the vmid in the 'id' field.
+        if str(t.get("id") or "") != want:
+            continue
+        end = t.get("endtime")
+        if isinstance(end, (int, float)) and (best is None or end > best):
+            best = int(end)
+    return best, None
+
+
 def collect(probe=True, local_node=None):
     """`local_node` is this node's own validated name, or None.
 
@@ -824,7 +917,19 @@ def collect(probe=True, local_node=None):
         # Report a capacity row only if we ESTABLISHED something. A pass that read neither the
         # RRD nor the guest sends no row at all, so the write path leaves the last good reading
         # — and its timestamp — untouched, rather than stamping "now" onto nothing.
-        if any(x is not None for x in rrd.values()) or disk is not None:
+        vm_health = None
+        if (probe and running and v.get("agent_ok") is True
+                and wants_printer_list(v.get("vlan_tag"), v.get("guest_os"))
+                and time.time() <= deadline):
+            vm_health, _health_err = vm_windows_health(node, vmid, local_node)
+            if vm_health is None and _health_err:
+                vm_health = {"error": _health_err}
+        backup_at = None
+        backup_err = None
+        if wants_printer_list(v.get("vlan_tag"), v.get("guest_os")):
+            backup_at, backup_err = vm_last_backup(node, vmid)
+        if (any(x is not None for x in rrd.values()) or disk is not None
+                or vm_health is not None or backup_at is not None):
             cap = {"vmid": vmid, "node": node, "name": r.get("name"),
                    "cores": r.get("maxcpu"), "mem_max_bytes": r.get("maxmem"),
                    # SENT, not swallowed. The write path only advances sampled_at on a row that
@@ -841,6 +946,14 @@ def collect(probe=True, local_node=None):
                 cap.update({"disk_mount": None, "disk_used_bytes": None,
                             "disk_total_bytes": None, "disk_source": "unknown"})
             # Split out of `v` by main() into the payload's own `capacity` array.
+            if vm_health is not None:
+                cap["proscript"] = vm_health.get("proscript")
+                cap["vm_sql"] = vm_health.get("sql")
+                cap["vm_scardsvr"] = vm_health.get("scardsvr")
+                cap["health_error"] = vm_health.get("error")
+            if backup_at is not None:
+                cap["last_backup_at"] = backup_at
+            cap["backup_error"] = backup_err
             v["capacity"] = cap
         return v
 
@@ -1316,10 +1429,14 @@ def plan_job(job, node, is_local=None):
             "disruptive": spec["disruptive"], "timeout_s": spec["timeout_s"]}, None
 
 
-def run_local(argv, timeout_s):
+def run_local(argv, timeout_s, limit=1000):
     """Run one already-validated argv. Returns (rc, output).
 
     A list, so there is no shell to inject into even if everything above were wrong.
+
+    `limit` bounds the captured output. 1000 suits a job's log line; a caller that has to PARSE
+    what it gets back must pass enough to hold a whole answer, because a truncated JSON document
+    fails as a parse error that reads exactly like the command having failed.
     """
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
@@ -1329,7 +1446,7 @@ def run_local(argv, timeout_s):
         return 124, "timed out after %ds" % timeout_s
     except Exception as e:                                   # noqa: BLE001 - reported, not swallowed
         return 1, "%s: %s" % (type(e).__name__, e)
-    return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()[:1000]
+    return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()[:limit]
 
 
 # ── RUNNING THE BATCH ────────────────────────────────────────────────────────

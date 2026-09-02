@@ -2437,6 +2437,39 @@ async function printerTestPrint(ctx) {
   return json(res, 200, { ok: true, queued: queue });
 }
 
+// POST /printers/adopt (admin) — { pharmacy_id, printer_id, as:'new'|'merge', into_printer_id?,
+// into_device_serial? }. 'new' makes the row its own printer; 'merge' records it as another
+// address-form of one already listed (kept as evidence, never deleted).
+async function printerAdopt(ctx) {
+  const { res, store, log, body } = ctx;
+  const p = parseJsonBody(body);
+  if (!p) return json(res, 400, { ok: false, error: 'bad json' });
+  if (!p.pharmacy_id || !p.printer_id) return json(res, 400, { ok: false, error: 'pharmacy_id and printer_id required' });
+  if (p.as && p.as !== 'new' && p.as !== 'merge') return json(res, 400, { ok: false, error: "as must be 'new' or 'merge'" });
+  const r = await store.adoptPrinter(p.pharmacy_id, {
+    printer_id: p.printer_id,
+    as: p.as || 'new',
+    into_printer_id: p.into_printer_id || null,
+    into_device_serial: p.into_device_serial || null,
+  });
+  if (r && r.error) return json(res, 409, { ok: false, error: r.error });
+  log.warn('pmr: printer adopted', { pharmacy_id: p.pharmacy_id, printer_id: p.printer_id, as: p.as || 'new' });
+  return json(res, 200, { ok: true, ...r });
+}
+
+// POST /printers/identify (admin) — { pharmacy_id, printer_id, counter_id? }. Queues a Pi to read
+// what is at the printer's address; it reports back on its next tick.
+async function printerIdentify(ctx) {
+  const { res, store, log, body } = ctx;
+  const p = parseJsonBody(body);
+  if (!p) return json(res, 400, { ok: false, error: 'bad json' });
+  if (!p.pharmacy_id || !p.printer_id) return json(res, 400, { ok: false, error: 'pharmacy_id and printer_id required' });
+  const r = await store.identifyPrinter(p.pharmacy_id, { printer_id: p.printer_id, counter_id: p.counter_id || null });
+  if (r && r.error) return json(res, 409, { ok: false, error: r.error });
+  log.warn('pmr: printer identify queued', { pharmacy_id: p.pharmacy_id, printer_id: p.printer_id, counter_id: r.counter_id });
+  return json(res, 200, { ok: true, ...r });
+}
+
 // POST /enrol/self  { serial, model?, identity? }   (auth: SELF_ENROL_TOKEN, checked in server.js)
 // A fresh Pi from the base image calls this on first boot to register itself and be issued a
 // per-device token. It lands as an UNCLAIMED counter-pi device (no counter points at it) and
@@ -2527,6 +2560,7 @@ async function piAgentScript(ctx) {
 const TOOLBOX_FILES = {
   'wcn-toolbox':      'text/x-shellscript; charset=utf-8',
   'wcn-toolbox-priv': 'text/x-shellscript; charset=utf-8',
+  'wcn-kiosk':        'text/x-shellscript; charset=utf-8',
 };
 async function piToolboxScript(ctx, which) {
   const { res, device, log } = ctx;
@@ -3254,7 +3288,10 @@ async function printersList(ctx) {
   const { res, store, query } = ctx;
   if (typeof store.listPrinters !== 'function') return json(res, 501, { ok: false, error: 'not supported by this store' });
   const pid = query && query.get('pharmacy_id');
-  return json(res, 200, { ok: true, printers: await store.listPrinters(pid || null) });
+  // The page that owns the parked drawer asks for hidden rows; nothing else has to know they
+  // exist. Same spelling as the 'force' flag elsewhere in this file.
+  const includeHidden = String((query && query.get('include_hidden')) || '') === 'true';
+  return json(res, 200, { ok: true, printers: await store.listPrinters(pid || null, { includeHidden }) });
 }
 
 async function printerUpsert(ctx) {
@@ -3281,11 +3318,45 @@ async function printerDelete(ctx) {
   return json(res, 200, { ok: true, ...r });
 }
 
+// A SIBLING COUNTER PI IS NOT A PRINTER. discover_printers() sweeps the pharmacy LAN and
+// files anything answering a printer port as a row named after its address -- and at a site
+// built the normal way the thing answering 631 on the next desk is ANOTHER COUNTER PI, whose
+// CUPS answers IPP perfectly happily. It then lands in 'printers' as a printer nobody owns.
+//
+// It is masked at iPharm today by an accident: the sweep skips addresses already known from
+// CUPS queues, and each Pi holds a remote queue pointing at the other, so each hides the
+// other from its own sweep. Remove one share, or add a third Pi that shares nothing, and the
+// sibling lands as a printer immediately. This is preventative, not corrective.
+//
+// THE TWO-PART TEST IS THE WHOLE SAFETY OF IT. Filtering on address alone would delete live
+// queues: ipharm-02 legitimately reports Label-GK420d with address 192.168.55.17 because the
+// Zebra is cabled to ipharm-01. Only SWEEP FINDS are eligible, and the sweep sets both tells
+// -- unconfigured:true, and a name that IS the address (agent: "THE NAME STAYS THE ADDRESS").
+// A configured queue sets neither, whatever address it points at.
+//
+// This is the platform doing what cups_queue_roles() says it should: the PLATFORM decides, by
+// matching a host against the addresses of the site's own counters. Applied to the discovery
+// feed rather than to a queue role. No agent change, so not a fleet event.
+//
+// RESIDUAL GAP, deliberately not closed here: counters_v.pi_lan_ip is device_state.raw
+// 'primary_ip' -- the PRIMARY address only. ipharm-01 is dual-homed (eth0 192.168.55.17 stored,
+// wlan0 10.10.2.75 stored nowhere) and sweeps both subnets, so a sibling reached at a
+// non-primary address still slips through. Closing that needs the agent to report all LAN
+// addresses, which is a fleet event; it is not exploitable today (ipharm-02 has only eth0).
+function isSiblingCounterPi(rec, piAddresses) {
+  if (!rec || !piAddresses.size) return false;
+  const addr = String(rec.address == null ? '' : rec.address).trim();
+  if (!addr || !piAddresses.has(addr)) return false;
+  const name = String(rec.name == null ? '' : rec.name).trim();
+  // The sweep sets both. A configured queue sets neither, whatever address it points at.
+  return rec.unconfigured === true || name === addr;
+}
+
 // POST /printers/report — a DEVICE route: the counter Pi posts what it polled on the
 // pharmacy LAN. Authenticated as the device, and the pharmacy is resolved from the
 // counter that owns that Pi, so a Pi can never write printers into another site.
 async function printersReport(ctx) {
-  const { res, store, device, body } = ctx;
+  const { res, store, device, body, log } = ctx;
   if (!device) return json(res, 401, { ok: false, error: 'unauthorized' });
   const p = parseJsonBody(body);
   if (!p) return json(res, 400, { ok: false, error: 'bad json' });
@@ -3293,7 +3364,23 @@ async function printersReport(ctx) {
   const counters = await store.listCounters();
   const mine = (counters || []).find((c) => c.pi_device_id === device.id);
   if (!mine) return json(res, 409, { ok: false, error: 'this device is not linked to a counter, so its pharmacy is unknown' });
-  return json(res, 200, { ok: true, ...(await store.reportPrinters(device.id, mine.pharmacy_id, p.printers)) });
+  // The whole counter list is already loaded to find 'mine'; the rest of it is what says
+  // which addresses at this site are Pis rather than printers. It was being thrown away.
+  const site = String(mine.pharmacy_id);
+  const piAddresses = new Set(
+    (counters || [])
+      .filter((c) => c && String(c.pharmacy_id) === site && c.pi_lan_ip)
+      .map((c) => String(c.pi_lan_ip).trim())
+      .filter(Boolean)
+  );
+  const kept = p.printers.filter((rec) => !isSiblingCounterPi(rec, piAddresses));
+  if (log && kept.length !== p.printers.length) {
+    log.info('printers: dropped sibling counter Pi sweep hits', {
+      serial: device.serial, pharmacy_id: mine.pharmacy_id,
+      dropped: p.printers.length - kept.length,
+    });
+  }
+  return json(res, 200, { ok: true, ...(await store.reportPrinters(device.id, mine.pharmacy_id, kept)) });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5650,6 +5737,12 @@ function cleanCapacityRow(r) {
     // this away, which is what made a permanently broken RRD path indistinguishable from a quiet
     // VM. The store writes it unconditionally, so a repaired path clears it.
     rrd_error: text(r.rrd_error),
+    proscript: (r.proscript === 'running' || r.proscript === 'stopped' || r.proscript === 'unknown') ? r.proscript : null,
+    vm_sql: (r.vm_sql === 'running' || r.vm_sql === 'stopped' || r.vm_sql === 'unknown') ? r.vm_sql : null,
+    vm_scardsvr: (r.vm_scardsvr === 'running' || r.vm_scardsvr === 'stopped' || r.vm_scardsvr === 'unknown') ? r.vm_scardsvr : null,
+    health_error: text(r.health_error),
+    last_backup_at: (Number.isFinite(Number(r.last_backup_at)) && Number(r.last_backup_at) > 0) ? Number(r.last_backup_at) : null,
+    backup_error: text(r.backup_error),
   };
   for (const k of CAPACITY_NUMERIC_FIELDS) {
     const n = Number(r[k]);
@@ -6714,6 +6807,8 @@ module.exports = {
   counterUpdate,
   lanPrinters,
   printerTestPrint,
+  printerAdopt,
+  printerIdentify,
   piAgentScript,
   piToolboxScript,
   postScreen,

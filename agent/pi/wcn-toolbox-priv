@@ -463,6 +463,29 @@ import hashlib, os, shutil, subprocess, sys, urllib.request
 FILES = [
     ("/agent/pi-toolbox",      "/usr/local/bin/wcn-toolbox",       0o755),
     ("/agent/pi-toolbox-priv", "/usr/local/sbin/wcn-toolbox-priv", 0o700),
+    # ⛔ THE KIOSK BELONGS HERE TOO, and it not being here is why the PC/SC shim was lost
+    # estate-wide: the launcher was the ONE script that could only be changed by hand, so a
+    # hand-applied fix on a Pi had nothing to survive in. Replacing this file does NOT disturb a
+    # live session — the running bash holds its own inode, so a new file takes effect at the next
+    # launch, which is the nightly restart. Same sha check and `bash -n` gate as the other two.
+    # ⛔ THE ORDER THIS DEPENDED ON, RECORDED BECAUSE IT IS THE WHOLE RISK.
+    # Enabled 2026-08-26 ONLY once a validated printers.tab was live on both counters. Before
+    # that, the replacement launcher would have found no table and no .prev, fallen to rung 2
+    # (lpstat — queue NAMES, no drivers), and FreeRDP would have redirected every label printer
+    # driverless: Windows Easy Print, which RASTERISES. Unreadable labels at a dispensing
+    # counter. If this line is ever re-enabled on a fresh site, the table goes first.
+    # The kiosk currently on the iPharm Pis emits its /printer: flags WITH Windows driver names
+    # ("ZDesigner ZD420-203dpi ZPL", "Brother HL-L5100DN series"). The replacement is
+    # site-agnostic by design and takes its set from printers.tab; neither Pi has one, and
+    # neither has printers.tab.prev, so it would land on fallback rung 2 — lpstat, which knows
+    # queue NAMES and no drivers. FreeRDP would then redirect every label printer with no driver,
+    # Windows would fall back to Easy Print, and Easy Print RASTERISES: unreadable labels at a
+    # dispensing counter, which is the exact failure §2 of the printer contract exists to prevent.
+    #
+    # ORDER MATTERS: promote a printers.tab carrying real driver names to both counters FIRST,
+    # then enable this line. Publishing the launcher before its data is what turns a correct
+    # refactor into an outage.
+    ("/agent/pi-kiosk",        "/usr/local/bin/wcn-kiosk",          0o755),
 ]
 conf = {}
 for path in sys.argv[1:]:

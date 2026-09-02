@@ -44,6 +44,17 @@
 #
 # Credentials: /etc/wcn-rdp.creds (root 0640). FreeRDP masks the password in `ps`.
 set -u
+# ⛔ THE PC/SC SHIM, AND IT HAS TO LIVE IN THIS FILE. FreeRDP resolves libpcsclite at RUNTIME, and
+# the system-wide /usr/lib/aarch64-linux-gnu/libpcsclite.so.1 is a DIFFERENT build from the one NHS
+# smartcard login needs. Without this line xfreerdp3 loads the wrong library and the card reader
+# stops working inside the session — a clinical outage, at every counter, on the same day.
+#
+# It has never been in this file: it was hand-applied on the Pis, which is why regenerating the
+# script on 2026-08-25 lost it estate-wide. It stayed INVISIBLE because the long-running parent
+# bash still carried the env, so every relaunched session inherited it; it fires on the next full
+# reboot, when this file is re-read from disk. The value is the one proven on the running process
+# at iPharm on 2026-08-26.
+export LD_LIBRARY_PATH=/usr/local/lib/wcn-pcsc
 . /etc/wcn-rdp.creds
 
 # Which VM this counter boots into is chosen in Watchman and pushed here by the Vigilant

@@ -651,15 +651,6 @@ SELECT v.pharmacy_id, v.vmid, v.ip, COALESCE(v.label, 'attached'),
  WHERE v.vmid IS DISTINCT FROM p.srv_vmid
    AND NOT EXISTS (SELECT 1 FROM counters c WHERE c.pharmacy_id = v.pharmacy_id AND c.vmid = v.vmid);
 
--- 'probe' provenance: the Pi found something listening on a printer port during a LAN
--- sweep but could not identify it. Deliberately distinct from snmp/ipp, which mean the
--- device actually answered a printer protocol.
-DO $$ BEGIN
-  ALTER TABLE printers DROP CONSTRAINT IF EXISTS printers_discovered_via_check;
-  ALTER TABLE printers ADD CONSTRAINT printers_discovered_via_check
-    CHECK (discovered_via IN ('snmp', 'ipp', 'cups', 'manual', 'probe'));
-END $$;
-
 -- ── observed WireGuard peer state on the hub (VM 300) ────────────────────────
 -- Kept separate from `counters` so live telemetry never overwrites intended
 -- configuration, and so a peer that is connected but NOT registered still shows
@@ -965,6 +956,66 @@ CREATE TABLE IF NOT EXISTS printers (
     UNIQUE (pharmacy_id, name)
 );
 CREATE INDEX IF NOT EXISTS printers_pharmacy_idx ON printers (pharmacy_id);
+-- The raw media meter off a label printer's own back-channel, in INCHES, exactly as
+-- the device reported it (Zebra ~HQOD 'TOTAL NONRESETTABLE'). page_count carries the
+-- LABEL count derived from it, which depends on the stock loaded at the time; this is
+-- the measurement that derivation is audited against, so it is kept separately rather
+-- than recomputed.
+ALTER TABLE printers ADD COLUMN IF NOT EXISTS odometer_in bigint;
+
+-- 'probe' provenance: the Pi found something listening on a printer port during a LAN
+-- sweep but could not identify it. Deliberately distinct from snmp/ipp, which mean the
+-- device actually answered a printer protocol.
+DO $$ BEGIN
+  ALTER TABLE printers DROP CONSTRAINT IF EXISTS printers_discovered_via_check;
+  ALTER TABLE printers ADD CONSTRAINT printers_discovered_via_check
+    CHECK (discovered_via IN ('snmp', 'ipp', 'cups', 'manual', 'probe'));
+END $$;
+
+-- ── the soft-hide, for rows the discovery feed has stopped mentioning ────────
+-- A CUPS queue that is renamed creates a NEW row and orphans the old one, because rows are
+-- keyed by (pharmacy_id, name). Nothing aged those orphans out, so at iPharm 13 dead rows
+-- became the bulk of what the printing page showed and were eventually deleted by hand.
+--
+-- SOFT, not a delete. The row is kept forever and stays one click away in the page's parked
+-- drawer, because "we stopped hearing about this" is not proof the printer is gone, and a
+-- delete cannot be undone by the person who finds out it was.
+--
+-- hidden_at IS NOT A JUDGEMENT ABOUT THE PRINTER. It says the row's NAME left the feed.
+-- printers.last_seen_at is set by reportPrinters for every name in a Pi's batch whether or
+-- not that Pi could read the device, so it means "still in some Pi's report" -- which is
+-- exactly the signal a reaper wants, and exactly why a site whose Pi has died drifts stale
+-- as one block. The sweep in store.pg.js therefore refuses to hide anything at a site whose
+-- feed is not currently moving. See hideStalePrinters() for that gate.
+--
+-- Cleared by BOTH write paths: reportPrinters (the name is back in the feed) and
+-- upsertPrinter (a human saved the row). Neither COALESCEs it -- see the note in
+-- reportPrinters about why this one column must not follow its neighbours.
+ALTER TABLE printers ADD COLUMN IF NOT EXISTS hidden_at     timestamptz;
+ALTER TABLE printers ADD COLUMN IF NOT EXISTS hidden_reason text;
+
+-- WF-037: a DHCP-stable hardware id for a NETWORK printer -- the NIC MAC the agent lifts out
+-- of `printer-uuid` (a Brother printer-uuid ends in its MAC). It is NOT a serial and is never
+-- shown as one; it is the identity that survives a DHCP re-address, which the IP does not.
+-- COALESCEd in reportPrinters (first non-null wins), like `serial`, so a reporter that could
+-- not read it never blanks one that could.
+ALTER TABLE printers ADD COLUMN IF NOT EXISTS hw_id text;
+
+-- Adopt/merge: when set, this printer row is another address-form of the printer whose id it
+-- holds (printers.id, a bigint) -- kept as discovery evidence, not standing as its own device.
+-- An earlier build created this column as uuid by mistake; correct the type in place. The DROP
+-- fires ONLY while it is the wrong type (and the column is empty then), so re-runs are no-ops
+-- and never wipe a real merge.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema = 'vigilant' AND table_name = 'printers'
+               AND column_name = 'merged_into' AND data_type = 'uuid') THEN
+    ALTER TABLE printers DROP COLUMN merged_into;
+  END IF;
+END $$;
+ALTER TABLE printers ADD COLUMN IF NOT EXISTS merged_into bigint;
+
 
 DROP TRIGGER IF EXISTS printers_touch ON printers;
 CREATE TRIGGER printers_touch BEFORE UPDATE ON printers
@@ -1001,6 +1052,135 @@ SELECT pr.*,
   FROM printers pr
   JOIN pharmacies ph ON ph.id = pr.pharmacy_id
   LEFT JOIN counters c ON c.id = pr.counter_id;
+
+-- ── printer_reports: what ONE Pi saw, per queue ──────────────────────────
+-- 'printers' above is UNIQUE (pharmacy_id, name) -- ONE ROW PER PHYSICAL PRINTER -- and it
+-- stays that way. This is the other half of the same report: the part that is true of ONE
+-- PI and not of the site.
+--
+-- WHY IT HAD TO EXIST. A queue name is unique on ONE PI, not across a site (contract 1),
+-- and the estate's normal pattern is every Pi holding every queue: at iPharm both counters
+-- hold all seven names, counter 8 with the GK420d and ZD420 on cables and the ZD421 over
+-- ipp://192.168.55.18, counter 9 the mirror image. Fourteen observations collapsed into
+-- seven rows and reported_by was whichever Pi posted last -- so printers_v resolved ALL
+-- SEVEN to counter 9 (host_counter_id = COALESCE(counter_id, the reporter's counter), and
+-- counter_id is NULL on every discovery row). Counter 8 rendered as a thin client with no
+-- printers while holding two of them on cables.
+--
+-- ONE COUNTER OWNS ONE ROW. That is the whole design and everything else follows from
+-- it -- see the write path, where every observed column is replaced wholesale and NONE of
+-- the guards on 'printers' are repeated. Those guards are the right rule for a row with two
+-- writers and the wrong rule for a row with one.
+--
+-- NOT AN IDENTITY TABLE. Identity is settled twice already -- pmr_printer_devices holds
+-- the physical device and 'printers' holds the site-wide row. So make, model,
+-- page_count and odometer_in are deliberately ABSENT: a lifetime meter belongs to the
+-- printer, 'printers' already ratchets it with GREATEST across every reporter, and a
+-- per-counter copy would be two meters for one printer that somebody eventually sums.
+--
+-- NO CHECK CONSTRAINTS ON queue OR discovered_via, AND THAT IS DELIBERATE TWICE OVER.
+-- (a) The parent INSERT runs first in the SAME transaction, so a value this table would
+--     have refused has already aborted the whole report. A CHECK here would be a second
+--     owner of a rule 'printers' already owns.
+-- (b) pmr_printer_queues' name CHECK is enforced against INTENT -- "a name the kiosk
+--     would reject must never be storable". Observation is the opposite duty: the queue you
+--     most need to see is the one that will break. This table records what IS.
+CREATE TABLE IF NOT EXISTS printer_reports (
+    id             bigserial   PRIMARY KEY,
+    pharmacy_id    bigint      NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    -- The Pi that is speaking, as a counter. NOT NULL: a report that cannot be attributed to
+    -- a counter is not written at all (the route already 409s an unlinked device).
+    counter_id     bigint      NOT NULL REFERENCES counters(id) ON DELETE CASCADE,
+    -- The CUPS queue name as THIS Pi holds it. Joins to printers on (pharmacy_id, queue) =
+    -- (pharmacy_id, name) -- the key the parent is unique on, and the same key
+    -- pmr_printer_assignments and pmr_printer_queues address a queue by.
+    queue          text        NOT NULL,
+    -- The device behind the counter, kept alongside counter_id rather than derived from it:
+    -- a counter re-linked to a different Pi would otherwise silently re-attribute every
+    -- observation the old Pi made.
+    reported_by    uuid        REFERENCES devices(id) ON DELETE SET NULL,
+    -- ── what THIS Pi saw ──
+    -- address + serial ARE THE LOCAL/REMOTE DISCRIMINATOR, and they are the pair that
+    -- produced the oscillation the printers upsert now guards against. poll_printer() reads a
+    -- usb:// queue straight off its CUPS device URI and sets serial WITH NO ADDRESS (a cabled
+    -- printer HAS no address); a Pi holding the same queue over ipp:// resolves the host --
+    -- which at this estate is THE OTHER PI -- and reports that as the address. Both readings
+    -- are true of their own Pi and neither belongs in a shared row.
+    address        text,
+    serial         text,
+    discovered_via text,
+    status         text,
+    state_reasons  text,
+    supplies       jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    -- THESE TWO ARE A SPOOLER'S, NOT A PRINTER'S. queue_depth and jobs_failed come from
+    -- THIS Pi's CUPS and describe THIS Pi's spool directory. They are the columns the shared
+    -- row could never hold correctly -- the upsert on 'printers' still takes them from
+    -- whichever Pi posted last, because there is no honest way to merge them.
+    queue_depth    int,
+    jobs_failed    int,
+    -- When this Pi was first seen holding this queue. A queue appearing on a Pi nobody staged
+    -- it on is drift, and drift is worth dating. Never updated after insert.
+    first_seen_at  timestamptz NOT NULL DEFAULT now(),
+    last_seen_at   timestamptz NOT NULL DEFAULT now(),
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    -- Contract 1: "A queue name is unique ON ONE PI, not across a site."
+    UNIQUE (counter_id, queue)
+);
+-- Serves the join back to the parent, which is BY NAME and not by id.
+CREATE INDEX IF NOT EXISTS printer_reports_site_queue_idx ON printer_reports (pharmacy_id, queue);
+DROP TRIGGER IF EXISTS printer_reports_touch ON printer_reports;
+CREATE TRIGGER printer_reports_touch BEFORE UPDATE ON printer_reports
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- ── the derived reading, in ONE place ──────────────────────────────────
+-- DROP then CREATE, not CREATE OR REPLACE, for the reason printers_v carries above: the view
+-- is SELECT r.*, so its column list is fixed at creation and a REPLACE may only APPEND.
+-- NO CASCADE, ON PURPOSE -- same as printers_v. Nothing in this repository depends on this
+-- view; a view built on it outside the repo must make this DROP fail loudly rather than be
+-- silently deleted.
+--
+-- 'via' IS DERIVED HERE AND NOT SHIPPED BY THE AGENT, and that is a deliberate trade. The Pi
+-- computes the same answer in cups_queue_roles(), but it only ever reaches the server inside
+-- peripherals.printer_queue_roles, CAPPED AT 6 -- and iPharm has 7 queues, so one is truncated
+-- away on both Pis today. Getting it onto /printers/report means changing the agent, which is
+-- a FLEET EVENT on live dispensing counters. The derivation below needs no agent change and
+-- is exact on today's data; if the agent ever ships 'via' directly, this CASE is what it
+-- replaces.
+--
+-- 'remote' MEANS THE PATH, NEVER THE DEVICE. A Pi reaching a queue over ipp:// resolves the
+-- host to ANOTHER PI and then reads THAT PI'S CUPS -- so a remote row's status/supplies
+-- describe the route, not the printer, and read_ok on such a row means only "something
+-- answered". Only a 'local-usb' or 'network' row may speak for the hardware.
+DROP VIEW IF EXISTS printer_reports_v;
+CREATE VIEW printer_reports_v AS
+SELECT r.*,
+       c.n     AS counter_n,
+       c.label AS counter_label,
+       -- Did this Pi read anything at all on its last pass? 'status' is the tell, and it is
+       -- the SAME tell the printers upsert uses: every path that reads a printer sets it and
+       -- a path that could not reach the device leaves it null. One predicate, one owner.
+       (r.status IS NOT NULL)                                    AS read_ok,
+       -- 15 minutes, matching printers_v, because printer polling is deliberately infrequent.
+       (r.last_seen_at < now() - interval '15 minutes')          AS stale,
+       CASE WHEN r.serial IS NOT NULL AND r.address IS NULL THEN 'local-usb'
+            WHEN r.address IS NULL                          THEN 'unknown'
+            WHEN h.id IS NOT NULL                           THEN 'remote'
+            ELSE 'network' END                                   AS via,
+       h.id                                                      AS via_counter_id
+  FROM printer_reports r
+  JOIN counters c ON c.id = r.counter_id
+  -- The host Pi, when the address this Pi resolved is ANOTHER COUNTER AT THIS SITE. No match
+  -- falls through to 'network', which is the honest answer rather than a guess.
+  LEFT JOIN LATERAL (
+      SELECT hc.id
+        FROM counters hc
+        JOIN device_state ds ON ds.device_id = hc.pi_device_id
+       WHERE hc.pharmacy_id = r.pharmacy_id
+         AND hc.id <> r.counter_id
+         AND ds.raw ->> 'primary_ip' = r.address
+       LIMIT 1
+  ) h ON true;
 
 -- ── discovered Proxmox VMs ───────────────────────────────────────────────────
 -- Observed cluster inventory, so a pharmacy's VMIDs and hostnames stop being hand-typed.
@@ -1112,6 +1292,12 @@ CREATE TABLE IF NOT EXISTS pmr_vm_capacity (
 -- now only advances on a pass that actually carried an RRD reading, and this says why when it
 -- did not.
 ALTER TABLE pmr_vm_capacity ADD COLUMN IF NOT EXISTS rrd_error text;
+ALTER TABLE pmr_vm_capacity ADD COLUMN IF NOT EXISTS proscript      text;
+ALTER TABLE pmr_vm_capacity ADD COLUMN IF NOT EXISTS vm_sql         text;
+ALTER TABLE pmr_vm_capacity ADD COLUMN IF NOT EXISTS vm_scardsvr    text;
+ALTER TABLE pmr_vm_capacity ADD COLUMN IF NOT EXISTS health_error   text;
+ALTER TABLE pmr_vm_capacity ADD COLUMN IF NOT EXISTS last_backup_at timestamptz;
+ALTER TABLE pmr_vm_capacity ADD COLUMN IF NOT EXISTS backup_error   text;
 
 -- Our own disk history, because Proxmox keeps none (see above). One row per VM per mountpoint
 -- per collection tick; the 1d/7d/30d columns on pmr_vm_capacity are AVGs over this table.
@@ -2798,7 +2984,15 @@ SELECT pr.*,
        COALESCE(pr.counter_id, rc.id)                AS host_counter_id,
        a.vmids                                       AS assigned_vmids,
        a.set_by                                      AS assigned_by,
-       a.set_at                                      AS assigned_at
+       a.set_at                                      AS assigned_at,
+       -- EVERY counter whose Pi reports holding this queue, not just the last one to post.
+       -- host_counter_id above resolves to ONE counter via reported_by, which is last-writer-
+       -- wins: at iPharm it named counter 9 for all seven printers while counter 8 held two
+       -- of them on cables. NULL here is not "no thin client" -- a LAN-sweep row has no
+       -- reports and never will, which identified() already separates.
+       (SELECT array_agg(rr.counter_id ORDER BY rr.counter_id)
+          FROM printer_reports rr
+         WHERE rr.pharmacy_id = pr.pharmacy_id AND rr.queue = pr.name) AS held_by_counter_ids
   FROM printers pr
   JOIN pharmacies ph ON ph.id = pr.pharmacy_id
   LEFT JOIN counters c  ON c.id = pr.counter_id
