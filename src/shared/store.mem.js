@@ -364,6 +364,33 @@ function makeMemStore(_config) {
     if (intervalS != null) d.poll_interval_s = intervalS;
   }
 
+  // ── wake (instant delivery) ────────────────────────────────────────────────
+  // Parity with store.pg so the e2e tests exercise the same contract. See the pg
+  // implementation for why this is a counter and not a signal.
+  async function bumpDeviceWake(deviceId) {
+    const d = devices.get(deviceId);
+    if (!d) return null;
+    d.wake_seq = Number(d.wake_seq || 0) + 1;
+    return d.wake_seq;
+  }
+
+  async function getDeviceWake(deviceId) {
+    const d = devices.get(deviceId);
+    return d ? Number(d.wake_seq || 0) : null;
+  }
+
+  // Parity with store.pg — see there for why this MERGES raw instead of replacing it, and why
+  // a device with no state row is a false return rather than a seeded one.
+  async function mergeDeviceStateRaw(deviceId, patch) {
+    const prev = deviceState.get(deviceId);
+    if (!prev) return false;
+    prev.raw = { ...(prev.raw || {}), ...(patch || {}) };
+    prev.status = 'online';
+    prev.last_seen_at = iso();
+    deviceState.set(deviceId, prev);
+    return true;
+  }
+
   // ── config jobs ────────────────────────────────────────────────────────────
   /** True if a job targets this device directly, or via one of the device's tags. */
   function jobTargetsDevice(job, deviceId) {
@@ -1101,6 +1128,9 @@ function makeMemStore(_config) {
     appendInterfaceHistory,
     appendLteHistory,
     setPollWindow,
+    bumpDeviceWake,
+    getDeviceWake,
+    mergeDeviceStateRaw,
     getPendingConfigJob,
     getConfigJobForFetch,
     getConfirmedJob,

@@ -3318,6 +3318,12 @@ def build_payload(conf):
         # else by fails schema validation and takes the WHOLE telemetry POST down with it, so a
         # new field gets a name nothing can already have claimed.
         "relay_session": relay_status(),
+        # Whether the server can reach this counter instantly (see the wake channel above).
+        "wake": wake_status(),
+        # WHICH agent this Pi is actually running. Absent it, a Pi on an old agent and a Pi
+        # on a new one with a dead worker are indistinguishable — which cost three wrong
+        # diagnoses during the wake-channel rollout. Twelve hex is plenty to match a deploy.
+        "agent_sha": (_sha256_file(AGENT_PATH) or "")[:12],
         # Whether this counter is sharing its screen, and the per-session password Vigilant needs
         # to sign a viewer token. Reported only while genuinely live.
         "support_vnc": support_vnc_status(),
@@ -4929,6 +4935,100 @@ def support_vnc_stop(reason="closed", expired=False):
         print("vigilant-pi-agent: support screen sharing stopped (%s)" % reason, flush=True)
 
 
+# Ceiling for the wait below. HIGHER than the 2s the old flat sleep spent, deliberately: hitting
+# it is not a failure any more, so a generous ceiling costs a slow start nothing and saves a fast
+# one everything.
+SUPPORT_VNC_START_TIMEOUT_S = 4.0
+SUPPORT_VNC_START_POLL_S = 0.1
+
+# /proc/net/tcp state code for TCP_LISTEN, and how /proc prints an IPv4 address: little-endian
+# hex, so 127.0.0.1 is "0100007F".
+_TCP_LISTEN = "0A"
+
+
+def _proc_hex_ip(host):
+    """An IPv4 address in the little-endian hex form /proc/net/tcp prints, or "" if unparseable."""
+    try:
+        parts = [int(x) for x in str(host).split("/")[0].strip().split(".")]
+    except (ValueError, AttributeError):
+        return ""
+    if len(parts) != 4 or any(p < 0 or p > 255 for p in parts):
+        return ""
+    return "".join("%02X" % p for p in reversed(parts))
+
+
+def _support_listening(host):
+    """Is the support server's own listening socket up yet?
+
+    ⛔ NOT a connect(). An earlier attempt dialled the port to test it, which is unsafe: x11vnc
+    serves a bounded number of clients, the unit file is not in this repo so its argument list
+    cannot be checked from here, and a probe that opens and drops a connection could consume the
+    very slot the engineer is about to use. Reading kernel state cannot disturb the server at all.
+
+    ⛔ NOT a bare port check either. These Pis run an UNRELATED x11vnc on loopback (see
+    support_vnc_running), so a LISTEN on 5900 is not by itself ours. The ADDRESS is what
+    distinguishes them — the same distinction support_vnc_running() makes by unit name. Loopback
+    therefore does NOT count; the tunnel address does, and so does a wildcard bind.
+
+    ⛔ And NOT a fork. Polling anything that spawns a subprocess starved the unit it was waiting
+    for on a single-core Pi and made this three times worse — see the note in _support_start.
+    """
+    want_ip = _proc_hex_ip(host)
+    if not want_ip:
+        return False
+    want_port = "%04X" % SUPPORT_VNC_PORT
+    try:
+        with open("/proc/net/tcp", "r") as fh:
+            fh.readline()                      # header
+            for line in fh:
+                f = line.split()
+                if len(f) < 4 or f[3] != _TCP_LISTEN:
+                    continue
+                ip, _sep, port = f[1].rpartition(":")
+                if port.upper() != want_port:
+                    continue
+                # Ours on the tunnel address, or a wildcard bind. Never loopback.
+                if ip.upper() in (want_ip, "00000000"):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+# The viewer password an operator reads off Watchman and types into the noVNC prompt.
+#
+# ⛔ NOT base64url any more. It was `urlsafe_b64encode(urandom(6))[:8]`, whose alphabet carries
+# "-" and "_" as well as l/I/O/0/1. Watchman now sets the value out ONE CHARACTER PER BLOCK, and
+# an underscore alone in a box reads as an EMPTY box — so characters that were merely awkward in a
+# run of text became characters that get skipped or mistyped, on a password typed into a second
+# window while somebody waits.
+#
+# 56 characters: alphanumerics minus l o I O 0 1. That is ~46 bits over 8 characters against ~48
+# before, and x11vnc derives its DES key from the first 8 bytes whatever we send — so the change
+# costs nothing real and removes a whole class of "the password does not work".
+SUPPORT_VNC_PASS_ALPHABET = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+SUPPORT_VNC_PASS_LEN = 8
+
+
+def _support_password():
+    """A password that survives being read off one screen and typed into another.
+
+    ⚠️ Rejection sampling, not a bare modulo. 256 % 56 is 32, so `byte % 56` would make the first
+    32 characters of the alphabet measurably likelier than the last 24. `secrets` is not imported
+    in this file and os.urandom is, so the rejection is done by hand rather than by adding one.
+    """
+    alpha = SUPPORT_VNC_PASS_ALPHABET
+    limit = 256 - (256 % len(alpha))          # 224: bytes at or above this are discarded
+    out = []
+    while len(out) < SUPPORT_VNC_PASS_LEN:
+        for b in os.urandom(SUPPORT_VNC_PASS_LEN * 2):
+            if b < limit:
+                out.append(alpha[b % len(alpha)])
+                if len(out) == SUPPORT_VNC_PASS_LEN:
+                    break
+    return "".join(out)
+
+
 def _support_start(minutes, wg_ip):
     """Start x11vnc on the live display for `minutes`, bound to the tunnel address only.
 
@@ -4940,7 +5040,7 @@ def _support_start(minutes, wg_ip):
     # EIGHT characters. VNC auth derives its DES key from the first 8 bytes and discards the
     # rest, so a longer secret is not stronger — it is just a password whose tail is a lie.
     # urandom+base64 rather than the secrets module: both are already imported.
-    password = base64.urlsafe_b64encode(os.urandom(6)).decode().rstrip("=")[:8]
+    password = _support_password()
     try:
         rc = subprocess.call(["x11vnc", "-storepasswd", password, SUPPORT_VNC_PASS],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -4960,7 +5060,27 @@ def _support_start(minutes, wg_ip):
     # VERIFY, do not assume. An earlier version logged "started" from the fact that spawning
     # returned without raising, and reported success for two minutes while the server was in
     # fact dying instantly. If the unit is not active, say so.
-    time.sleep(2)
+    #
+    # ⛔ DO NOT POLL `systemctl is-active` HERE. Tried 2026-09-11: calling support_vnc_running()
+    # every 100ms FORKS ten times a second, and on a single-core Pi 3 also running the kiosk, X
+    # and an RDP session it competed with the very unit it was waiting for — activation slipped
+    # past the ceiling, the start was failed, and the session was left to a later ordinary tick.
+    # Measured on two live counters: 3.0s -> 18.4s and 4.5s -> 15.5s. It was reverted.
+    #
+    # ⭐ So wait on the LISTENING SOCKET instead, read from /proc/net/tcp. No fork, and no
+    # connection either — see _support_listening for why dialling the port is not safe. Two
+    # things make this safe where the subprocess poll was not:
+    #   * the ceiling is a BREAK, not a failure. A start that is slow still succeeds, because
+    #     the single check below decides — timing out here is not itself an error. Failing on
+    #     the ceiling is precisely what turned a 3s wait into an 18s one.
+    #   * `systemctl is-active` remains the AUTHORITY and is asked exactly ONCE. A port that
+    #     accepts is not proof the unit is healthy, and the unit being active is what the rest
+    #     of this file reasons about.
+    deadline = time.monotonic() + SUPPORT_VNC_START_TIMEOUT_S
+    while not _support_listening(wg_ip):
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(SUPPORT_VNC_START_POLL_S)
     if not support_vnc_running():
         print("vigilant-pi-agent: support screen sharing FAILED to start "
               "(journalctl -u %s)" % SUPPORT_VNC_UNIT, flush=True)
@@ -5055,6 +5175,207 @@ def support_vnc_status():
 #     an unbounded pool on a single-core device that also has a pharmacy counter to run.
 #   * redirects are NOT followed and proxy_base is ignored, both of which would otherwise be
 #     ways to move the Pi's requests (and its bearer token) somewhere else entirely.
+
+# ── wake channel ────────────────────────────────────────────────────────────
+#
+# WHY THIS EXISTS. Everything an operator does to this counter arrives on the telemetry tick.
+# The server's fast-poll window already drags that from 30s down to MIN_POLL_S (3s), and 3s is a
+# FLOOR rather than a setting — it is the thundering-herd guard that exists because the router
+# fleet once saturated the ingest. So "make the support button instant" cannot be answered with a
+# smaller interval; it needs the server to be able to reach us, and this is that channel.
+#
+# Same shape as the relay above — one long poll, plain HTTP, device-initiated — for the same
+# reasons: Cloudflare fronts Vigilant, nothing may assume a WebSocket survives it, and a
+# pharmacy Pi must never listen for inbound connections.
+#
+# ONE worker, not eight. The relay pool is sized for a browser pulling a dozen subresources at
+# once; this carries a single bit ("something changed, tick now"), so a second poll would only
+# add a second held connection per Pi to the ingest for nothing.
+WAKE_POLL_TIMEOUT_S = 35        # the server holds /wake for 25s — tunnel slack, then reconnect
+WAKE_MAX_ERRORS = 6             # then stop and let the next agent restart try again
+WAKE_ERROR_BACKOFF_S = 5
+# A tick floor for the wake path. Without it a server returning 200 in a loop turns a
+# single-core device that also has a pharmacy counter to run into a hot tick loop. 1s rather
+# than MIN_POLL_S because the herd guard is about the whole fleet polling continuously, whereas
+# a wake is one operator's click — bounded by how fast a human can press a button.
+WAKE_MIN_GAP_S = 1.0
+
+# Set by the worker, waited on by the main loop in place of a plain sleep.
+WAKE_EVENT = threading.Event()
+WAKE_STOP = threading.Event()
+
+# Reported in telemetry so ADOPTION IS OBSERVABLE. Without this there is no way to tell a Pi
+# still on the old agent from one on the new agent whose worker has died — both simply tick at
+# the ordinary cadence, and "did the deploy land" becomes guesswork. Mirrors how relay_session
+# and support_vnc already report themselves.
+WAKE_STATE = {"running": False, "seq": 0, "woken": 0, "last_status": None,
+              "pending_settings": None}
+
+
+def wake_status():
+    """Whether this counter's wake channel is up, and how often it has been used."""
+    return {
+        "running": bool(WAKE_STATE["running"]),
+        "seq": int(WAKE_STATE["seq"]),
+        "woken": int(WAKE_STATE["woken"]),
+        "last_status": WAKE_STATE["last_status"],
+    }
+
+
+def _wake_poll(url, token, serial, seq):
+    """Hold a GET open on /devices/:serial/wake until our wake_seq moves past `seq`.
+
+    Returns (status, seq_or_None). The status is RETURNED, not raised: 204 (nothing happened,
+    reconnect) is the normal case, and 404/501 mean an ingest that predates this route — which
+    is a reason to go quiet, not an error to retry.
+    """
+    q = f"/devices/{urllib.parse.quote(str(serial))}/wake?seq={int(seq)}"
+    req = urllib.request.Request(
+        url.rstrip("/") + q,
+        headers={"Authorization": f"Bearer {token}", "User-Agent": AGENT_UA},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=WAKE_POLL_TIMEOUT_S) as r:
+            body = r.read(4096)
+            if r.status == 204:
+                # The seq rides a header on the empty reply, so a reconnecting agent resyncs
+                # without needing a wake to happen first.
+                hdr = r.headers.get("x-wake-seq")
+                return 204, (int(hdr) if str(hdr or "").strip().isdigit() else None), None
+            try:
+                j = json.loads(body)
+                return r.status, int(j.get("seq")), j.get("settings")
+            except Exception:
+                return r.status, None, None
+    except urllib.error.HTTPError as e:
+        try:
+            e.read()
+        except Exception:
+            pass
+        return e.code, None, None
+
+
+def _wake_worker(url, token, serial):
+    """The standing long-poll. Never raises: a wake channel that falls over must cost the
+    counter nothing, and telemetry is on another thread entirely."""
+    seq = 0
+    errors = 0
+    WAKE_STATE["running"] = True
+    while not WAKE_STOP.is_set():
+        try:
+            status, got, settings = _wake_poll(url, token, serial, seq)
+        except Exception as e:
+            errors += 1
+            if errors >= WAKE_MAX_ERRORS:
+                print(f"vigilant-pi-agent: wake channel giving up after {errors} failures "
+                      f"({explain_failure(e)})", flush=True)
+                return
+            WAKE_STOP.wait(WAKE_ERROR_BACKOFF_S)
+            continue
+
+        WAKE_STATE["last_status"] = status
+        if status == 200:
+            errors = 0
+            WAKE_STATE["woken"] += 1
+            if got is not None:
+                seq = got
+            else:
+                # A 200 we cannot parse must still advance, or the same wake is answered
+                # forever and this becomes the hot loop WAKE_MIN_GAP_S is guarding against.
+                seq += 1
+            WAKE_STATE["seq"] = seq
+            # Handed to the MAIN thread rather than applied here: support_vnc_tick() and the
+            # kiosk are the main loop's to touch, and a worker thread racing it on a live
+            # pharmacy counter is not a trade worth making for a few hundred milliseconds.
+            if settings:
+                WAKE_STATE["pending_settings"] = settings
+            print("vigilant-pi-agent: woken by the server — acting now", flush=True)
+            WAKE_EVENT.set()
+            continue
+
+        if status == 204:
+            errors = 0
+            if got is not None:
+                seq = got
+            WAKE_STATE["seq"] = seq
+            continue        # nothing queued — reconnect at once, that IS the design
+
+        if status in (404, 501):
+            # An ingest without this route (or a store that does not support it). Going quiet is
+            # correct: the fast-poll window still applies, so the operator waits ~3s instead of
+            # ~0, and nothing hammers a server that cannot answer.
+            print(f"vigilant-pi-agent: wake channel unavailable (HTTP {status}) — "
+                  f"falling back to the poll cadence", flush=True)
+            return
+
+        if status in (401, 403):
+            print(f"vigilant-pi-agent: wake channel refused (HTTP {status})", flush=True)
+            return
+
+        errors += 1
+        if errors >= WAKE_MAX_ERRORS:
+            print(f"vigilant-pi-agent: wake channel giving up after {errors} "
+                  f"failures (last HTTP {status})", flush=True)
+            return
+        WAKE_STOP.wait(WAKE_ERROR_BACKOFF_S)
+
+
+def wake_start(conf):
+    """Start the wake worker once, if this device has a token to poll with."""
+    url = (conf.get("VIGILANT_URL") or "").strip()
+    token = (conf.get("VIGILANT_TOKEN") or "").strip()
+    serial = (conf.get("VIGILANT_SERIAL") or "").strip() or pi_serial()
+    if not url or not token or not serial:
+        return False
+    threading.Thread(target=_wake_worker, args=(url, token, serial),
+                     daemon=True, name="wake").start()
+    return True
+
+
+# How long the acknowledgement may take before we stop waiting for it. Short on purpose: this
+# runs on the main thread, immediately before the woken tick, and a slow ingest must delay the
+# telemetry pass by seconds at most. The tick that follows reports the same state anyway, so a
+# timed-out ack costs latency on one click and nothing else.
+WAKE_ACK_TIMEOUT_S = 6
+
+
+def wake_ack(conf):
+    """Tell the server we have ACTED, without collecting a payload.
+
+    ⭐ This is the second half of "instant". The wake brings the directive in and
+    support_vnc_tick() has already started (or stopped) the screen share by the time this runs —
+    but Watchman does not open the viewer until the DEVICE reports the session is up, and that
+    report used to mean a full build_payload: ~10 s of shell-outs on a Pi 3, on top of the wait.
+
+    So this sends the two blocks that answer "did it work" and nothing else. It is deliberately
+    NOT a telemetry POST: /telemetry writes device_state.raw wholesale, so a partial payload sent
+    that way would blank the logs, printers and wifi that the last real tick stored. The ack route
+    merges instead.
+
+    Never raises. A counter whose acknowledgement fails must still tick normally, and the worst
+    case is exactly the behaviour we had before this existed — the operator waits for the tick.
+    """
+    url = (conf.get("VIGILANT_URL") or "").strip()
+    token = (conf.get("VIGILANT_TOKEN") or "").strip()
+    serial = (conf.get("VIGILANT_SERIAL") or "").strip() or pi_serial()
+    if not url or not token or not serial:
+        return
+    try:
+        body = {"support_vnc": support_vnc_status(), "wake": wake_status()}
+        path = f"/devices/{urllib.parse.quote(str(serial))}/ack"
+        status, reply = post(url, token, path, body, timeout=WAKE_ACK_TIMEOUT_S)
+        # 501/404 mean an ingest that predates this route. Say so once at the level that gets
+        # read, and carry on: the woken tick below still reports the session, just later.
+        if status in (404, 501):
+            print(f"vigilant-pi-agent: ack unavailable (HTTP {status}) — "
+                  f"the woken tick will report instead", flush=True)
+        else:
+            print(f"ack {status} {reply[:200]}", flush=True)
+    except Exception as e:
+        print("vigilant-pi-agent: ack failed (harmless): " + explain_failure(e),
+              file=sys.stderr, flush=True)
+
 
 # Ports a session may target. The only ones a printer or phone admin UI is on in this estate,
 # and the narrowness IS the control: this exists to reach a web UI, not to reach whatever else
@@ -5887,6 +6208,16 @@ def main():
 
     n = 0
     printer_pass = 0
+    # ⛔ INITIALISED BEFORE THE LOOP, not inside it: the wake wait at the bottom reads tick_at,
+    # so a wake arriving during the FIRST interval would raise NameError and take the agent
+    # down — on a device whose job is running a pharmacy counter.
+    tick_at = time.monotonic()
+    # The standing wake channel. Deliberately not fatal: a device that cannot open it simply
+    # falls back to the poll cadence (the operator waits ~3s instead of ~0), which is exactly
+    # the behaviour before this existed.
+    if not wake_start(conf):
+        print("vigilant-pi-agent: no wake channel (no url/token/serial) — poll cadence only", flush=True)
+    woken_pass = False
     while True:
         # Re-read per pass rather than per process: a cadence pushed from Watchman has to
         # apply live, which is the whole point of it being an agent setting and not a session
@@ -5895,6 +6226,21 @@ def main():
         printer_every = RUNTIME["printer_every"]
         discover_every = RUNTIME["discover_every"]
         do_printers = printer_every > 0 and (n % printer_every == 0)
+        # ⭐ A WOKEN PASS IS A LIGHT PASS — this is what makes the click actually instant.
+        #
+        # MEASURED, not assumed: this counter reports every ~25s against a 10s interval, so the
+        # tick itself costs ~15s (SNMP printer polling, LAN discovery, log collection, the
+        # screenshot upload). support_vnc_tick() runs AFTER the payload is collected, so a wake
+        # that kicked off a FULL tick still made the operator sit through all of it — mean 9.0s
+        # to act, against ~12.5s unwoken. The wake had removed the waiting but not the working.
+        #
+        # So a woken pass collects only what is needed to LEARN the directive and act on it: no
+        # printers, no discovery, no logs, no screenshot. The POST is small, the reply carries
+        # the settings, and support_vnc_tick() runs seconds later instead of tens of seconds.
+        # The next ORDINARY pass does the full job, so nothing is lost — only reordered.
+        deferred_printers = woken_pass and do_printers
+        if woken_pass:
+            do_printers = False
         if do_printers:
             conf["_discover"] = discover_every > 0 and (printer_pass % discover_every == 0)
             # Opt-in, and only on the slow pass: an update check every 30s is pointless load.
@@ -5910,14 +6256,15 @@ def main():
         # so clicking a thin client almost always showed nothing. The two have no reason to
         # share a cadence: this is a few KB of filtered text, whereas the printer pass hammers
         # SNMP on print servers old enough to wedge under it.
-        conf["_logs"] = True
+        # A woken pass skips them: it exists to be quick, and the next ordinary tick sends them.
+        conf["_logs"] = not woken_pass
         got = tick_guarded(conf, do_printers=do_printers)
         # Screen thumbnail, AFTER the telemetry tick and on its own upload. Separate from the
         # payload on purpose: an image inside telemetry would be stored in device_state.raw,
         # which is written wholesale every tick. 0 disables it outright — the setting a site
         # that has not agreed to screen capture must be able to rely on.
         shot_every = RUNTIME.get("screenshot_every", 0)
-        if shot_every > 0 and (n % shot_every == 0) and conf.get("VIGILANT_TOKEN"):
+        if shot_every > 0 and (n % shot_every == 0) and conf.get("VIGILANT_TOKEN") and not woken_pass:
             send_screen(conf)
         # EVERY tick, not on a multiple: this both starts a session an operator has just asked
         # for and ENDS one whose time is up, and a counter that keeps sharing its screen for
@@ -5933,8 +6280,49 @@ def main():
             # Keep what we report as in force honest, including when the interval came from
             # the fleet-wide poll_interval_s rather than from this device's settings.
             RUNTIME["report_interval_s"] = interval
-        n += 1
-        time.sleep(interval)
+        # A deferred printer pass runs on the VERY NEXT tick rather than slipping a whole
+        # printer_every (~4 min) behind, so a burst of operator clicks cannot starve the
+        # printer feed.
+        if not deferred_printers:
+            n += 1
+        # ── the wait ────────────────────────────────────────────────────────────────────────
+        # WAKE_EVENT in place of time.sleep(): the server can end this wait the instant an
+        # operator clicks, instead of the click landing on the next tick. Everything below the
+        # wait behaves exactly as it did when this was a sleep — a wake just makes it happen
+        # sooner.
+        #
+        # WAKE_MIN_GAP_S is the floor: a wake that arrives immediately after a tick still costs
+        # a moment, so a server answering 200 in a loop cannot spin this thread on a single-core
+        # device that is also running a pharmacy counter.
+        woken = WAKE_EVENT.wait(interval)
+        woken_pass = bool(woken)
+        if woken:
+            # ⭐ ACT FIRST, REPORT AFTER. The directive arrived on the wake itself, so apply it
+            # and start (or stop) the screen share before collecting a single reading — the
+            # collection is the ~10s this whole exercise exists to get out of the way.
+            pend = WAKE_STATE.get("pending_settings")
+            if pend:
+                WAKE_STATE["pending_settings"] = None
+                try:
+                    apply_settings(pend)
+                    support_vnc_tick()
+                except Exception as e:
+                    print("vigilant-pi-agent: acting on the wake failed: "
+                          + explain_failure(e), file=sys.stderr, flush=True)
+                # ⭐ AND THIS IS THE "REPORT AFTER" HALF. Acting was already instant; what was
+                # not was the operator finding out. Watchman opens the viewer only when the
+                # DEVICE says the session is up, so without this line the click still waited
+                # for the woken tick's payload collection underneath.
+                #
+                # OUTSIDE the try above on purpose: if applying the settings went wrong, the
+                # state we ended in is exactly what the operator most needs to see. wake_ack
+                # never raises, so it cannot cost this pass its tick either way.
+                wake_ack(conf)
+            WAKE_EVENT.clear()
+            gap = time.monotonic() - tick_at
+            if gap < WAKE_MIN_GAP_S:
+                time.sleep(WAKE_MIN_GAP_S - gap)
+        tick_at = time.monotonic()
 
 
 if __name__ == "__main__":

@@ -390,6 +390,21 @@ CREATE INDEX IF NOT EXISTS devices_kind_idx ON devices (kind);
 -- It is served only through the ingest API's device-detail endpoint, masked by default.
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS pppoe_password text;
 
+-- ── wake_seq — the instant-delivery counter ──────────────────────────────────
+-- Bumped whenever an operator does something the device should act on NOW (opening a support
+-- session, for a start) rather than on its next ordinary tick. A device parks a long-poll on
+-- GET /devices/:serial/wake?seq=N; the server answers the moment this number moves past N.
+--
+-- WHY A COUNTER AND NOT JUST A SIGNAL: a bare notification fired while the Pi is between polls
+-- (reconnect, a dropped tunnel, a restart) is lost, and the operator is back to waiting for the
+-- next tick — which is the whole fault this exists to remove. Because the agent sends the last
+-- seq it saw, a wake that happened while it was away is still pending on its very next poll.
+-- Monotonic, never reset; wrap is not a concern at bigint.
+--
+-- NOT added to the GRANT SELECT column list below on purpose: this is ingest↔agent plumbing and
+-- the dashboard has no use for it.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS wake_seq bigint NOT NULL DEFAULT 0;
+
 -- ── pharmacies ───────────────────────────────────────────────────────────────
 -- ADDRESSING IS DERIVED-BY-DEFAULT, and OVERRIDABLE. From systems/pmr-vpn/network-design.md,
 -- a pharmacy index N gives: vlan 100+N, subnet 10.200.N.0/<prefix>, gateway 10.200.N.1,

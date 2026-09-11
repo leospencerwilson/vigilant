@@ -2964,6 +2964,14 @@ async function counterSupportStart(ctx) {
     const secs = starting ? checked.value.support_vnc_min * 60 + 60 : 60;
     await store.setPollWindow(counter.pi_device_id, new Date(Date.now() + secs * 1000).toISOString(), null);
   }
+  //   3. and WAKE the device, so it acts on all of the above NOW rather than on its next tick.
+  // The two steps above shrink the wait to MIN_POLL_S (3s); this removes it. Bumped for a STOP
+  // as well as a START — an operator revoking access is entitled to the screen going dark
+  // immediately, which is the same argument the agent makes for tearing the session down on the
+  // tick it hears rather than the next one.
+  if (typeof store.bumpDeviceWake === 'function') {
+    await store.bumpDeviceWake(counter.pi_device_id);
+  }
 
   const by = typeof p.by === 'string' && p.by.trim() ? p.by.trim() : 'watchman';
   // Audited BEFORE the session can possibly be live, so a crash between here and the viewer
@@ -6328,6 +6336,37 @@ function compareIpish(a, b) {
 // against inventory the site itself reported, and every hop is an ordinary HTTP request this
 // server can see, log and refuse.
 
+// ── wake channel (instant operator→device delivery) ─────────────────────────
+//
+// THE PROBLEM. Everything an operator does to a thin client — opening a support session above
+// all — is delivered on the device's next telemetry tick. The fast-poll window (poll_until +
+// config.fastPollS) already takes that from 30 s down to MIN_POLL_S = 3 s, and 3 s is a FLOOR,
+// not a tuning knob: it is the thundering-herd guard that exists because the router fleet once
+// saturated the ingest. You cannot poll your way to instant.
+//
+// THE FIX. The device parks a long-poll here and the server answers the moment the operator
+// clicks; the agent then runs its settings tick immediately instead of sleeping out the
+// remainder of its interval. Same reverse-channel shape as the relay's GET /next, which has
+// been carrying browser traffic through these Pis for weeks — no inbound connectivity, nothing
+// that assumes a WebSocket survives Cloudflare, and the device keeps the initiative.
+//
+// WHY IT POLLS THE DB WHILE HOLDING, rather than resolving an in-process promise: the ingest
+// forks N workers over one shared socket (src/ingest/cluster.js, which warns in as many words
+// that the ingest must hold no singleton state). The operator's POST and this held GET land on
+// different workers as a matter of routine, so an in-memory registry would pass every test and
+// then never fire in production. Postgres is the only thing both workers share.
+//
+// ⚠️ SIZING — READ BEFORE THE FLEET GROWS. One held request per enrolled counter Pi, each
+// polling one indexed primary-key row. At the current THREE Pis (RX54554 + iPharm x2) that is
+// ~6 queries/s, i.e. noise beside the telemetry write load. It stays sane into the low
+// hundreds; at the ~700 Pis a full 348-site rollout implies it does NOT, and the answer then is
+// LISTEN/NOTIFY (one listening connection per worker, no polling at all) rather than a longer
+// WAKE_POLL_MS. Revisit at ~150 Pis.
+const WAKE_HOLD_MS = 25000;      // same 25 s as the relay: under every timeout in the path
+const WAKE_POLL_MS = 250;        // a click landing within a quarter second reads as instant
+const WAKE_MAX_HOLDS = 2;        // per process, per device — one worker plus a torn-down retry
+const wakeHolds = new Map();
+
 // 10 minutes: long enough to read a toner page or change a phone's dial plan, short enough that
 // a forgotten browser tab is not a standing hole into a pharmacy LAN.
 const RELAY_TTL_S = 600;
@@ -6523,6 +6562,142 @@ async function relayLoadSession(ctx, { requireLive }) {
 // GET /relay/:session_id/next  (device bearer)
 // Held open up to RELAY_NEXT_HOLD_MS waiting for a browser request. 200 with work, 204 to
 // reconnect, 410 when the session is over.
+// GET /devices/:serial/wake?seq=N   (device token)
+//
+// Held open up to WAKE_HOLD_MS. 200 the instant this device's wake_seq moves past the caller's
+// N, 204 on timeout so the agent reconnects. The seq is what makes a wake that fired while the
+// Pi was reconnecting still land on its next poll instead of being lost.
+async function deviceWake(ctx) {
+  const { req, res, store, device } = ctx;
+  if (typeof store.getDeviceWake !== 'function') {
+    // An older store: say so rather than hold a connection open forever pretending.
+    return json(res, 501, { ok: false, error: 'wake channel not supported by this store' });
+  }
+
+  // The URL says which serial, but the BEARER says who you are. A valid token for device B
+  // must not be able to watch device A — the same rule relayNext enforces on its session.
+  const wanted = String((ctx.params && ctx.params.serial) || '').trim();
+  if (wanted && device.serial && wanted !== device.serial) {
+    return json(res, 403, { ok: false, error: 'not your device' });
+  }
+
+  const held = wakeHolds.get(device.id) || 0;
+  if (held >= WAKE_MAX_HOLDS) {
+    return json(res, 429, { ok: false, error: 'too many concurrent wake holds for this device' });
+  }
+  wakeHolds.set(device.id, held + 1);
+
+  // If the agent walks away mid-hold, stop querying for it.
+  let gone = false;
+  const onClose = () => { gone = true; };
+  req.on('close', onClose);
+
+  try {
+    // ctx.query is URLSearchParams, not a plain object — `.seq` would be silently undefined,
+    // every poll would look like "no history", and the first wake would fire on connect.
+    const raw = Number(ctx.query && typeof ctx.query.get === 'function' ? ctx.query.get('seq') : NaN);
+    // A missing or junk seq means "I have no history" — treat as 0 rather than 400, so a
+    // freshly installed agent still gets woken on its very first poll.
+    const since = Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 0;
+    const deadline = Date.now() + WAKE_HOLD_MS;
+
+    for (;;) {
+      const seq = await store.getDeviceWake(device.id);
+      if (seq === null) return json(res, 404, { ok: false, error: 'device not found' });
+      if (seq > since) {
+        // wake: settings ride the 200, so the agent can ACT without a telemetry POST.
+        //
+        // ⭐ THIS IS WHAT MAKES THE CLICK INSTANT, and it was measured the hard way. Waking the
+        // agent only removed the WAITING; it still had to build a telemetry payload to learn
+        // what to do, and on a Pi 3 that costs ~10s (uptime, cpu, disk, temp, route,
+        // interfaces, wireguard, throttling, CUPS, smartcard — a shell-out apiece). Carrying
+        // the directive here takes the whole payload collection off the critical path: the Pi
+        // applies the settings and starts sharing its screen straight away, and its next
+        // ordinary tick reports state as usual.
+        let settings = null;
+        if (device.kind === 'counter-pi' && typeof store.getCounterSettingsForDevice === 'function') {
+          try {
+            const row = await store.getCounterSettingsForDevice(device.id);
+            if (row) settings = effectiveCounterSettings(row.settings);
+          } catch { settings = null; }   // never fail the wake over the extra read
+        }
+        return json(res, 200, { ok: true, seq, settings });
+      }
+      if (gone) return undefined;                 // client hung up; nothing to answer
+      if (Date.now() >= deadline) {
+        // 204 with no body — a 204 that carries one is malformed. `seq` rides the header so a
+        // reconnecting agent can resync without a wake having to happen first.
+        res.setHeader('x-wake-seq', String(seq));
+        res.writeHead(204);
+        return res.end();
+      }
+      await sleep(WAKE_POLL_MS);
+    }
+  } finally {
+    req.removeListener('close', onClose);
+    const n = (wakeHolds.get(device.id) || 1) - 1;
+    if (n <= 0) wakeHolds.delete(device.id);
+    else wakeHolds.set(device.id, n);
+  }
+}
+
+// POST /devices/:serial/ack   (device bearer)
+//
+// ⭐ THE SECOND HALF OF "INSTANT". The wake channel carries the directive TO the Pi in
+// milliseconds and the Pi acts on it at once — but the operator does not learn the screen share
+// is live until the DEVICE says so (counterSupportStart deliberately returns no viewer URL, so
+// Watchman never claims a session that is not really up). That acknowledgement used to ride the
+// next telemetry tick, which on a Pi 3 costs ~10 s of collection on top of the wait. So the
+// outbound leg was instant and the round trip still was not.
+//
+// This route is that acknowledgement, and NOTHING else. It carries no readings, starts no work
+// and cannot report a snapshot.
+//
+// ⛔ WHITELISTED, not "the body". A device may state its own session and channel status and may
+// not write anything else into device_state.raw: the raw blob is read by the UI and by the alert
+// rules, so an open merge here would let one compromised counter's payload set any key it liked.
+const ACK_KEYS = ['support_vnc', 'wake'];
+
+async function deviceAck(ctx) {
+  const { res, store, body, device, log } = ctx;
+  if (typeof store.mergeDeviceStateRaw !== 'function') {
+    // An older store. 501 is what the agent already treats as "this ingest predates the
+    // channel — go quiet", so an agent ahead of its server degrades to the poll cadence
+    // instead of retrying a route that cannot answer.
+    return json(res, 501, { ok: false, error: 'ack not supported by this store' });
+  }
+
+  // The URL says which serial, the BEARER says who you are. Same rule as deviceWake.
+  const wanted = String((ctx.params && ctx.params.serial) || '').trim();
+  if (wanted && device.serial && wanted !== device.serial) {
+    return json(res, 403, { ok: false, error: 'not your device' });
+  }
+
+  // ctx.body is the raw STRING from readBody, as everywhere else in this file — parseJsonBody
+  // returns null on junk rather than throwing, so a malformed ack is a 400 and never a 500.
+  const b = parseJsonBody(body);
+  if (!b || typeof b !== 'object') return json(res, 400, { ok: false, error: 'bad json' });
+  const patch = {};
+  for (const k of ACK_KEYS) {
+    if (b[k] !== undefined) patch[k] = b[k];
+  }
+  // An empty ack is a no-op, not an error: an agent that woke for a settings change with no
+  // session to report has nothing to say here, and should not be taught to treat that as a
+  // failure worth retrying.
+  if (!Object.keys(patch).length) {
+    return json(res, 200, { ok: true, applied: false, reason: 'nothing to merge' });
+  }
+
+  const applied = await store.mergeDeviceStateRaw(device.id, patch);
+  // applied:false means this device has no device_state row yet, i.e. it has never completed a
+  // telemetry tick. Not an error — see the store comment. Logged at debug because on a healthy
+  // fleet it should never happen, and if it starts happening that is worth being able to see.
+  if (!applied && log && typeof log.debug === 'function') {
+    log.debug('ack: no device_state row yet', { device: device.id, serial: device.serial });
+  }
+  return json(res, 200, { ok: true, applied, keys: Object.keys(patch) });
+}
+
 async function relayNext(ctx) {
   const { req, res, store, log, device } = ctx;
   const s = await relayLoadSession(ctx, { requireLive: true });
@@ -6784,6 +6959,8 @@ function writeRelayResponse(ctx, session, reply) {
 module.exports = {
   siteDevices,
   relaySessionCreate,
+  deviceWake,
+  deviceAck,
   relayNext,
   relayReply,
   relayProxy,

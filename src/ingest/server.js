@@ -1153,6 +1153,41 @@ function createServer({ store, config: cfg }) {
         ctx.body = await readBody(req);
         return await handlers.relaySessionCreate(ctx);
       }
+
+      // ── wake channel ─────────────────────────────────────────────
+      // GET /devices/:serial/wake?seq=N — device long-poll, held ~25s. Answers the instant an
+      // operator action bumps this device's wake_seq, so a click lands now instead of on the
+      // device's next tick. Device bearer, like the relay routes below.
+      const mWake = /^\/devices\/([^/]+)\/wake$/.exec(pathname);
+      if (method === 'GET' && mWake) {
+        const dev = await authDevice(req, store);
+        if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
+        ctx.device = dev;
+        ctx.params = { serial: decodeURIComponent(mWake[1]) };
+        return await handlers.deviceWake(ctx);
+      }
+
+      // POST /devices/:serial/ack — the woken counter's acknowledgement, and nothing else.
+      // A few bytes saying "the screen share is up", so the operator stops waiting for a full
+      // telemetry payload to find that out. Device bearer, like the wake above.
+      //
+      // ⛔ The body is bounded HERE rather than in readBody, which is shared and unbounded for
+      // every other route. An ack is tens of bytes by design, so anything larger is either a
+      // bug or an attempt to make a 1 GB counter's ingest worker hold a body for it.
+      const mAck = /^\/devices\/([^/]+)\/ack$/.exec(pathname);
+      if (method === 'POST' && mAck) {
+        const dev = await authDevice(req, store);
+        if (!dev) return json(res, 401, { ok: false, error: 'unauthorized' });
+        const len = Number(req.headers['content-length'] || 0);
+        if (Number.isFinite(len) && len > 4096) {
+          return json(res, 413, { ok: false, error: 'ack too large' });
+        }
+        ctx.device = dev;
+        ctx.params = { serial: decodeURIComponent(mAck[1]) };
+        ctx.body = await readBody(req);
+        return await handlers.deviceAck(ctx);
+      }
+
       // DEVICE routes — the Pi's own bearer, not an operator's token.
       const mRelayNext = /^\/relay\/([^/]+)\/next$/.exec(pathname);
       if (method === 'GET' && mRelayNext) {

@@ -889,6 +889,56 @@ function makePgStore(poolOrConfig) {
     );
   }
 
+  // ── wake (instant delivery) ────────────────────────────────────────────────
+  // Bump the device's wake counter so a parked long-poll returns AT ONCE instead of the
+  // operator waiting for the next telemetry tick. Returns the new value.
+  //
+  // The UPDATE is the whole mechanism — there is no in-process registry, deliberately. The
+  // ingest forks N workers that share the listening socket (src/ingest/cluster.js), so the
+  // operator's POST and the device's held GET routinely land on DIFFERENT workers; an
+  // in-memory map would look right in testing and silently never fire in production.
+  async function bumpDeviceWake(deviceId) {
+    const row = await one(
+      `UPDATE devices SET wake_seq = wake_seq + 1 WHERE id = $1 RETURNING wake_seq`,
+      [deviceId]
+    );
+    return row ? Number(row.wake_seq) : null;
+  }
+
+  async function getDeviceWake(deviceId) {
+    const row = await one(`SELECT wake_seq FROM devices WHERE id = $1`, [deviceId]);
+    return row ? Number(row.wake_seq) : null;
+  }
+
+  // ── the woken acknowledgement ─────────────────────────────────────────────
+  // MERGE a few device-reported keys into device_state.raw, and touch nothing else.
+  //
+  // ⛔ WHY THIS IS NOT upsertDeviceState. That one writes `raw = EXCLUDED.raw` — wholesale,
+  // and correctly, because an ordinary telemetry tick IS the whole snapshot. A woken counter
+  // must be able to say "the screen share is up" WITHOUT collecting a snapshot first, because
+  // that collection is the ~10 s on a Pi 3 this whole channel exists to get off the critical
+  // path. A payload carrying only support_vnc through the ordinary path would therefore blank
+  // logs, printers, wifi and every other key the last real tick stored.
+  //
+  // So: jsonb ||, for the same reason setCounterSettings uses it.
+  //
+  // UPDATE rather than an upsert, deliberately. A device with no device_state row has never
+  // reported, so it cannot have a support session to acknowledge, and seeding a row here would
+  // fabricate an 'online' device out of an empty snapshot. Zero rows is an answer, not an
+  // error: the caller reports applied:false and the next ordinary tick creates the row.
+  async function mergeDeviceStateRaw(deviceId, patch) {
+    const row = await one(
+      `UPDATE device_state
+          SET raw          = COALESCE(raw, '{}'::jsonb) || $2::jsonb,
+              last_seen_at = now(),
+              status       = 'online'
+        WHERE device_id = $1
+        RETURNING device_id`,
+      [deviceId, JSON.stringify(patch || {})],
+    );
+    return !!row;
+  }
+
   // ── config push ──────────────────────────────────────────────────────────
   // Approved + targeted (this device directly, or via a tag on the device).
   async function getPendingConfigJob(deviceId) {
@@ -6098,6 +6148,9 @@ function makePgStore(poolOrConfig) {
     appendInterfaceHistory,
     appendLteHistory,
     setPollWindow,
+    bumpDeviceWake,
+    getDeviceWake,
+    mergeDeviceStateRaw,
     getPendingConfigJob,
     getConfigJobForFetch,
     getConfirmedJob,

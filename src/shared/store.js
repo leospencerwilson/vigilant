@@ -101,6 +101,8 @@
  * @property {(deviceId: string, ts: string, row: Object) => Promise<void>} appendLteHistory
  *
  * @property {(deviceId: string, pollUntil: ?string, intervalS: number) => Promise<void>} setPollWindow
+ * @property {(deviceId: string) => Promise<?number>} bumpDeviceWake
+ * @property {(deviceId: string) => Promise<?number>} getDeviceWake
  *
  * @property {(deviceId: string) => Promise<?PendingConfigJob>} getPendingConfigJob
  *   status='approved' job matching this device or one of its tags; else null.
