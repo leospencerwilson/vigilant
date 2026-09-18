@@ -640,6 +640,20 @@ install -D -m 0755 /dev/stdin "$MNT/usr/local/sbin/wcn-firstboot" <<'FB'
 # that installed the whole stack looked IDENTICAL - same exit 0, same silence. On the first real
 # Pi (2026-09-18) that cost a morning: dpkg.log was empty, nothing was installed, and nothing
 # anywhere said why. Refuse early and say the reason; the unit stays armed and retries.
+# WAIT FOR A ROUTE THAT ACTUALLY WORKS. Do not trust network-online.target: on a real Pi
+# (2026-09-18) it was reached on LOOPBACK at 16:53:39, four seconds before eth0 had carrier and
+# nine before DHCP. Ask the question that matters - can we fetch from the mirror - and wait up to
+# five minutes for the answer to be yes.
+i=0
+while [ $i -lt 60 ]; do
+    if curl -sf -o /dev/null -m 10 http://deb.debian.org/debian/dists/trixie/InRelease; then break; fi
+    i=$((i+1)); sleep 5
+done
+if [ $i -ge 60 ]; then
+    echo "wcn-firstboot: no route to the Debian mirror after 5 minutes - retrying next boot." >&2
+    exit 1
+fi
+
 FREE_MB=$(df -Pm / | awk 'NR==2{print $4}')
 if [ "${FREE_MB:-0}" -lt 1500 ]; then
     echo "wcn-firstboot: only ${FREE_MB} MB free on / - REFUSING to install the counter stack." >&2
@@ -647,7 +661,10 @@ if [ "${FREE_MB:-0}" -lt 1500 ]; then
     echo "wcn-firstboot: check wcn-resizefs.service; retrying on the next boot." >&2
     exit 1
 fi
-if ! apt-get update -qq; then
+# Error-Mode=any or this is worthless: apt-get update EXITS 0 when individual repositories fail
+# to refresh, so the June index survived, the backports source was never fetched, and the install
+# then 404'd on versions the mirror had replaced. That is precisely what happened on 2026-09-18.
+if ! apt-get update -qq -o APT::Update::Error-Mode=any; then
     echo "wcn-firstboot: apt-get update FAILED - no usable network on this Pi." >&2
     echo "wcn-firstboot: it needs wired Ethernet on a port that serves DHCP and reaches the" >&2
     echo "wcn-firstboot: internet. A laptop dock port usually is NOT one. Retrying next boot." >&2
@@ -687,7 +704,10 @@ After=NetworkManager.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/wcn-firstboot
-TimeoutStartSec=180
+# NO start timeout. This was TimeoutStartSec=180 and it is why the counter stack never once
+# installed on real hardware: 87 MB on a Pi takes about thirty minutes, systemd killed it at
+# three, and the unit reported Result=timeout rather than anything that named the cause.
+TimeoutStartSec=infinity
 
 [Install]
 WantedBy=multi-user.target
