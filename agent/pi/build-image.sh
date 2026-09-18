@@ -60,6 +60,43 @@ mount "${LOOP}p1" "$MNT/boot/firmware" 2>/dev/null || mount "${LOOP}p1" "$MNT/bo
 install -D -m 0755 "$HERE/vigilant-pi-agent.py" "$MNT/usr/local/sbin/vigilant-pi-agent"
 install -D -m 0755 "$HERE/../pi/wcn-kiosk"        "$MNT/usr/local/bin/wcn-kiosk"
 
+# ── the WCN PC/SC shim ───────────────────────────────────────────────────────
+# WITHOUT THIS THE CARD READS AND THE PIN FAILS. The reader, the certificate store and the
+# whole card path look healthy; only SetSmartCardPIN dies, with
+#   "CryptAcquireContext: The requested protocols are incompatible with the protocol
+#    currently in use with the smart card"
+# because the NHS Identity Agent asks for T=0 on the PIN path in a remote session and NHS
+# series 9/10 cards are T=1 only. The shim sits in front of libpcsclite and:
+#   - strips SCARD_PROTOCOL_RAW  (RAW pins the card; PIN verify then dies PROTO_MISMATCH)
+#   - strips SCARD_STATE_CHANGED (a FreeRDP defect; without this, insertion is never seen)
+#   - debounces a card removal shorter than 3 s (a phantom dropout logs the user off Spine
+#     and silently stops the ETP poll)
+#
+# FreeRDP dlopen()s the library BY NAME, so LD_PRELOAD cannot reach it. wcn-kiosk therefore
+# exports LD_LIBRARY_PATH=/usr/local/lib/wcn-pcsc before it launches xfreerdp3. That export
+# went missing from the kiosk for three weeks in 2026 and the fault only surfaced at the next
+# REBOOT, because a long-running kiosk loop inherits the old environment.
+#
+# A PREBUILT aarch64 object is shipped, not compiled here: this host is x86_64, and the
+# smartcard path must not depend on a compiler and a working network at first boot. The
+# source sits beside it for provenance and for rebuilds.
+# WARNING  Rebuild with, and only with:
+#     gcc -shared -fPIC -O2 -o libpcsclite.so.1 wcn-pcsc-wrap.c -ldl
+#   Do NOT add -Wl,-soname. The libraries running in production were built without it.
+# WARNING  Do not compare two builds by whole-file hash — the GNU build-id differs every
+#   time. Compare the .text, .rodata, .dynstr and .data sections, or compare the source.
+install -D -m 0755 "$HERE/wcn-pcsc-libpcsclite.so.1" "$MNT/usr/local/lib/wcn-pcsc/libpcsclite.so.1"
+install -D -m 0644 "$HERE/wcn-pcsc-wrap.c"           "$MNT/usr/local/src/wcn-pcsc-wrap.c"
+
+# ── trixie-backports, for FreeRDP 3.30.0 ─────────────────────────────────────
+# Stock trixie ships FreeRDP 3.15.0, which suffers a SCARD_E_CANCELLED storm that breaks
+# smartcard redirection. The counters run 3.30.0 from backports. Written at bake time so the
+# first-boot top-up can pull from it. No apt pin: only the packages asked for by
+# `-t trixie-backports` come from here.
+install -D -m 0644 /dev/stdin "$MNT/etc/apt/sources.list.d/trixie-backports.list" <<'BP'
+deb http://deb.debian.org/debian trixie-backports main
+BP
+
 # ── the on-console support toolbox ("BIOS" for a thin client) ────────────────
 # Without this a rebuilt counter comes up with NO support menu, and the failure is invisible
 # until someone is standing at a dark counter during an outage — which is the exact scenario
@@ -259,7 +296,8 @@ EOF
 ln -sf /etc/systemd/system/vigilant-agent.service \
    "$MNT/etc/systemd/system/multi-user.target.wants/vigilant-agent.service"
 
-# NOTE: the kiosk (xinit/getty autologin -> wcn-kiosk), FreeRDP, pcscd, CUPS and the
+# NOTE: the kiosk, FreeRDP, pcscd/libccid, X and the WCN PC/SC shim are all provisioned as of
+# 2026-09-16 — the shim is baked above, the rest by wcn-firstboot. CUPS and the
 # WireGuard interface are the remaining image content. They are site-independent EXCEPT the
 # WireGuard key: a Pi generates its own key on first boot and reports its public key in
 # telemetry, so the hub side is provisioned at adoption. Wire that into first-boot here.
@@ -329,6 +367,66 @@ ExecStart=
 ExecStart=-/sbin/agetty --autologin westerncomms --noclear --noissue %I $TERM
 GETTY
 
+# ── first-boot provisioning: MUST be non-interactive or a headless Pi HANGS ───
+# Stock Raspberry Pi OS first boot is interactive, and that is fatal for a counter Pi with no
+# keyboard. TWO stock units block it, and MEASURED on the first real boot of this image
+# (2026-08-19) they cost a black screen, no DHCP lease, and no self-enrolment:
+#   systemd-firstboot.service  ConditionFirstBoot=yes, ordered Before=sysinit.target, runs
+#                              `systemd-firstboot --prompt-locale --prompt-keymap
+#                              --prompt-timezone --prompt-root-password` with StandardInput=tty.
+#                              It waits for console input BEFORE networking starts, so a headless
+#                              Pi never reaches multi-user.target — NetworkManager and the agent
+#                              never run. This is THE hang.
+#   userconfig.service         the Raspberry Pi user-creation wizard, also StandardInput=tty.
+# And the stock image ships uid 1000 as `pi` (nologin) with NO `westerncomms`, so even past the
+# hang the autologin above would fail on a user that does not exist.
+
+# 1. The primary user must EXIST. Rename the stock pi (uid/gid 1000) to westerncomms with a real
+#    login shell, across every account db, its group memberships (sudo/video/render/gpio/…) and
+#    the NOPASSWD sudoers drop-in — so the autologin, kiosk, SSH keys and toolbox sudo all land
+#    on a user that is actually there.
+sed -i 's#^pi:x:1000:1000:\([^:]*\):/home/pi:[^:]*#westerncomms:x:1000:1000:\1:/home/westerncomms:/bin/bash#' "$MNT/etc/passwd"
+sed -i 's#^pi:#westerncomms:#' "$MNT/etc/shadow"
+sed -i 's#\bpi\b#westerncomms#g' "$MNT/etc/group" "$MNT/etc/gshadow" 2>/dev/null || true
+sed -i 's#^pi:#westerncomms:#' "$MNT/etc/subuid" "$MNT/etc/subgid" 2>/dev/null || true
+for f in "$MNT"/etc/sudoers.d/*; do [ -f "$f" ] && sed -i 's#\bpi\b#westerncomms#g' "$f"; done
+# Carry any stock skeleton from /home/pi into the home the earlier steps populated, then drop it.
+if [ -d "$MNT/home/pi" ]; then cp -an "$MNT/home/pi/." "$MNT/home/westerncomms/" 2>/dev/null || true; rm -rf "$MNT/home/pi"; fi
+chown -R 1000:1000 "$MNT/home/westerncomms"
+echo "  renamed stock pi -> westerncomms (uid 1000)"
+
+# 1b. The toolbox's unprivileged TUI reaches its root helper via `sudo -n /usr/local/sbin/wcn-toolbox-priv`
+#     (fixed argv, non-interactive). NEITHER this image nor install-pi-agent.sh ever created the
+#     sudoers rule that makes that work, and trixie ships no pi-NOPASSWD file to inherit — so without
+#     this EVERY PIN-gated / network / printer / remote-support action silently fails. Grant NOPASSWD
+#     to that ONE binary only (the documented security model); sudo requires the file be 0440.
+install -d -m 0755 "$MNT/etc/sudoers.d"
+printf '%s\n' 'westerncomms ALL=(root) NOPASSWD: /usr/local/sbin/wcn-toolbox-priv' > "$MNT/etc/sudoers.d/010-wcn-toolbox"
+chmod 0440 "$MNT/etc/sudoers.d/010-wcn-toolbox"
+echo "  installed toolbox sudoers rule (NOPASSWD wcn-toolbox-priv)"
+
+# 2. Neutralise the interactive first-boot units. Mask both (symlink to /dev/null). machine-id is
+#    still (re)generated non-interactively by systemd early in boot, so masking firstboot loses
+#    only the console questions — which we answer in step 3.
+ln -sf /dev/null "$MNT/etc/systemd/system/systemd-firstboot.service"
+ln -sf /dev/null "$MNT/etc/systemd/system/userconfig.service"
+rm -f "$MNT/etc/systemd/system/multi-user.target.wants/userconfig.service"
+echo "  masked systemd-firstboot + userconfig (the headless hang)"
+
+# 3. Preseed the answers firstboot would have prompted for, so the system has sane UK defaults.
+echo 'LANG=en_GB.UTF-8' > "$MNT/etc/locale.conf"
+echo 'KEYMAP=gb'        > "$MNT/etc/vconsole.conf"
+echo 'Europe/London'    > "$MNT/etc/timezone"
+ln -sf /usr/share/zoneinfo/Europe/London "$MNT/etc/localtime"
+
+# 4. Enable SSH. The baked engineer keys are useless unless sshd runs, and stock RPi OS ships it
+#    disabled. The boot-partition sentinel is the canonical trigger; also wire the unit directly
+#    so it does not hinge on the sshswitch generator.
+touch "$MNT/boot/firmware/ssh" 2>/dev/null || touch "$MNT/boot/ssh" 2>/dev/null || true
+[ -e "$MNT/lib/systemd/system/ssh.service" ] && \
+  ln -sf /lib/systemd/system/ssh.service "$MNT/etc/systemd/system/multi-user.target.wants/ssh.service"
+echo "  enabled SSH (boot sentinel + unit)"
+
 # ── clean, fast, branded boot (bake-time) ────────────────────────────────────
 # Turns the stock verbose boot into: black -> WCN mark on the console -> the toolbox loader -> the
 # VM, and cuts ~8s of pointless boot wait. Every line here was proven on the pilot Pi 3B 2026-08-19.
@@ -371,8 +469,10 @@ ln -sf /etc/systemd/system/wcn-boot-logo.service \
   install -D -m 0644 "$HERE/wcn-splash.png" "$MNT/usr/local/share/wcn/splash.png"
 
 # The support banner the X kiosk launches: an always-on-top strip showing a message support pushes
-# from wc-field (the agent writes it to /var/lib/wcn/kiosk-message.txt). Needs python3-tk, present
-# in the base image.
+# from wc-field (the agent writes it to /var/lib/wcn/kiosk-message.txt). Needs python3-tk.
+# WARNING  This comment used to say python3-tk was "present in the base image". It is NOT —
+# checked against the stock RPi OS Lite arm64 trixie base on 2026-09-16. wcn-firstboot now
+# installs it.
 install -D -m 0755 "$HERE/wcn-banner" "$MNT/usr/local/bin/wcn-banner"
 
 # 6. feh paints that splash on the X root. The image is customised WITHOUT a chroot, so feh cannot
@@ -380,18 +480,43 @@ install -D -m 0755 "$HERE/wcn-banner" "$MNT/usr/local/bin/wcn-banner"
 #    down. A missing feh is not an error — wcn-kiosk degrades to a solid black root.
 install -D -m 0755 /dev/stdin "$MNT/usr/local/sbin/wcn-firstboot" <<'FB'
 #!/bin/sh
-# First-boot package top-ups that cannot be baked without a chroot. Idempotent; only stands down
-# once the top-up actually succeeded, so a first boot with no network simply retries next boot.
-if [ ! -x /usr/bin/feh ]; then
-    apt-get update -qq && apt-get install -y -q feh
+# First-boot package top-ups that cannot be baked without a chroot (no emulation here). Installs:
+#   feh              paints the splash on the X root (missing -> black root, not fatal)
+#   wireguard-tools  `wg`, REQUIRED to bring up the tunnel when the counter is adopted
+#   snmp             `snmpget`, printer telemetry collector
+#   cups-client      `lpstat`, print-queue collector
+# Idempotent; stands down ONLY once the essentials are present, so a first boot with no network
+# simply retries on the next boot rather than shipping a half-provisioned counter.
+apt-get update -qq || true
+apt-get install -y -q feh wireguard-tools snmp cups-client || true
+# The counter stack. The base is RPi OS *Lite*: it has no X, no RDP client and no smartcard
+# daemon, so a Pi without these enrols and then sits at a black screen forever.
+apt-get install -y -q xserver-xorg xinit x11-xserver-utils python3-tk pcscd libccid || true
+# FreeRDP from BACKPORTS specifically. Stock trixie is 3.15.0 and its SCARD_E_CANCELLED storm
+# breaks smartcard redirection. The proven version is 3.30.0+dfsg-1~bpo13+1.
+apt-get install -y -q -t trixie-backports freerdp3-x11 || true
+# Stand down only once EVERY collector is present. A gate on feh+wg alone permanently
+# disables this unit on a boot where those two landed and snmp did not — and a missing
+# snmpget is SILENT: the printer just reports no serial and no page count, forever, with
+# nothing on the Pi saying why.
+# xfreerdp3 and pcscd are in the gate because without them the counter cannot show a desktop
+# or read a card at all — a far worse failure than a missing page count, and one that would
+# otherwise be locked in permanently by a single boot that got the small packages and not
+# these. The shim is a baked file, so it needs no gate.
+if command -v feh >/dev/null 2>&1 && command -v wg >/dev/null 2>&1 \
+   && command -v snmpget >/dev/null 2>&1 && command -v lpstat >/dev/null 2>&1 \
+   && command -v xfreerdp3 >/dev/null 2>&1 && command -v xinit >/dev/null 2>&1 \
+   && command -v pcscd >/dev/null 2>&1; then
+    systemctl disable wcn-firstboot.service 2>/dev/null || true
 fi
-[ -x /usr/bin/feh ] && systemctl disable wcn-firstboot.service 2>/dev/null || true
 FB
 cat > "$MNT/etc/systemd/system/wcn-firstboot.service" <<'UNIT'
 [Unit]
 Description=WCN first-boot package top-ups
 After=NetworkManager.service
-ConditionPathExists=!/usr/bin/feh
+# No ConditionPathExists gate: the script self-disables once ALL FOUR collectors are present
+# (feh, wg, snmpget, lpstat), and must be free to re-run across boots until then (a first boot
+# with no network installs nothing).
 
 [Service]
 Type=oneshot
