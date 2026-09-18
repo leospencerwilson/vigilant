@@ -340,6 +340,33 @@ if [ -n "$CMDLINE" ]; then
   line="$(printf '%s' "$line" | sed 's/^ *//; s/  */ /g; s/ *$//')"
   printf '%s\n' "$line" > "$CMDLINE"
   echo "cmdline.txt: quiet tokens + plymouth.enable=0 ensured; console=tty1 + splash removed (root=/PARTUUID untouched)"
+
+# ---- A CONSOLE SOMEBODY CAN ACTUALLY READ ----------------------------------
+# Without console=tty1 the kernel talks only to the serial port, so HDMI stays black through a
+# healthy boot AND through a hang - they look identical. On 2026-09-18 that cost three separate
+# card-reads to answer questions a screen would have answered in seconds. The quiet/logo flags
+# stay, so the branded boot is unchanged in normal use; this only means a failure is visible.
+grep -q "console=tty1" "$MNT/boot/firmware/cmdline.txt" 2>/dev/null || \
+  sed -i 's/console=serial0,115200/console=serial0,115200 console=tty1/' \
+    "$MNT/boot/firmware/cmdline.txt" 2>/dev/null || true
+echo "  console=tty1 restored (a black screen must not be the only symptom)"
+
+# ---- DISABLE THE STOCK RESIZE -----------------------------------------------
+# PROVEN ON REAL HARDWARE, 2026-09-18. The `resize` token hands first boot to the stock Pi resize.
+# It grows the partition, invents a NEW disk identifier, writes that identifier into cmdline.txt
+# AND /etc/fstab - and never writes it to the disk. Jake's card came back with the MBR still
+# holding the bake-time id 0x041bba91 while cmdline.txt demanded PARTUUID=ca0573d9-02, so the
+# initramfs sat there and then gave up waiting for a root device that has never existed.
+#
+# The cost was total and silent: userspace NEVER ran. machine-id still "uninitialized", no
+# journal, not one package installed, no enrolment - and nothing on screen, because the image
+# also boots quiet. Two Pis and two builds failed this way before it was found.
+#
+# So the token goes, and wcn-resizefs below does the whole job instead. It never touches the disk
+# identifier, so the PARTUUIDs baked here stay true for the life of the card.
+sed -i 's/ resize\( \|$\)/\1/g' "$MNT/boot/firmware/cmdline.txt" 2>/dev/null \
+  || sed -i 's/ resize\( \|$\)/\1/g' "$MNT/boot/cmdline.txt" 2>/dev/null || true
+echo "  removed the stock 'resize' token (it strands the card - wcn-resizefs does this now)"
 else
   echo "WARNING: no cmdline.txt found in image — boot verbosity left as-is" >&2
 fi
@@ -410,6 +437,15 @@ echo "  installed toolbox sudoers rule (NOPASSWD wcn-toolbox-priv)"
 #    only the console questions — which we answer in step 3.
 ln -sf /dev/null "$MNT/etc/systemd/system/systemd-firstboot.service"
 ln -sf /dev/null "$MNT/etc/systemd/system/userconfig.service"
+# systemd-networkd-wait-online BLOCKS network-online.target FOREVER on this image, and with it
+# vigilant-agent and multi-user.target. The base enables it even though NetworkManager owns the
+# interface (and it masks NetworkManager-wait-online, which is the inverse of what we need), so
+# it sits waiting for networkd links that never appear while the network is perfectly up.
+# Measured 2026-09-18: with this masked the same image boots through to "Started
+# vigilant-agent.service" and enrols in seconds; without it, nothing after network-online ever
+# runs and the Pi looks dead while being entirely healthy.
+ln -sf /dev/null "$MNT/etc/systemd/system/systemd-networkd-wait-online.service"
+echo "  masked systemd-networkd-wait-online (it blocks the agent forever under NetworkManager)"
 rm -f "$MNT/etc/systemd/system/multi-user.target.wants/userconfig.service"
 echo "  masked systemd-firstboot + userconfig (the headless hang)"
 
@@ -423,13 +459,27 @@ echo 'Europe/London'    > "$MNT/etc/timezone"
 #     The Pi was unplugged and every log from the failed boot went with it, which is most of why
 #     that fault took a morning to find. A counter Pi that cannot say why it failed after a
 #     power cycle is a support problem in its own right.
-install -d -m 0755 "$MNT/var/log/journal"
+# NOTE the two things this deliberately does NOT do, both of which cost a boot on 2026-09-18:
+#   - it does NOT say Storage=persistent. That makes journald CREATE /var/log/journal and flush
+#     into it during early boot, before sysinit.target, on a filesystem that still has 183 MB
+#     free. The Pi hangs at "Received client request to flush runtime journal" and nothing after
+#     it ever runs - no resize, no packages, no agent, no enrolment, and no journal either.
+#   - it does NOT create /var/log/journal here. Storage=auto persists only if that directory
+#     already exists, so its absence is what keeps the first boot in RAM.
+# wcn-resizefs creates the directory AFTER it has grown the filesystem. First boot logs to RAM
+# as it always did; every boot after that persists, which is all we ever needed.
 install -D -m 0644 /dev/stdin "$MNT/etc/systemd/journald.conf.d/10-wcn-persistent.conf" <<'JCONF'
 [Journal]
-Storage=persistent
-SystemMaxUse=200M
+Storage=auto
+SystemMaxUse=64M
+RuntimeMaxUse=32M
 JCONF
-echo "  journald set to persistent storage"
+# The base image SHIPS /var/log/journal. Storage=auto persists whenever that directory exists,
+# so leaving it in place keeps the early-boot flush deadlock alive on a 183 MB filesystem. Not
+# creating it was never enough - it has to go.
+rm -rf "$MNT/var/log/journal"
+echo "  removed the base image's /var/log/journal (it re-armed the first-boot flush deadlock)"
+echo "  journald set to Storage=auto (wcn-resizefs turns on persistence once there is room)"
 ln -sf /usr/share/zoneinfo/Europe/London "$MNT/etc/localtime"
 
 # 4. Enable SSH. The baked engineer keys are useless unless sshd runs, and stock RPi OS ships it
@@ -504,19 +554,50 @@ install -D -m 0755 "$HERE/wcn-banner" "$MNT/usr/local/bin/wcn-banner"
 # the failure the 2026-09-16 work set out to kill. Do not rely on the stock mechanism; own it.
 install -D -m 0755 /dev/stdin "$MNT/usr/local/sbin/wcn-resizefs" <<'RS'
 #!/bin/sh
-# Grow the root filesystem to fill its partition. Idempotent: resize2fs is a no-op once the
-# filesystem already fills the partition, and ext4 resizes online, so this is safe on a
-# mounted root. Ordered before wcn-firstboot so the package installs have room.
+# Grow BOTH the partition and the filesystem. We do the whole job because the stock Pi resize
+# cannot be trusted with it (see the cmdline.txt note above): it renames the disk and strands
+# the card. Nothing here ever touches the disk identifier, so the baked PARTUUIDs stay true for
+# the life of the card.
+#
+# Idempotent. sfdisk is a no-op once the partition already fills the disk, and resize2fs is a
+# no-op once the filesystem already fills the partition. ext4 grows online, so this is safe with
+# the root mounted - this is the same approach cloud-init's growpart uses.
+set -u
 SRC=$(findmnt -no SOURCE / 2>/dev/null)
 [ -n "$SRC" ] || SRC=/dev/mmcblk0p2
-echo "wcn-resizefs: root is $SRC"
+# /dev/mmcblk0p2 -> disk /dev/mmcblk0, part 2.  /dev/sda2 -> /dev/sda, 2.
+case "$SRC" in
+  *[0-9]p[0-9]*) DISK=${SRC%p*}; NUM=${SRC##*p} ;;
+  *)             DISK=$(echo "$SRC" | sed 's/[0-9]*$//'); NUM=$(echo "$SRC" | sed 's/.*[^0-9]//') ;;
+esac
+echo "wcn-resizefs: root=$SRC disk=$DISK part=$NUM"
+
+# 1. grow the partition to the end of the card
+if command -v sfdisk >/dev/null 2>&1; then
+    echo ",+" | sfdisk -N "$NUM" --no-reread --force "$DISK" >/dev/null 2>&1 \
+        || echo "wcn-resizefs: sfdisk declined (already full?)" >&2
+    # Tell the running kernel the partition is bigger. partx -u resizes in place; it does NOT
+    # remove the device nodes, which is what a re-read would try and fail to do on a mounted root.
+    partx -u "$DISK" >/dev/null 2>&1 || true
+fi
+
+# 2. grow the filesystem into it
 resize2fs "$SRC" 2>&1 || echo "wcn-resizefs: resize2fs returned $?" >&2
+
 PART=$(blockdev --getsize64 "$SRC" 2>/dev/null || echo 0)
 FS=$(df -B1 --output=size / 2>/dev/null | tail -1 | tr -d ' ')
 echo "wcn-resizefs: partition=${PART}b filesystem=${FS}b"
-# Stand down only once the filesystem really does fill its partition. A gate on "resize2fs
-# exited 0" would disable this on a boot where it did nothing useful.
+# Stand down only once the filesystem really does fill the partition. A gate on "resize2fs exited
+# 0" would disable this on a boot where it achieved nothing.
 if [ "$PART" -gt 0 ] && [ -n "$FS" ] && [ "$FS" -ge $(( PART / 10 * 9 )) ]; then
+    # Now - and ONLY now - is there room to keep logs on disk. journald is set to Storage=auto,
+    # so creating this directory is what switches persistence on, from the next boot onward.
+    # Doing it at bake time instead deadlocks the very first boot (see the journald note above).
+    if [ ! -d /var/log/journal ]; then
+        install -d -m 2755 -o root -g systemd-journal /var/log/journal 2>/dev/null \
+            || mkdir -p /var/log/journal
+        echo "wcn-resizefs: enabled persistent journald for subsequent boots"
+    fi
     systemctl disable wcn-resizefs.service 2>/dev/null || true
     echo "wcn-resizefs: filesystem fills the partition, standing down"
 fi
@@ -524,7 +605,11 @@ RS
 cat > "$MNT/etc/systemd/system/wcn-resizefs.service" <<'RUNIT'
 [Unit]
 Description=WCN grow the root filesystem to fill its partition
-DefaultDependencies=no
+# NO DefaultDependencies=no HERE. It was tried on 2026-09-18 and it drops the Pi into emergency
+# mode: without the default ordering this unit starts while systemd is still mounting
+# /boot/firmware, and rewriting the partition table underneath that mount fails it, which fails
+# local-fs.target and takes the whole boot down. Growing a filesystem is not early-boot work -
+# it belongs after everything is mounted, which is exactly what the default dependencies give.
 After=local-fs.target
 Before=wcn-firstboot.service
 ConditionPathExists=/usr/local/sbin/wcn-resizefs
@@ -618,5 +703,9 @@ trap - EXIT
 rmdir "$MNT"
 
 # ── compress for distribution ────────────────────────────────────────────────
-xz -T0 -9 -f "$OUT"
+# -M matters: at -9 xz wants ~700 MB per thread and self-limits to about a quarter of system
+# RAM, so on the 12 GB builder -T0 quietly collapsed from 6 threads to 2 and the log said
+# "Reduced the number of threads from 6 to 2 to not exceed the memory usage limit of 2994 MiB".
+# The image is byte-identical either way; this just stops the build taking twice as long.
+xz -T0 -9 -M 8GiB -f "$OUT"
 echo "built ${OUT}.xz — host it and set VITE_THIN_CLIENT_IMAGE_URL to its download URL"
