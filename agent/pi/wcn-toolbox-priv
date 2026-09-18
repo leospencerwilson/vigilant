@@ -249,6 +249,39 @@ cmd_wg_status() {
 #   * a DEAD-MAN REVERT is armed BEFORE the swap: 3 min later wg-revert-check restores the backup
 #     unless the tunnel has actually handshaked. So the failure mode of a re-key self-recovers to
 #     the previous working identity, with nobody on site.
+cmd_firstboot_now() {
+    # Run the first-boot top-up NOW, detached, with NO start timeout.
+    # wcn-firstboot.service caps itself at TimeoutStartSec=180 - three minutes for an 87 MB
+    # install on a Pi, so systemd kills it every single time and the unit reports Result=timeout.
+    # It also runs at boot, before the network is really up, so apt-get update silently refreshes
+    # nothing and the stale June index 404s. Running it here, on demand, dodges both.
+    if command -v xfreerdp3 >/dev/null 2>&1 && command -v Xorg >/dev/null 2>&1; then
+        echo "firstboot-now: counter stack already present"
+        return 0
+    fi
+    systemctl reset-failed wcn-firstboot-manual >/dev/null 2>&1 || true
+    systemd-run --collect --unit=wcn-firstboot-manual \
+        --property=Type=oneshot --property=TimeoutStartSec=infinity \
+        /usr/local/sbin/wcn-firstboot >/dev/null 2>&1 \
+        || die "firstboot-now: could not start wcn-firstboot-manual"
+    echo "firstboot-now: started in the background (journalctl -u wcn-firstboot-manual -f)"
+}
+
+cmd_wg_bootstrap() {
+    # Install wireguard-tools from the image's OWN apt cache. No network: the .deb was fetched
+    # during the aborted first-boot run and is still in /var/cache/apt/archives. Idempotent.
+    if command -v wg >/dev/null 2>&1; then
+        echo "wg-bootstrap: wireguard-tools already present"
+        return 0
+    fi
+    local deb
+    deb=$(ls -1 /var/cache/apt/archives/wireguard-tools_*.deb 2>/dev/null | head -1)
+    [ -n "$deb" ] || die "wg-bootstrap: no cached wireguard-tools .deb on this device"
+    dpkg -i "$deb" >/dev/null 2>&1 || true
+    command -v wg >/dev/null 2>&1 || die "wg-bootstrap: dpkg ran but wg is still absent"
+    echo "wg-bootstrap: installed $(basename "$deb")"
+}
+
 cmd_wg_apply() {
     local new tmp pk
     new=$(cat)
@@ -265,6 +298,11 @@ cmd_wg_apply() {
     printf 'armed\n' > "$WG_TRIAL"
     systemd-run --on-active=180 /usr/local/sbin/wcn-toolbox-priv wg-revert-check >/dev/null 2>&1 || true
     install -m 600 "$tmp" "$WG_CONF"; rm -f "$tmp"
+    # ENABLE as well as restart. Without this the tunnel comes up once and is GONE after a reboot:
+    # the unit is wanted by no target, so nothing starts it at boot. Watched happen on Waterloo
+    # counter 3, 2026-09-18 - applied at 16:05, handshaking, silent the moment it rebooted. The
+    # older hand-built Pis never hit this because their runbook said `systemctl enable --now`.
+    systemctl enable wg-quick@wg0 >/dev/null 2>&1 || true
     systemctl restart wg-quick@wg0
     echo "wg-apply: applied; auto-reverts in ~3 min unless the tunnel handshakes"
 }
@@ -1049,6 +1087,8 @@ case "$verb" in
     auth)               cmd_auth ;;
     wg-status)          cmd_wg_status ;;
     wg-apply)           cmd_wg_apply ;;
+    wg-bootstrap)       cmd_wg_bootstrap ;;
+    firstboot-now)      cmd_firstboot_now ;;
     wg-revert-check)    cmd_wg_revert_check ;;
     agent-url)          cmd_agent_url ;;
     agent-installed)    cmd_agent_installed_sha ;;

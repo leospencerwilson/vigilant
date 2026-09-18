@@ -60,6 +60,43 @@ mount "${LOOP}p1" "$MNT/boot/firmware" 2>/dev/null || mount "${LOOP}p1" "$MNT/bo
 install -D -m 0755 "$HERE/vigilant-pi-agent.py" "$MNT/usr/local/sbin/vigilant-pi-agent"
 install -D -m 0755 "$HERE/../pi/wcn-kiosk"        "$MNT/usr/local/bin/wcn-kiosk"
 
+# ── the WCN PC/SC shim ───────────────────────────────────────────────────────
+# WITHOUT THIS THE CARD READS AND THE PIN FAILS. The reader, the certificate store and the
+# whole card path look healthy; only SetSmartCardPIN dies, with
+#   "CryptAcquireContext: The requested protocols are incompatible with the protocol
+#    currently in use with the smart card"
+# because the NHS Identity Agent asks for T=0 on the PIN path in a remote session and NHS
+# series 9/10 cards are T=1 only. The shim sits in front of libpcsclite and:
+#   - strips SCARD_PROTOCOL_RAW  (RAW pins the card; PIN verify then dies PROTO_MISMATCH)
+#   - strips SCARD_STATE_CHANGED (a FreeRDP defect; without this, insertion is never seen)
+#   - debounces a card removal shorter than 3 s (a phantom dropout logs the user off Spine
+#     and silently stops the ETP poll)
+#
+# FreeRDP dlopen()s the library BY NAME, so LD_PRELOAD cannot reach it. wcn-kiosk therefore
+# exports LD_LIBRARY_PATH=/usr/local/lib/wcn-pcsc before it launches xfreerdp3. That export
+# went missing from the kiosk for three weeks in 2026 and the fault only surfaced at the next
+# REBOOT, because a long-running kiosk loop inherits the old environment.
+#
+# A PREBUILT aarch64 object is shipped, not compiled here: this host is x86_64, and the
+# smartcard path must not depend on a compiler and a working network at first boot. The
+# source sits beside it for provenance and for rebuilds.
+# WARNING  Rebuild with, and only with:
+#     gcc -shared -fPIC -O2 -o libpcsclite.so.1 wcn-pcsc-wrap.c -ldl
+#   Do NOT add -Wl,-soname. The libraries running in production were built without it.
+# WARNING  Do not compare two builds by whole-file hash — the GNU build-id differs every
+#   time. Compare the .text, .rodata, .dynstr and .data sections, or compare the source.
+install -D -m 0755 "$HERE/wcn-pcsc-libpcsclite.so.1" "$MNT/usr/local/lib/wcn-pcsc/libpcsclite.so.1"
+install -D -m 0644 "$HERE/wcn-pcsc-wrap.c"           "$MNT/usr/local/src/wcn-pcsc-wrap.c"
+
+# ── trixie-backports, for FreeRDP 3.30.0 ─────────────────────────────────────
+# Stock trixie ships FreeRDP 3.15.0, which suffers a SCARD_E_CANCELLED storm that breaks
+# smartcard redirection. The counters run 3.30.0 from backports. Written at bake time so the
+# first-boot top-up can pull from it. No apt pin: only the packages asked for by
+# `-t trixie-backports` come from here.
+install -D -m 0644 /dev/stdin "$MNT/etc/apt/sources.list.d/trixie-backports.list" <<'BP'
+deb http://deb.debian.org/debian trixie-backports main
+BP
+
 # ── the on-console support toolbox ("BIOS" for a thin client) ────────────────
 # Without this a rebuilt counter comes up with NO support menu, and the failure is invisible
 # until someone is standing at a dark counter during an outage — which is the exact scenario
@@ -259,7 +296,8 @@ EOF
 ln -sf /etc/systemd/system/vigilant-agent.service \
    "$MNT/etc/systemd/system/multi-user.target.wants/vigilant-agent.service"
 
-# NOTE: the kiosk (xinit/getty autologin -> wcn-kiosk), FreeRDP, pcscd, CUPS and the
+# NOTE: the kiosk, FreeRDP, pcscd/libccid, X and the WCN PC/SC shim are all provisioned as of
+# 2026-09-16 — the shim is baked above, the rest by wcn-firstboot. CUPS and the
 # WireGuard interface are the remaining image content. They are site-independent EXCEPT the
 # WireGuard key: a Pi generates its own key on first boot and reports its public key in
 # telemetry, so the hub side is provisioned at adoption. Wire that into first-boot here.
@@ -302,6 +340,33 @@ if [ -n "$CMDLINE" ]; then
   line="$(printf '%s' "$line" | sed 's/^ *//; s/  */ /g; s/ *$//')"
   printf '%s\n' "$line" > "$CMDLINE"
   echo "cmdline.txt: quiet tokens + plymouth.enable=0 ensured; console=tty1 + splash removed (root=/PARTUUID untouched)"
+
+# ---- A CONSOLE SOMEBODY CAN ACTUALLY READ ----------------------------------
+# Without console=tty1 the kernel talks only to the serial port, so HDMI stays black through a
+# healthy boot AND through a hang - they look identical. On 2026-09-18 that cost three separate
+# card-reads to answer questions a screen would have answered in seconds. The quiet/logo flags
+# stay, so the branded boot is unchanged in normal use; this only means a failure is visible.
+grep -q "console=tty1" "$MNT/boot/firmware/cmdline.txt" 2>/dev/null || \
+  sed -i 's/console=serial0,115200/console=serial0,115200 console=tty1/' \
+    "$MNT/boot/firmware/cmdline.txt" 2>/dev/null || true
+echo "  console=tty1 restored (a black screen must not be the only symptom)"
+
+# ---- DISABLE THE STOCK RESIZE -----------------------------------------------
+# PROVEN ON REAL HARDWARE, 2026-09-18. The `resize` token hands first boot to the stock Pi resize.
+# It grows the partition, invents a NEW disk identifier, writes that identifier into cmdline.txt
+# AND /etc/fstab - and never writes it to the disk. Jake's card came back with the MBR still
+# holding the bake-time id 0x041bba91 while cmdline.txt demanded PARTUUID=ca0573d9-02, so the
+# initramfs sat there and then gave up waiting for a root device that has never existed.
+#
+# The cost was total and silent: userspace NEVER ran. machine-id still "uninitialized", no
+# journal, not one package installed, no enrolment - and nothing on screen, because the image
+# also boots quiet. Two Pis and two builds failed this way before it was found.
+#
+# So the token goes, and wcn-resizefs below does the whole job instead. It never touches the disk
+# identifier, so the PARTUUIDs baked here stay true for the life of the card.
+sed -i 's/ resize\( \|$\)/\1/g' "$MNT/boot/firmware/cmdline.txt" 2>/dev/null \
+  || sed -i 's/ resize\( \|$\)/\1/g' "$MNT/boot/cmdline.txt" 2>/dev/null || true
+echo "  removed the stock 'resize' token (it strands the card - wcn-resizefs does this now)"
 else
   echo "WARNING: no cmdline.txt found in image — boot verbosity left as-is" >&2
 fi
@@ -372,6 +437,15 @@ echo "  installed toolbox sudoers rule (NOPASSWD wcn-toolbox-priv)"
 #    only the console questions — which we answer in step 3.
 ln -sf /dev/null "$MNT/etc/systemd/system/systemd-firstboot.service"
 ln -sf /dev/null "$MNT/etc/systemd/system/userconfig.service"
+# systemd-networkd-wait-online BLOCKS network-online.target FOREVER on this image, and with it
+# vigilant-agent and multi-user.target. The base enables it even though NetworkManager owns the
+# interface (and it masks NetworkManager-wait-online, which is the inverse of what we need), so
+# it sits waiting for networkd links that never appear while the network is perfectly up.
+# Measured 2026-09-18: with this masked the same image boots through to "Started
+# vigilant-agent.service" and enrols in seconds; without it, nothing after network-online ever
+# runs and the Pi looks dead while being entirely healthy.
+ln -sf /dev/null "$MNT/etc/systemd/system/systemd-networkd-wait-online.service"
+echo "  masked systemd-networkd-wait-online (it blocks the agent forever under NetworkManager)"
 rm -f "$MNT/etc/systemd/system/multi-user.target.wants/userconfig.service"
 echo "  masked systemd-firstboot + userconfig (the headless hang)"
 
@@ -379,6 +453,33 @@ echo "  masked systemd-firstboot + userconfig (the headless hang)"
 echo 'LANG=en_GB.UTF-8' > "$MNT/etc/locale.conf"
 echo 'KEYMAP=gb'        > "$MNT/etc/vconsole.conf"
 echo 'Europe/London'    > "$MNT/etc/timezone"
+
+# 3b. PERSISTENT JOURNAL. Measured on the first real Pi (2026-09-18): /var/log/journal existed
+#     but was EMPTY and journald.conf set no Storage=, so it defaulted to `auto` -> volatile.
+#     The Pi was unplugged and every log from the failed boot went with it, which is most of why
+#     that fault took a morning to find. A counter Pi that cannot say why it failed after a
+#     power cycle is a support problem in its own right.
+# NOTE the two things this deliberately does NOT do, both of which cost a boot on 2026-09-18:
+#   - it does NOT say Storage=persistent. That makes journald CREATE /var/log/journal and flush
+#     into it during early boot, before sysinit.target, on a filesystem that still has 183 MB
+#     free. The Pi hangs at "Received client request to flush runtime journal" and nothing after
+#     it ever runs - no resize, no packages, no agent, no enrolment, and no journal either.
+#   - it does NOT create /var/log/journal here. Storage=auto persists only if that directory
+#     already exists, so its absence is what keeps the first boot in RAM.
+# wcn-resizefs creates the directory AFTER it has grown the filesystem. First boot logs to RAM
+# as it always did; every boot after that persists, which is all we ever needed.
+install -D -m 0644 /dev/stdin "$MNT/etc/systemd/journald.conf.d/10-wcn-persistent.conf" <<'JCONF'
+[Journal]
+Storage=auto
+SystemMaxUse=64M
+RuntimeMaxUse=32M
+JCONF
+# The base image SHIPS /var/log/journal. Storage=auto persists whenever that directory exists,
+# so leaving it in place keeps the early-boot flush deadlock alive on a 183 MB filesystem. Not
+# creating it was never enough - it has to go.
+rm -rf "$MNT/var/log/journal"
+echo "  removed the base image's /var/log/journal (it re-armed the first-boot flush deadlock)"
+echo "  journald set to Storage=auto (wcn-resizefs turns on persistence once there is room)"
 ln -sf /usr/share/zoneinfo/Europe/London "$MNT/etc/localtime"
 
 # 4. Enable SSH. The baked engineer keys are useless unless sshd runs, and stock RPi OS ships it
@@ -431,13 +532,101 @@ ln -sf /etc/systemd/system/wcn-boot-logo.service \
   install -D -m 0644 "$HERE/wcn-splash.png" "$MNT/usr/local/share/wcn/splash.png"
 
 # The support banner the X kiosk launches: an always-on-top strip showing a message support pushes
-# from wc-field (the agent writes it to /var/lib/wcn/kiosk-message.txt). Needs python3-tk, present
-# in the base image.
+# from wc-field (the agent writes it to /var/lib/wcn/kiosk-message.txt). Needs python3-tk.
+# WARNING  This comment used to say python3-tk was "present in the base image". It is NOT —
+# checked against the stock RPi OS Lite arm64 trixie base on 2026-09-16. wcn-firstboot now
+# installs it.
 install -D -m 0755 "$HERE/wcn-banner" "$MNT/usr/local/bin/wcn-banner"
 
 # 6. feh paints that splash on the X root. The image is customised WITHOUT a chroot, so feh cannot
 #    be apt-installed here; a one-shot first-boot unit installs it once (online by then) and stands
 #    down. A missing feh is not an error — wcn-kiosk degrades to a solid black root.
+# -- grow the root filesystem ------------------------------------------------
+# THIS BASE DOES NOT RESIZE ITS OWN FILESYSTEM. Measured on the first real Pi, 2026-09-18:
+# the PARTITION grew correctly (2.3 GB -> 15.1 GB, `resize` consumed from cmdline.txt, PARTUUID
+# rewritten) but resize2fs never ran, so the filesystem stayed at its built size: 2.2 GB with
+# 183 MB free. `resize2fs` and `e2fsck` are both present, but /usr/lib/raspberrypi-sys-mods/
+# holds only get_fw_loc, i2cprobe, imager_custom and sshswitch - there is NO init_resize.sh and
+# no resize unit anywhere in the base.
+#
+# The consequence is not subtle: the counter stack (X, FreeRDP, pcscd) needs several hundred MB,
+# so on a perfectly good network the Pi enrols and then sits at a black screen forever - exactly
+# the failure the 2026-09-16 work set out to kill. Do not rely on the stock mechanism; own it.
+install -D -m 0755 /dev/stdin "$MNT/usr/local/sbin/wcn-resizefs" <<'RS'
+#!/bin/sh
+# Grow BOTH the partition and the filesystem. We do the whole job because the stock Pi resize
+# cannot be trusted with it (see the cmdline.txt note above): it renames the disk and strands
+# the card. Nothing here ever touches the disk identifier, so the baked PARTUUIDs stay true for
+# the life of the card.
+#
+# Idempotent. sfdisk is a no-op once the partition already fills the disk, and resize2fs is a
+# no-op once the filesystem already fills the partition. ext4 grows online, so this is safe with
+# the root mounted - this is the same approach cloud-init's growpart uses.
+set -u
+SRC=$(findmnt -no SOURCE / 2>/dev/null)
+[ -n "$SRC" ] || SRC=/dev/mmcblk0p2
+# /dev/mmcblk0p2 -> disk /dev/mmcblk0, part 2.  /dev/sda2 -> /dev/sda, 2.
+case "$SRC" in
+  *[0-9]p[0-9]*) DISK=${SRC%p*}; NUM=${SRC##*p} ;;
+  *)             DISK=$(echo "$SRC" | sed 's/[0-9]*$//'); NUM=$(echo "$SRC" | sed 's/.*[^0-9]//') ;;
+esac
+echo "wcn-resizefs: root=$SRC disk=$DISK part=$NUM"
+
+# 1. grow the partition to the end of the card
+if command -v sfdisk >/dev/null 2>&1; then
+    echo ",+" | sfdisk -N "$NUM" --no-reread --force "$DISK" >/dev/null 2>&1 \
+        || echo "wcn-resizefs: sfdisk declined (already full?)" >&2
+    # Tell the running kernel the partition is bigger. partx -u resizes in place; it does NOT
+    # remove the device nodes, which is what a re-read would try and fail to do on a mounted root.
+    partx -u "$DISK" >/dev/null 2>&1 || true
+fi
+
+# 2. grow the filesystem into it
+resize2fs "$SRC" 2>&1 || echo "wcn-resizefs: resize2fs returned $?" >&2
+
+PART=$(blockdev --getsize64 "$SRC" 2>/dev/null || echo 0)
+FS=$(df -B1 --output=size / 2>/dev/null | tail -1 | tr -d ' ')
+echo "wcn-resizefs: partition=${PART}b filesystem=${FS}b"
+# Stand down only once the filesystem really does fill the partition. A gate on "resize2fs exited
+# 0" would disable this on a boot where it achieved nothing.
+if [ "$PART" -gt 0 ] && [ -n "$FS" ] && [ "$FS" -ge $(( PART / 10 * 9 )) ]; then
+    # Now - and ONLY now - is there room to keep logs on disk. journald is set to Storage=auto,
+    # so creating this directory is what switches persistence on, from the next boot onward.
+    # Doing it at bake time instead deadlocks the very first boot (see the journald note above).
+    if [ ! -d /var/log/journal ]; then
+        install -d -m 2755 -o root -g systemd-journal /var/log/journal 2>/dev/null \
+            || mkdir -p /var/log/journal
+        echo "wcn-resizefs: enabled persistent journald for subsequent boots"
+    fi
+    systemctl disable wcn-resizefs.service 2>/dev/null || true
+    echo "wcn-resizefs: filesystem fills the partition, standing down"
+fi
+RS
+cat > "$MNT/etc/systemd/system/wcn-resizefs.service" <<'RUNIT'
+[Unit]
+Description=WCN grow the root filesystem to fill its partition
+# NO DefaultDependencies=no HERE. It was tried on 2026-09-18 and it drops the Pi into emergency
+# mode: without the default ordering this unit starts while systemd is still mounting
+# /boot/firmware, and rewriting the partition table underneath that mount fails it, which fails
+# local-fs.target and takes the whole boot down. Growing a filesystem is not early-boot work -
+# it belongs after everything is mounted, which is exactly what the default dependencies give.
+After=local-fs.target
+Before=wcn-firstboot.service
+ConditionPathExists=/usr/local/sbin/wcn-resizefs
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/wcn-resizefs
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+RUNIT
+ln -sf /etc/systemd/system/wcn-resizefs.service \
+   "$MNT/etc/systemd/system/multi-user.target.wants/wcn-resizefs.service"
+echo "  installed wcn-resizefs (the base does NOT grow its own filesystem)"
+
 install -D -m 0755 /dev/stdin "$MNT/usr/local/sbin/wcn-firstboot" <<'FB'
 #!/bin/sh
 # First-boot package top-ups that cannot be baked without a chroot (no emulation here). Installs:
@@ -447,9 +636,60 @@ install -D -m 0755 /dev/stdin "$MNT/usr/local/sbin/wcn-firstboot" <<'FB'
 #   cups-client      `lpstat`, print-queue collector
 # Idempotent; stands down ONLY once the essentials are present, so a first boot with no network
 # simply retries on the next boot rather than shipping a half-provisioned counter.
-apt-get update -qq || true
-apt-get install -y -q feh wireguard-tools snmp cups-client || true
-if command -v feh >/dev/null 2>&1 && command -v wg >/dev/null 2>&1; then
+# FAIL LOUDLY. Every apt call here used to end in `|| true`, so a Pi with no network and a Pi
+# that installed the whole stack looked IDENTICAL - same exit 0, same silence. On the first real
+# Pi (2026-09-18) that cost a morning: dpkg.log was empty, nothing was installed, and nothing
+# anywhere said why. Refuse early and say the reason; the unit stays armed and retries.
+# WAIT FOR A ROUTE THAT ACTUALLY WORKS. Do not trust network-online.target: on a real Pi
+# (2026-09-18) it was reached on LOOPBACK at 16:53:39, four seconds before eth0 had carrier and
+# nine before DHCP. Ask the question that matters - can we fetch from the mirror - and wait up to
+# five minutes for the answer to be yes.
+i=0
+while [ $i -lt 60 ]; do
+    if curl -sf -o /dev/null -m 10 http://deb.debian.org/debian/dists/trixie/InRelease; then break; fi
+    i=$((i+1)); sleep 5
+done
+if [ $i -ge 60 ]; then
+    echo "wcn-firstboot: no route to the Debian mirror after 5 minutes - retrying next boot." >&2
+    exit 1
+fi
+
+FREE_MB=$(df -Pm / | awk 'NR==2{print $4}')
+if [ "${FREE_MB:-0}" -lt 1500 ]; then
+    echo "wcn-firstboot: only ${FREE_MB} MB free on / - REFUSING to install the counter stack." >&2
+    echo "wcn-firstboot: the root filesystem has almost certainly not been resized." >&2
+    echo "wcn-firstboot: check wcn-resizefs.service; retrying on the next boot." >&2
+    exit 1
+fi
+# Error-Mode=any or this is worthless: apt-get update EXITS 0 when individual repositories fail
+# to refresh, so the June index survived, the backports source was never fetched, and the install
+# then 404'd on versions the mirror had replaced. That is precisely what happened on 2026-09-18.
+if ! apt-get update -qq -o APT::Update::Error-Mode=any; then
+    echo "wcn-firstboot: apt-get update FAILED - no usable network on this Pi." >&2
+    echo "wcn-firstboot: it needs wired Ethernet on a port that serves DHCP and reaches the" >&2
+    echo "wcn-firstboot: internet. A laptop dock port usually is NOT one. Retrying next boot." >&2
+    exit 1
+fi
+apt-get install -y -q feh wireguard-tools snmp cups-client || \
+    echo "wcn-firstboot: base collector install failed" >&2
+# The counter stack. The base is RPi OS *Lite*: it has no X, no RDP client and no smartcard
+# daemon, so a Pi without these enrols and then sits at a black screen forever.
+apt-get install -y -q xserver-xorg xinit x11-xserver-utils python3-tk pcscd libccid || true
+# FreeRDP from BACKPORTS specifically. Stock trixie is 3.15.0 and its SCARD_E_CANCELLED storm
+# breaks smartcard redirection. The proven version is 3.30.0+dfsg-1~bpo13+1.
+apt-get install -y -q -t trixie-backports freerdp3-x11 || true
+# Stand down only once EVERY collector is present. A gate on feh+wg alone permanently
+# disables this unit on a boot where those two landed and snmp did not — and a missing
+# snmpget is SILENT: the printer just reports no serial and no page count, forever, with
+# nothing on the Pi saying why.
+# xfreerdp3 and pcscd are in the gate because without them the counter cannot show a desktop
+# or read a card at all — a far worse failure than a missing page count, and one that would
+# otherwise be locked in permanently by a single boot that got the small packages and not
+# these. The shim is a baked file, so it needs no gate.
+if command -v feh >/dev/null 2>&1 && command -v wg >/dev/null 2>&1 \
+   && command -v snmpget >/dev/null 2>&1 && command -v lpstat >/dev/null 2>&1 \
+   && command -v xfreerdp3 >/dev/null 2>&1 && command -v xinit >/dev/null 2>&1 \
+   && command -v pcscd >/dev/null 2>&1; then
     systemctl disable wcn-firstboot.service 2>/dev/null || true
 fi
 FB
@@ -457,13 +697,17 @@ cat > "$MNT/etc/systemd/system/wcn-firstboot.service" <<'UNIT'
 [Unit]
 Description=WCN first-boot package top-ups
 After=NetworkManager.service
-# No ConditionPathExists gate: the script self-disables once feh AND wg are present, and must be
-# free to re-run across boots until then (a first boot with no network installs nothing).
+# No ConditionPathExists gate: the script self-disables once ALL FOUR collectors are present
+# (feh, wg, snmpget, lpstat), and must be free to re-run across boots until then (a first boot
+# with no network installs nothing).
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/wcn-firstboot
-TimeoutStartSec=180
+# NO start timeout. This was TimeoutStartSec=180 and it is why the counter stack never once
+# installed on real hardware: 87 MB on a Pi takes about thirty minutes, systemd killed it at
+# three, and the unit reported Result=timeout rather than anything that named the cause.
+TimeoutStartSec=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -479,5 +723,9 @@ trap - EXIT
 rmdir "$MNT"
 
 # ── compress for distribution ────────────────────────────────────────────────
-xz -T0 -9 -f "$OUT"
+# -M matters: at -9 xz wants ~700 MB per thread and self-limits to about a quarter of system
+# RAM, so on the 12 GB builder -T0 quietly collapsed from 6 threads to 2 and the log said
+# "Reduced the number of threads from 6 to 2 to not exceed the memory usage limit of 2994 MiB".
+# The image is byte-identical either way; this just stops the build taking twice as long.
+xz -T0 -9 -M 8GiB -f "$OUT"
 echo "built ${OUT}.xz — host it and set VITE_THIN_CLIENT_IMAGE_URL to its download URL"
