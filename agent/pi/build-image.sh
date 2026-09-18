@@ -417,6 +417,19 @@ echo "  masked systemd-firstboot + userconfig (the headless hang)"
 echo 'LANG=en_GB.UTF-8' > "$MNT/etc/locale.conf"
 echo 'KEYMAP=gb'        > "$MNT/etc/vconsole.conf"
 echo 'Europe/London'    > "$MNT/etc/timezone"
+
+# 3b. PERSISTENT JOURNAL. Measured on the first real Pi (2026-09-18): /var/log/journal existed
+#     but was EMPTY and journald.conf set no Storage=, so it defaulted to `auto` -> volatile.
+#     The Pi was unplugged and every log from the failed boot went with it, which is most of why
+#     that fault took a morning to find. A counter Pi that cannot say why it failed after a
+#     power cycle is a support problem in its own right.
+install -d -m 0755 "$MNT/var/log/journal"
+install -D -m 0644 /dev/stdin "$MNT/etc/systemd/journald.conf.d/10-wcn-persistent.conf" <<'JCONF'
+[Journal]
+Storage=persistent
+SystemMaxUse=200M
+JCONF
+echo "  journald set to persistent storage"
 ln -sf /usr/share/zoneinfo/Europe/London "$MNT/etc/localtime"
 
 # 4. Enable SSH. The baked engineer keys are useless unless sshd runs, and stock RPi OS ships it
@@ -478,6 +491,57 @@ install -D -m 0755 "$HERE/wcn-banner" "$MNT/usr/local/bin/wcn-banner"
 # 6. feh paints that splash on the X root. The image is customised WITHOUT a chroot, so feh cannot
 #    be apt-installed here; a one-shot first-boot unit installs it once (online by then) and stands
 #    down. A missing feh is not an error — wcn-kiosk degrades to a solid black root.
+# -- grow the root filesystem ------------------------------------------------
+# THIS BASE DOES NOT RESIZE ITS OWN FILESYSTEM. Measured on the first real Pi, 2026-09-18:
+# the PARTITION grew correctly (2.3 GB -> 15.1 GB, `resize` consumed from cmdline.txt, PARTUUID
+# rewritten) but resize2fs never ran, so the filesystem stayed at its built size: 2.2 GB with
+# 183 MB free. `resize2fs` and `e2fsck` are both present, but /usr/lib/raspberrypi-sys-mods/
+# holds only get_fw_loc, i2cprobe, imager_custom and sshswitch - there is NO init_resize.sh and
+# no resize unit anywhere in the base.
+#
+# The consequence is not subtle: the counter stack (X, FreeRDP, pcscd) needs several hundred MB,
+# so on a perfectly good network the Pi enrols and then sits at a black screen forever - exactly
+# the failure the 2026-09-16 work set out to kill. Do not rely on the stock mechanism; own it.
+install -D -m 0755 /dev/stdin "$MNT/usr/local/sbin/wcn-resizefs" <<'RS'
+#!/bin/sh
+# Grow the root filesystem to fill its partition. Idempotent: resize2fs is a no-op once the
+# filesystem already fills the partition, and ext4 resizes online, so this is safe on a
+# mounted root. Ordered before wcn-firstboot so the package installs have room.
+SRC=$(findmnt -no SOURCE / 2>/dev/null)
+[ -n "$SRC" ] || SRC=/dev/mmcblk0p2
+echo "wcn-resizefs: root is $SRC"
+resize2fs "$SRC" 2>&1 || echo "wcn-resizefs: resize2fs returned $?" >&2
+PART=$(blockdev --getsize64 "$SRC" 2>/dev/null || echo 0)
+FS=$(df -B1 --output=size / 2>/dev/null | tail -1 | tr -d ' ')
+echo "wcn-resizefs: partition=${PART}b filesystem=${FS}b"
+# Stand down only once the filesystem really does fill its partition. A gate on "resize2fs
+# exited 0" would disable this on a boot where it did nothing useful.
+if [ "$PART" -gt 0 ] && [ -n "$FS" ] && [ "$FS" -ge $(( PART / 10 * 9 )) ]; then
+    systemctl disable wcn-resizefs.service 2>/dev/null || true
+    echo "wcn-resizefs: filesystem fills the partition, standing down"
+fi
+RS
+cat > "$MNT/etc/systemd/system/wcn-resizefs.service" <<'RUNIT'
+[Unit]
+Description=WCN grow the root filesystem to fill its partition
+DefaultDependencies=no
+After=local-fs.target
+Before=wcn-firstboot.service
+ConditionPathExists=/usr/local/sbin/wcn-resizefs
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/wcn-resizefs
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+RUNIT
+ln -sf /etc/systemd/system/wcn-resizefs.service \
+   "$MNT/etc/systemd/system/multi-user.target.wants/wcn-resizefs.service"
+echo "  installed wcn-resizefs (the base does NOT grow its own filesystem)"
+
 install -D -m 0755 /dev/stdin "$MNT/usr/local/sbin/wcn-firstboot" <<'FB'
 #!/bin/sh
 # First-boot package top-ups that cannot be baked without a chroot (no emulation here). Installs:
@@ -487,8 +551,25 @@ install -D -m 0755 /dev/stdin "$MNT/usr/local/sbin/wcn-firstboot" <<'FB'
 #   cups-client      `lpstat`, print-queue collector
 # Idempotent; stands down ONLY once the essentials are present, so a first boot with no network
 # simply retries on the next boot rather than shipping a half-provisioned counter.
-apt-get update -qq || true
-apt-get install -y -q feh wireguard-tools snmp cups-client || true
+# FAIL LOUDLY. Every apt call here used to end in `|| true`, so a Pi with no network and a Pi
+# that installed the whole stack looked IDENTICAL - same exit 0, same silence. On the first real
+# Pi (2026-09-18) that cost a morning: dpkg.log was empty, nothing was installed, and nothing
+# anywhere said why. Refuse early and say the reason; the unit stays armed and retries.
+FREE_MB=$(df -Pm / | awk 'NR==2{print $4}')
+if [ "${FREE_MB:-0}" -lt 1500 ]; then
+    echo "wcn-firstboot: only ${FREE_MB} MB free on / - REFUSING to install the counter stack." >&2
+    echo "wcn-firstboot: the root filesystem has almost certainly not been resized." >&2
+    echo "wcn-firstboot: check wcn-resizefs.service; retrying on the next boot." >&2
+    exit 1
+fi
+if ! apt-get update -qq; then
+    echo "wcn-firstboot: apt-get update FAILED - no usable network on this Pi." >&2
+    echo "wcn-firstboot: it needs wired Ethernet on a port that serves DHCP and reaches the" >&2
+    echo "wcn-firstboot: internet. A laptop dock port usually is NOT one. Retrying next boot." >&2
+    exit 1
+fi
+apt-get install -y -q feh wireguard-tools snmp cups-client || \
+    echo "wcn-firstboot: base collector install failed" >&2
 # The counter stack. The base is RPi OS *Lite*: it has no X, no RDP client and no smartcard
 # daemon, so a Pi without these enrols and then sits at a black screen forever.
 apt-get install -y -q xserver-xorg xinit x11-xserver-utils python3-tk pcscd libccid || true
